@@ -4,11 +4,11 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * In-memory asset ledger.
+ * 内存资产账本
  *
- * <p>Each operation updates all balance components while holding the lock for
- * the user's stripe. The lock is non-fair to minimize context-switch and
- * queueing overhead on the hot path.</p>
+ * <p>每次操作在锁定期间更新所有余额组件用户的Stripe。
+ * 锁采用非公平策略以最小化上下文切换
+ * 热路径上的排队开销。</p>
  */
 public final class LedgerService {
 
