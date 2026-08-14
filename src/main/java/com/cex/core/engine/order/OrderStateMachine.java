@@ -2,6 +2,7 @@ package com.cex.core.engine.order;
 
 import com.cex.core.engine.event.EventType;
 import com.cex.core.engine.event.OrderEvent;
+import com.cex.core.engine.ledger.LedgerService;
 
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
@@ -27,10 +28,21 @@ public final class OrderStateMachine {
     private final ReentrantLock[] stripes;
     /** 订单锁分片掩码。 */
     private final int stripeMask;
+    /** 可选成交结算账本；为空时保留仅状态机的兼容模式。 */
+    private final LedgerService ledgerService;
 
     /** 使用默认锁分片和默认乱序事件缓存创建状态机。 */
     public OrderStateMachine() {
-        this(new OrderEventBuffer(), DEFAULT_STRIPE_COUNT);
+        this(new OrderEventBuffer(), DEFAULT_STRIPE_COUNT, null);
+    }
+
+    /**
+     * 创建带成交结算能力的订单状态机。
+     *
+     * @param ledgerService 成交时执行买方冻结到卖方可用转移的账本
+     */
+    public OrderStateMachine(LedgerService ledgerService) {
+        this(new OrderEventBuffer(), DEFAULT_STRIPE_COUNT, ledgerService);
     }
 
     /**
@@ -42,6 +54,13 @@ public final class OrderStateMachine {
      * @throws IllegalArgumentException stripeCount 不满足分片约束时抛出
      */
     public OrderStateMachine(OrderEventBuffer eventBuffer, int stripeCount) {
+        this(eventBuffer, stripeCount, null);
+    }
+
+    /** 创建可配置乱序缓存、锁分片和成交账本的状态机。 */
+    public OrderStateMachine(OrderEventBuffer eventBuffer,
+                             int stripeCount,
+                             LedgerService ledgerService) {
         if (eventBuffer == null) {
             throw new NullPointerException("eventBuffer");
         }
@@ -49,6 +68,7 @@ public final class OrderStateMachine {
             throw new IllegalArgumentException("stripeCount must be a positive power of two");
         }
         this.eventBuffer = eventBuffer;
+        this.ledgerService = ledgerService;
         this.stripes = new ReentrantLock[stripeCount];
         for (int i = 0; i < stripeCount; i++) {
             this.stripes[i] = new ReentrantLock(false);
@@ -78,9 +98,13 @@ public final class OrderStateMachine {
                     event.getType(),
                     event.getUserId(),
                     event.getSymbol(),
-                    event.getPrice(),
-                    event.getQuantity(),
-                    event.getFillQuantity());
+                     event.getPrice(),
+                     event.getQuantity(),
+                     event.getFillQuantity(),
+                     event.getTradeId(),
+                     event.getBuyerUserId(),
+                     event.getSellerUserId(),
+                     event.getSettlementAmount());
             OrderAggregate aggregate = orders.get(orderId);
             return new EventApplyResult(status,
                     aggregate == null ? null : aggregate.snapshot());
@@ -112,6 +136,23 @@ public final class OrderStateMachine {
                                       long price,
                                       long quantity,
                                       long fillQuantity) {
+        return applyFast(eventId, orderId, type, userId, symbol, price, quantity,
+                fillQuantity, 0L, 0L, 0L, 0L);
+    }
+
+    /** 以低分配路径应用带成交结算事实的订单事件。 */
+    public EventApplyStatus applyFast(long eventId,
+                                      long orderId,
+                                      EventType type,
+                                      long userId,
+                                      String symbol,
+                                      long price,
+                                      long quantity,
+                                      long fillQuantity,
+                                      long tradeId,
+                                      long buyerUserId,
+                                      long sellerUserId,
+                                      long settlementAmount) {
         if (type == null) {
             throw new NullPointerException("type");
         }
@@ -119,7 +160,8 @@ public final class OrderStateMachine {
         lock.lock();
         try {
             return applyLocked(eventId, orderId, type, userId, symbol, price,
-                    quantity, fillQuantity);
+                    quantity, fillQuantity, tradeId, buyerUserId,
+                    sellerUserId, settlementAmount);
         } finally {
             lock.unlock();
         }
@@ -168,13 +210,18 @@ public final class OrderStateMachine {
                                          String symbol,
                                          long price,
                                          long quantity,
-                                         long fillQuantity) {
+                                         long fillQuantity,
+                                         long tradeId,
+                                         long buyerUserId,
+                                         long sellerUserId,
+                                         long settlementAmount) {
         OrderAggregate aggregate = orders.get(orderId);
         if (aggregate == null) {
             if (type != EventType.ORDER_CREATED) {
                 // 未知订单事件必须保留原始事实，等待 CREATE 到达后补偿执行。
                 OrderEvent event = toEvent(eventId, orderId, type, userId, symbol,
-                        price, quantity, fillQuantity);
+                        price, quantity, fillQuantity, tradeId, buyerUserId,
+                        sellerUserId, settlementAmount);
                 boolean buffered = eventBuffer.add(event);
                 return buffered ? EventApplyStatus.BUFFERED : EventApplyStatus.DUPLICATE;
             }
@@ -184,8 +231,15 @@ public final class OrderStateMachine {
             orders.put(orderId, aggregate);
 
             for (OrderEvent pending : eventBuffer.drain(orderId)) {
-                applyKnownEvent(aggregate, pending.getEventId(), pending.getType(),
-                        pending.getFillQuantity());
+                EventApplyStatus replayStatus = applyKnownEvent(aggregate,
+                        pending.getEventId(), pending.getType(),
+                        pending.getFillQuantity(), pending.getTradeId(),
+                        pending.getBuyerUserId(), pending.getSellerUserId(),
+                        pending.getSettlementAmount());
+                if (replayStatus == EventApplyStatus.SETTLEMENT_REJECTED) {
+                    eventBuffer.add(pending);
+                    return replayStatus;
+                }
             }
             return EventApplyStatus.APPLIED;
         }
@@ -201,8 +255,15 @@ public final class OrderStateMachine {
             return EventApplyStatus.DUPLICATE;
         }
 
-        return applyKnownEvent(aggregate, eventId, type, fillQuantity)
-                ? EventApplyStatus.APPLIED : EventApplyStatus.IGNORED;
+        EventApplyStatus result = applyKnownEvent(aggregate, eventId, type, fillQuantity, tradeId,
+                buyerUserId, sellerUserId, settlementAmount);
+        if (result != EventApplyStatus.SETTLEMENT_REJECTED) {
+            eventBuffer.remove(orderId, eventId);
+            if (type == EventType.ORDER_CANCELLED && result == EventApplyStatus.APPLIED) {
+                eventBuffer.drain(orderId);
+            }
+        }
+        return result;
     }
 
     /**
@@ -212,25 +273,31 @@ public final class OrderStateMachine {
      * @param eventId 事件幂等标识
      * @param type 订单事件类型
      * @param fillQuantity 成交数量，非成交事件忽略
-     * @return 事件实际改变订单状态或成交数量时返回 true
-     * @note 先写入 primitive eventId 集合再执行状态分支，保证重复调用不会重复成交；终态订单忽略迟到事件。
+     * @return 事件应用结果
+     * @note 成交结算成功后才写入 eventId 幂等集合，资金不足时允许上游重试；终态订单仍记录并忽略迟到事件。
      */
-    private boolean applyKnownEvent(OrderAggregate aggregate,
-                                    long eventId,
-                                    EventType type,
-                                    long fillQuantity) {
-        if (!aggregate.processedEventIds.add(eventId)) {
-            return false;
+    private EventApplyStatus applyKnownEvent(OrderAggregate aggregate,
+                                             long eventId,
+                                             EventType type,
+                                             long fillQuantity,
+                                             long tradeId,
+                                             long buyerUserId,
+                                             long sellerUserId,
+                                             long settlementAmount) {
+        if (aggregate.processedEventIds.contains(eventId)) {
+            return EventApplyStatus.DUPLICATE;
         }
 
         if (type == EventType.ORDER_CANCELLED) {
             // FILLED/CANCELLED 为终态，撤单只能影响未完成订单。
             if (aggregate.state == OrderState.FILLED
                     || aggregate.state == OrderState.CANCELLED) {
-                return false;
+                aggregate.processedEventIds.add(eventId);
+                return EventApplyStatus.IGNORED;
             }
+            aggregate.processedEventIds.add(eventId);
             aggregate.state = OrderState.CANCELLED;
-            return true;
+            return EventApplyStatus.APPLIED;
         }
 
         if (type == EventType.RISK_HOLD) {
@@ -238,19 +305,23 @@ public final class OrderStateMachine {
             if (aggregate.state == OrderState.FILLED
                     || aggregate.state == OrderState.CANCELLED
                     || aggregate.state == OrderState.RISK_HOLD) {
-                return false;
+                aggregate.processedEventIds.add(eventId);
+                return EventApplyStatus.IGNORED;
             }
+            aggregate.processedEventIds.add(eventId);
             aggregate.stateBeforeRiskHold = aggregate.state;
             aggregate.state = OrderState.RISK_HOLD;
-            return true;
+            return EventApplyStatus.APPLIED;
         }
 
         if (type == EventType.RISK_RELEASED) {
             if (aggregate.state != OrderState.RISK_HOLD) {
-                return false;
+                aggregate.processedEventIds.add(eventId);
+                return EventApplyStatus.IGNORED;
             }
+            aggregate.processedEventIds.add(eventId);
             aggregate.state = aggregate.stateBeforeRiskHold;
-            return true;
+            return EventApplyStatus.APPLIED;
         }
 
         if (type == EventType.MATCH_FILLED) {
@@ -259,21 +330,41 @@ public final class OrderStateMachine {
                     || aggregate.state == OrderState.CANCELLED
                     || aggregate.state == OrderState.RISK_HOLD
                     || fillQuantity <= 0L) {
-                return false;
+                aggregate.processedEventIds.add(eventId);
+                return EventApplyStatus.IGNORED;
             }
 
             long remaining = aggregate.quantity - aggregate.filledQuantity;
             long appliedQuantity = Math.min(remaining, fillQuantity);
             if (appliedQuantity <= 0L) {
-                return false;
+                aggregate.processedEventIds.add(eventId);
+                return EventApplyStatus.IGNORED;
             }
+
+            if (ledgerService != null) {
+                if (tradeId <= 0L || buyerUserId <= 0L || sellerUserId <= 0L
+                        || settlementAmount <= 0L
+                        || buyerUserId != aggregate.userId) {
+                    return EventApplyStatus.SETTLEMENT_REJECTED;
+                }
+                try {
+                    if (!ledgerService.settleTrade(tradeId, buyerUserId,
+                            sellerUserId, settlementAmount)) {
+                        return EventApplyStatus.SETTLEMENT_REJECTED;
+                    }
+                } catch (IllegalArgumentException invalidSettlement) {
+                    return EventApplyStatus.SETTLEMENT_REJECTED;
+                }
+            }
+            aggregate.processedEventIds.add(eventId);
             aggregate.filledQuantity += appliedQuantity;
             aggregate.state = aggregate.filledQuantity == aggregate.quantity
                     ? OrderState.FILLED : OrderState.PARTIAL_FILLED;
-            return true;
+            return EventApplyStatus.APPLIED;
         }
 
-        return false;
+        aggregate.processedEventIds.add(eventId);
+        return EventApplyStatus.IGNORED;
     }
 
     /**
@@ -294,9 +385,13 @@ public final class OrderStateMachine {
                                       EventType type,
                                       long userId,
                                       String symbol,
-                                      long price,
-                                      long quantity,
-                                      long fillQuantity) {
+                                       long price,
+                                       long quantity,
+                                       long fillQuantity,
+                                       long tradeId,
+                                       long buyerUserId,
+                                       long sellerUserId,
+                                       long settlementAmount) {
         if (type == EventType.ORDER_CREATED) {
             return OrderEvent.created(eventId, orderId, userId, symbol, price, quantity);
         }
@@ -308,6 +403,10 @@ public final class OrderStateMachine {
         }
         if (type == EventType.RISK_RELEASED) {
             return OrderEvent.riskReleased(eventId, orderId);
+        }
+        if (type == EventType.MATCH_FILLED && tradeId > 0L) {
+            return OrderEvent.matchFilled(eventId, orderId, fillQuantity, tradeId,
+                    buyerUserId, sellerUserId, settlementAmount);
         }
         return OrderEvent.matchFilled(eventId, orderId, fillQuantity);
     }

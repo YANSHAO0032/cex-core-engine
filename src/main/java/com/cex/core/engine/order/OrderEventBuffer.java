@@ -80,6 +80,25 @@ public final class OrderEventBuffer {
         return pending == null ? 0 : pending.byId.size();
     }
 
+    /**
+     * 移除指定订单的一个待处理事件。
+     *
+     * @param orderId 订单标识
+     * @param eventId 事件幂等标识
+     * @return 成功移除返回 true
+     */
+    public boolean remove(long orderId, long eventId) {
+        PendingEvents pending = pendingByOrder.get(orderId);
+        if (pending == null || pending.byId.remove(eventId) == null) {
+            return false;
+        }
+        pending.arrivalOrder.removeIf(event -> event.getEventId() == eventId);
+        if (pending.byId.isEmpty()) {
+            pendingByOrder.remove(orderId, pending);
+        }
+        return true;
+    }
+
     /** 单个订单的事件幂等索引和到达顺序队列。 */
     private static final class PendingEvents {
 

@@ -80,6 +80,11 @@ flowchart LR
 1. 兼容路径使用 `OrderEvent`、`MpscRingBuffer` 和 `apply`，便于调试和读取状态快照。
 2. 高吞吐路径使用 `PrimitiveEventRingBuffer`、`PrimitiveEventDispatcher` 和 `applyFast`，事件字段直接写入固定 primitive 槽位，减少热路径对象创建。
 
+需要资金结算的生产路径使用 `new OrderStateMachine(ledgerService)`，并发布带
+`tradeId`、`buyerUserId`、`sellerUserId` 和 `settlementAmount` 的
+`OrderEvent.matchFilled(...)`。缺少这些事实或买方冻结资金不足时，状态机返回
+`SETTLEMENT_REJECTED`，不会推进订单成交数量。
+
 风控计算与订单状态更新解耦。`RiskEngine` 负责累计成交金额和生成判定；超出阈值后生成独立的 `RISK_HOLD` 事件，并向 `ApprovalTaskService` 提交纯内存异步审批任务。审批通过时，审批 worker 调用账本 `tradeDebit` 扣减冻结资金并发布 `RISK_RELEASED` 放行事件；审批拒绝时调用 `unfreeze` 解冻资金并发布 `ORDER_CANCELLED` 撤单事件。审批任务以 `taskId` 幂等提交，重复审批请求不会重复扣减或重复解冻。
 
 ## 4. 订单状态机图
@@ -181,16 +186,16 @@ sequenceDiagram
 
 - `submit` 使用 `ConcurrentHashMap.putIfAbsent(taskId)` 做任务幂等，重复审批任务不会重复进入队列。
 - worker 使用单线程 `LinkedBlockingQueue` 异步消费审批任务，避免审批流程进入高频撮合事件热路径。
-- 审批通过时，账本先从冻结金额扣减到 `traded`，再发布 `RISK_RELEASED`，订单恢复到进入 `RISK_HOLD` 前的活跃态。
+- 审批通过时，账本先从冻结金额扣减到非负 `traded`，再发布 `RISK_RELEASED`，订单恢复到进入 `RISK_HOLD` 前的活跃态。
 - 审批拒绝时，账本先解冻资金，再发布 `ORDER_CANCELLED`，订单进入终态 `CANCELLED`。
 - 审批策略返回空结果、冻结余额不足或解冻失败时，任务进入 `FAILED`，订单保持 `RISK_HOLD`，避免状态和资金侧产生半完成语义。
 
 ## 6. 资产一致性证明
 
-每个账户开户时建立不可变守恒常量：
+每个账户维护当前所有权对应的守恒基线；跨账户成交时，买方基线减少、卖方基线增加：
 
 ```text
-constant = initialAvailable
+constant = current account asset ownership
 available = initialAvailable
 frozen = 0
 traded = 0
@@ -199,27 +204,32 @@ traded = 0
 系统维护以下不变量：
 
 ```text
-available + frozen + traded = constant
+available + frozen + traded = account constant
 ```
 
-所有资金字段使用资产最小单位的 `long`。每次操作都在用户分片锁内完成，其他线程不会观察到该次操作的中间状态。
+所有资金字段使用资产最小单位的 `long`，且 `available`、`frozen`、`traded` 均不得为负。普通单账户操作在用户分片锁内完成；买卖双方结算按分片序号排序同时持有两个账户锁，避免交叉成交死锁。
 
 | 操作 | 余额变化 | 守恒变化 |
 |---|---|---|
 | `freeze(amount)` | `available -= amount`；`frozen += amount` | `-amount + amount = 0` |
 | `unfreeze(amount)` | `frozen -= amount`；`available += amount` | `-amount + amount = 0` |
 | `tradeDebit(amount)` | `frozen -= amount`；`traded += amount` | `-amount + amount = 0` |
-| `tradeCredit(amount)` | `available += amount`；`traded -= amount` | `+amount - amount = 0` |
+| `tradeCredit(amount)` | `available += amount`；`traded -= amount` | 仅当 `traded >= amount` 时允许 |
+| `settleTrade(tradeId, buyer, seller, amount)` | 买方 `frozen -= amount`；卖方 `available += amount` | 买卖双方真实转移，系统总资产不变 |
 
-因此，设一次操作前余额为 `(A, F, T)`，操作后为 `(A', F', T')`，四类资金操作均满足：
+因此，单账户内部操作满足：
 
 ```text
-A' + F' + T' = A + F + T = constant
+A' + F' + T' = A + F + T = account constant
 ```
 
-账本只允许从有足够余额的桶中扣减：冻结要求 `available >= amount`，解冻和成交借记分别要求 `frozen >= amount`。金额非正数直接拒绝，溢出通过 `Math.addExact`/`Math.subtractExact` 暴露，避免静默破坏守恒计算。
+成交结算另外满足系统级不变量：
 
-`traded` 是成交结算偏移桶，允许为有符号值，用于在内存模型中表示成交借记和成交贷记的相对结算变化；最终守恒检查仍以三项代数和为准。
+```text
+Σ(all accounts: available + frozen + traded) = initial system assets
+```
+
+账本只允许从有足够余额的桶中扣减：冻结要求 `available >= amount`，解冻和成交借记分别要求 `frozen >= amount`，贷记要求 `traded >= amount`。金额非正数直接拒绝，溢出通过 `Math.addExact`/`Math.subtractExact` 暴露，避免静默破坏守恒计算。`settleTrade` 使用 `tradeId` 幂等，重复成交不会重复转账。
 
 ## 7. 乱序事件收敛方案
 
@@ -229,8 +239,9 @@ sequenceDiagram
     participant S as OrderStateMachine
     participant B as OrderEventBuffer
     participant O as OrderAggregate
+    participant L as LedgerService
 
-    M->>S: MATCH_FILLED(eventId=100)
+    M->>S: MATCH_FILLED(eventId=100, buyer, seller, amount)
     S->>B: 未发现 orderId，缓存事件
     S-->>M: BUFFERED
     M->>S: ORDER_CREATED
@@ -238,6 +249,7 @@ sequenceDiagram
     S->>B: drain(orderId)
     B-->>S: 返回历史事件
     S->>O: 按到达顺序 replay MATCH
+    S->>L: settleTrade(tradeId, buyer, seller, amount)
     S-->>M: APPLIED
 ```
 
@@ -293,9 +305,9 @@ sequenceDiagram
 
 ```text
 Event pipeline benchmark (500000 events, 16 producers / 1 consumer)
-Before: TPS=2286582.93, avg/event=0.44 us, GC collections=0, GC time=0 ms
-After : TPS=2481144.54, avg/event=0.40 us, GC collections=0, GC time=0 ms
-Speedup: 1.09x, GC collections delta: 0 -> 0
+Before: TPS=2231521.22, avg/event=0.45 us, GC collections=1, GC time=2 ms
+After : TPS=2700202.46, avg/event=0.37 us, GC collections=0, GC time=0 ms
+Speedup: 1.21x, GC collections delta: 1 -> 0
 ```
 
 其中：
@@ -324,19 +336,21 @@ Remove-Item Env:MAVEN_OPTS
 - 随机 `Thread.sleep()`
 - 协调线程随机调用 `Thread.interrupt()`
 - 故意执行零金额资金操作，验证异常路径
-- 测试结束校验每个用户的资产守恒
+- 测试结束校验每个用户余额非负、账户守恒，以及所有买卖双方账户的系统总资产守恒
+- 撮合事件携带不同买方/卖方账户，由 `settleTrade` 执行真实双边转账并按 `tradeId` 幂等
 
 最近一次运行结果：
 
 ```text
-Chaos metrics: operations=21686993, TPS=361390.20, avgLatency=0.15 us,
-P99=0.70 us, expectedExceptions=216545, interrupts=5887
+Chaos metrics: operations=21740221, TPS=362313.00, avgLatency=0.14 us,
+P99=0.70 us, expectedExceptions=217145, interrupts=5903
 ```
 
 最终断言：
 
 ```text
-available + frozen + traded = initialBalance
+每个账户：available、frozen、traded 均 >= 0 且满足账户守恒；全体账户：
+Σ(available + frozen + traded) = initialSystemAssets
 ```
 
 因此混沌测试不是只验证成功案例，同时覆盖线程中断、非法金额、账户竞争、重复订单操作、事件背压和成交/撤单竞争。

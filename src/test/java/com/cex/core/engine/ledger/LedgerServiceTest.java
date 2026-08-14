@@ -28,7 +28,7 @@ class LedgerServiceTest {
         assertTrue(ledger.freeze(1L, 400L));
         assertTrue(ledger.unfreeze(1L, 100L));
         assertTrue(ledger.tradeDebit(1L, 200L));
-        assertTrue(ledger.tradeCredit(1L, 300L));
+        assertTrue(ledger.tradeCredit(1L, 200L));
 
         LedgerBalance balance = ledger.snapshot(1L);
         assertEquals(1_000L, balance.getAvailable() + balance.getFrozen()
@@ -72,6 +72,47 @@ class LedgerServiceTest {
         assertEquals(threadCount * (long) iterations, balance.getAvailable());
         assertEquals(0L, balance.getFrozen());
         assertEquals(0L, balance.getTraded());
+        assertTrue(balance.isConserved());
+    }
+
+    @Test
+    void settlesFrozenBuyerFundsToSellerExactlyOnce() {
+        LedgerService ledger = new LedgerService(4);
+        ledger.openAccount(1L, 1_000L);
+        ledger.openAccount(2L, 500L);
+
+        assertTrue(ledger.freeze(1L, 200L));
+        assertTrue(ledger.settleTrade(99L, 1L, 2L, 200L));
+        assertTrue(ledger.settleTrade(99L, 1L, 2L, 200L));
+
+        LedgerBalance buyer = ledger.snapshot(1L);
+        LedgerBalance seller = ledger.snapshot(2L);
+        assertEquals(800L, buyer.getAvailable());
+        assertEquals(0L, buyer.getFrozen());
+        assertEquals(700L, seller.getAvailable());
+        assertEquals(0L, seller.getFrozen());
+        assertEquals(1_500L, buyer.getAvailable() + buyer.getFrozen()
+                + seller.getAvailable() + seller.getFrozen());
+        assertTrue(buyer.isConserved());
+        assertTrue(seller.isConserved());
+    }
+
+    @Test
+    void rejectsCreditWithoutARealDebitAndRejectsInsufficientSettlement() {
+        LedgerService ledger = new LedgerService(2);
+        ledger.openAccount(1L, 100L);
+        ledger.openAccount(2L, 100L);
+
+        assertTrue(!ledger.tradeCredit(1L, 1L));
+        assertTrue(!ledger.settleTrade(1L, 1L, 2L, 1L));
+        assertTrue(ledger.freeze(1L, 10L));
+        assertTrue(ledger.tradeDebit(1L, 10L));
+        assertTrue(ledger.tradeCredit(1L, 10L));
+
+        LedgerBalance balance = ledger.snapshot(1L);
+        assertTrue(balance.getAvailable() >= 0L);
+        assertTrue(balance.getFrozen() >= 0L);
+        assertTrue(balance.getTraded() >= 0L);
         assertTrue(balance.isConserved());
     }
 }

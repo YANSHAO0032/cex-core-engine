@@ -24,6 +24,14 @@ public final class OrderEvent {
     private final long quantity;
     /** 本次撮合成交数量，使用交易标的最小数量单位表示。 */
     private final long fillQuantity;
+    /** 结算成交幂等标识；未携带结算信息的兼容事件为 0。 */
+    private final long tradeId;
+    /** 结算买方账户；未携带结算信息的兼容事件为 0。 */
+    private final long buyerUserId;
+    /** 结算卖方账户；未携带结算信息的兼容事件为 0。 */
+    private final long sellerUserId;
+    /** 结算金额；未携带结算信息的兼容事件为 0。 */
+    private final long settlementAmount;
 
     /**
      * 创建不可变事件对象。
@@ -44,7 +52,11 @@ public final class OrderEvent {
                        String symbol,
                        long price,
                        long quantity,
-                       long fillQuantity) {
+                       long fillQuantity,
+                       long tradeId,
+                       long buyerUserId,
+                       long sellerUserId,
+                       long settlementAmount) {
         this.eventId = eventId;
         this.orderId = orderId;
         this.type = type;
@@ -53,6 +65,10 @@ public final class OrderEvent {
         this.price = price;
         this.quantity = quantity;
         this.fillQuantity = fillQuantity;
+        this.tradeId = tradeId;
+        this.buyerUserId = buyerUserId;
+        this.sellerUserId = sellerUserId;
+        this.settlementAmount = settlementAmount;
     }
 
     /**
@@ -73,7 +89,8 @@ public final class OrderEvent {
                                      long price,
                                      long quantity) {
         return new OrderEvent(eventId, orderId, EventType.ORDER_CREATED,
-                userId, symbol, price, quantity, 0L);
+                userId, symbol, price, quantity, 0L,
+                0L, 0L, 0L, 0L);
     }
 
     /**
@@ -85,7 +102,8 @@ public final class OrderEvent {
      */
     public static OrderEvent cancelled(long eventId, long orderId) {
         return new OrderEvent(eventId, orderId, EventType.ORDER_CANCELLED,
-                0L, null, 0L, 0L, 0L);
+                0L, null, 0L, 0L, 0L,
+                0L, 0L, 0L, 0L);
     }
 
     /**
@@ -98,7 +116,32 @@ public final class OrderEvent {
      */
     public static OrderEvent matchFilled(long eventId, long orderId, long fillQuantity) {
         return new OrderEvent(eventId, orderId, EventType.MATCH_FILLED,
-                0L, null, 0L, 0L, fillQuantity);
+                0L, null, 0L, 0L, fillQuantity,
+                0L, 0L, 0L, 0L);
+    }
+
+    /**
+     * 构造带真实买卖双方结算信息的成交事件。
+     *
+     * @param eventId 状态机事件幂等标识
+     * @param orderId 成交所属订单
+     * @param fillQuantity 本次成交数量
+     * @param tradeId 资金结算幂等标识
+     * @param buyerUserId 买方账户，必须与订单用户一致
+     * @param sellerUserId 卖方账户
+     * @param settlementAmount 买方冻结并转给卖方的成交金额
+     * @return 带资金结算事实的成交事件
+     */
+    public static OrderEvent matchFilled(long eventId,
+                                         long orderId,
+                                         long fillQuantity,
+                                         long tradeId,
+                                         long buyerUserId,
+                                         long sellerUserId,
+                                         long settlementAmount) {
+        return new OrderEvent(eventId, orderId, EventType.MATCH_FILLED,
+                0L, null, 0L, 0L, fillQuantity,
+                tradeId, buyerUserId, sellerUserId, settlementAmount);
     }
 
     /**
@@ -110,7 +153,8 @@ public final class OrderEvent {
      */
     public static OrderEvent riskHold(long eventId, long orderId) {
         return new OrderEvent(eventId, orderId, EventType.RISK_HOLD,
-                0L, null, 0L, 0L, 0L);
+                0L, null, 0L, 0L, 0L,
+                0L, 0L, 0L, 0L);
     }
 
     /**
@@ -122,7 +166,8 @@ public final class OrderEvent {
      */
     public static OrderEvent riskReleased(long eventId, long orderId) {
         return new OrderEvent(eventId, orderId, EventType.RISK_RELEASED,
-                0L, null, 0L, 0L, 0L);
+                0L, null, 0L, 0L, 0L,
+                0L, 0L, 0L, 0L);
     }
 
     /**
@@ -195,5 +240,25 @@ public final class OrderEvent {
      */
     public long getFillQuantity() {
         return fillQuantity;
+    }
+
+    /** 获取成交结算幂等标识；兼容非结算事件时返回 0。 */
+    public long getTradeId() {
+        return tradeId;
+    }
+
+    /** 获取成交买方账户；兼容非结算事件时返回 0。 */
+    public long getBuyerUserId() {
+        return buyerUserId;
+    }
+
+    /** 获取成交卖方账户；兼容非结算事件时返回 0。 */
+    public long getSellerUserId() {
+        return sellerUserId;
+    }
+
+    /** 获取成交结算金额；兼容非结算事件时返回 0。 */
+    public long getSettlementAmount() {
+        return settlementAmount;
     }
 }

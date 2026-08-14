@@ -3,6 +3,7 @@ package com.cex.core.engine.event;
 import com.cex.core.engine.order.Order;
 import com.cex.core.engine.order.OrderState;
 import com.cex.core.engine.order.OrderStateMachine;
+import com.cex.core.engine.ledger.LedgerService;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -99,5 +100,35 @@ class EventDispatcherTest {
         assertTrue(ringBuffer.offer(3));
         assertEquals(2, ringBuffer.poll());
         assertEquals(3, ringBuffer.poll());
+    }
+
+    @Test
+    void primitiveDispatcherCarriesTwoSidedSettlementFacts() throws Exception {
+        LedgerService ledger = new LedgerService(4);
+        ledger.openAccount(7L, 1_000L);
+        ledger.openAccount(8L, 500L);
+        assertTrue(ledger.freeze(7L, 100L));
+
+        OrderStateMachine stateMachine = new OrderStateMachine(ledger);
+        PrimitiveEventDispatcher dispatcher = new PrimitiveEventDispatcher(stateMachine, 16);
+        dispatcher.start();
+        try {
+            assertTrue(dispatcher.publish(EventType.ORDER_CREATED, 1L, 10L, 7L,
+                    "BTC-USDT", 50_000L, 10L, 0L));
+            assertTrue(dispatcher.publish(EventType.MATCH_FILLED, 2L, 10L, 0L,
+                    null, 0L, 0L, 10L, 100L, 7L, 8L, 100L));
+            long deadline = System.nanoTime()
+                    + java.util.concurrent.TimeUnit.SECONDS.toNanos(5L);
+            while (dispatcher.processedEventCount() < 2L
+                    && System.nanoTime() < deadline) {
+                Thread.onSpinWait();
+            }
+            assertEquals(2L, dispatcher.processedEventCount());
+            assertEquals(OrderState.FILLED, stateMachine.get(10L).getState());
+            assertEquals(600L, ledger.snapshot(8L).getAvailable());
+            assertNull(dispatcher.getConsumerFailure());
+        } finally {
+            dispatcher.close();
+        }
     }
 }

@@ -85,11 +85,29 @@ public final class PrimitiveEventDispatcher implements AutoCloseable {
                            long price,
                            long quantity,
                            long fillQuantity) {
+        return publish(type, eventId, orderId, userId, symbol, price, quantity,
+                fillQuantity, 0L, 0L, 0L, 0L);
+    }
+
+    /** 发布带买卖双方结算事实的 primitive 订单事件。 */
+    public boolean publish(EventType type,
+                           long eventId,
+                           long orderId,
+                           long userId,
+                           String symbol,
+                           long price,
+                           long quantity,
+                           long fillQuantity,
+                           long tradeId,
+                           long buyerUserId,
+                           long sellerUserId,
+                           long settlementAmount) {
         if (type == null) {
             throw new NullPointerException("type");
         }
         return ringBuffer.offer(type.ordinal(), eventId, orderId, userId, symbol,
-                price, quantity, fillQuantity);
+                price, quantity, fillQuantity, tradeId, buyerUserId,
+                sellerUserId, settlementAmount);
     }
 
     /**
@@ -112,10 +130,28 @@ public final class PrimitiveEventDispatcher implements AutoCloseable {
                                 long userId,
                                 String symbol,
                                 long price,
+                                 long quantity,
+                                 long fillQuantity) throws InterruptedException {
+        publishBlocking(type, eventId, orderId, userId, symbol, price, quantity,
+                fillQuantity, 0L, 0L, 0L, 0L);
+    }
+
+    /** 以自旋背压方式发布带结算事实的 primitive 事件。 */
+    public void publishBlocking(EventType type,
+                                long eventId,
+                                long orderId,
+                                long userId,
+                                String symbol,
+                                long price,
                                 long quantity,
-                                long fillQuantity) throws InterruptedException {
+                                long fillQuantity,
+                                long tradeId,
+                                long buyerUserId,
+                                long sellerUserId,
+                                long settlementAmount) throws InterruptedException {
         while (!publish(type, eventId, orderId, userId, symbol, price,
-                quantity, fillQuantity)) {
+                quantity, fillQuantity, tradeId, buyerUserId, sellerUserId,
+                settlementAmount)) {
             if (Thread.interrupted()) {
                 throw new InterruptedException("event publisher interrupted");
             }
@@ -200,9 +236,14 @@ public final class PrimitiveEventDispatcher implements AutoCloseable {
                           String symbol,
                           long price,
                           long quantity,
-                          long fillQuantity) {
+                          long fillQuantity,
+                          long tradeId,
+                          long buyerUserId,
+                          long sellerUserId,
+                          long settlementAmount) {
         stateMachine.applyFast(eventId, orderId, EVENT_TYPES[type], userId,
-                symbol, price, quantity, fillQuantity);
+                symbol, price, quantity, fillQuantity, tradeId, buyerUserId,
+                sellerUserId, settlementAmount);
         processedEvents.increment();
     }
 }

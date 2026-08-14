@@ -17,7 +17,7 @@ public final class PrimitiveEventRingBuffer {
     private final int mask;
     /** 事件类型 ordinal 数组。 */
     private final int[] types;
-    /** 每槽位连续保存 eventId、orderId、userId、price、quantity、fillQuantity 等字段的 payload。 */
+    /** 每槽位连续保存事件和成交结算字段的 primitive payload。 */
     private final long[] payload;
     /** 交易对引用数组，槽位消费后立即清空以便对象回收。 */
     private final String[] symbols;
@@ -41,7 +41,7 @@ public final class PrimitiveEventRingBuffer {
         this.capacity = capacity;
         this.mask = capacity - 1;
         this.types = new int[capacity];
-        this.payload = new long[capacity * 7];
+        this.payload = new long[capacity * 10];
         this.symbols = new String[capacity];
         this.publishedSequences = new AtomicLongArray(capacity);
         for (int i = 0; i < capacity; i++) {
@@ -71,6 +71,23 @@ public final class PrimitiveEventRingBuffer {
                          long price,
                          long quantity,
                          long fillQuantity) {
+        return offer(type, eventId, orderId, userId, symbol, price, quantity,
+                fillQuantity, 0L, 0L, 0L, 0L);
+    }
+
+    /** 将带成交结算事实的 primitive 事件写入环形缓冲区。 */
+    public boolean offer(int type,
+                         long eventId,
+                         long orderId,
+                         long userId,
+                         String symbol,
+                         long price,
+                         long quantity,
+                         long fillQuantity,
+                         long tradeId,
+                         long buyerUserId,
+                         long sellerUserId,
+                         long settlementAmount) {
         long sequence;
         for (;;) {
             long producer = producerSequence.get();
@@ -86,7 +103,7 @@ public final class PrimitiveEventRingBuffer {
         }
 
         int index = (int) sequence & mask;
-        int offset = index * 7;
+        int offset = index * 10;
         types[index] = type;
         payload[offset] = eventId;
         payload[offset + 1] = orderId;
@@ -94,6 +111,10 @@ public final class PrimitiveEventRingBuffer {
         payload[offset + 3] = price;
         payload[offset + 4] = quantity;
         payload[offset + 5] = fillQuantity;
+        payload[offset + 6] = tradeId;
+        payload[offset + 7] = buyerUserId;
+        payload[offset + 8] = sellerUserId;
+        payload[offset + 9] = settlementAmount;
         symbols[index] = symbol;
         publishedSequences.lazySet(index, sequence);
         return true;
@@ -113,9 +134,10 @@ public final class PrimitiveEventRingBuffer {
             return false;
         }
 
-        int offset = index * 7;
+        int offset = index * 10;
         consumer.accept(types[index], payload[offset], payload[offset + 1], payload[offset + 2],
-                symbols[index], payload[offset + 3], payload[offset + 4], payload[offset + 5]);
+                symbols[index], payload[offset + 3], payload[offset + 4], payload[offset + 5],
+                payload[offset + 6], payload[offset + 7], payload[offset + 8], payload[offset + 9]);
         symbols[index] = null;
         consumerSequence.lazySet(sequence + 1L);
         return true;
@@ -169,14 +191,22 @@ public final class PrimitiveEventRingBuffer {
          * @param price 订单价格
          * @param quantity 订单数量
          * @param fillQuantity 成交数量
+         * @param tradeId 成交结算幂等标识
+         * @param buyerUserId 买方账户
+         * @param sellerUserId 卖方账户
+         * @param settlementAmount 成交结算金额
          */
         void accept(int type,
                     long eventId,
                     long orderId,
                     long userId,
-                    String symbol,
-                    long price,
-                    long quantity,
-                    long fillQuantity);
+                     String symbol,
+                     long price,
+                     long quantity,
+                     long fillQuantity,
+                     long tradeId,
+                     long buyerUserId,
+                     long sellerUserId,
+                     long settlementAmount);
     }
 }

@@ -111,9 +111,21 @@ class ChaosConcurrencyTest {
         for (long userId : fixture.userIds) {
             LedgerBalance balance = fixture.ledger.snapshot(userId);
             assertTrue(balance.isConserved(), "asset conservation failed for " + userId);
-            assertEquals(INITIAL_BALANCE, balance.getAvailable()
-                    + balance.getFrozen() + balance.getTraded());
+            assertTrue(balance.getAvailable() >= 0L && balance.getFrozen() >= 0L
+                            && balance.getTraded() >= 0L,
+                    "negative balance for " + userId);
         }
+        long totalAvailable = 0L;
+        long totalFrozen = 0L;
+        for (long userId : fixture.userIds) {
+            LedgerBalance balance = fixture.ledger.snapshot(userId);
+            totalAvailable += balance.getAvailable();
+            totalFrozen += balance.getFrozen();
+        }
+        assertEquals(USER_COUNT * INITIAL_BALANCE, totalAvailable + totalFrozen,
+                "system asset total must be conserved across counterparties");
+        assertTrue(fixture.ledger.settledTradeCount() > 0L,
+                "chaos test must execute at least one two-sided settlement");
     }
 
     /** 组合账本、状态机和事件分发器的混沌测试夹具。 */
@@ -122,7 +134,7 @@ class ChaosConcurrencyTest {
         /** 支持冻结、解冻和成交结算的内存账本。 */
         private final LedgerService ledger = new LedgerService(64);
         /** 支持乱序和幂等订单事件的状态机。 */
-        private final OrderStateMachine stateMachine = new OrderStateMachine();
+        private final OrderStateMachine stateMachine = new OrderStateMachine(ledger);
         /** 用于模拟 MQ 的对象事件分发器。 */
         private final EventDispatcher dispatcher = new EventDispatcher(stateMachine, 1 << 12);
         /** 按订单保存剩余冻结金额，使用 AtomicLong 支持并发扣减。 */
@@ -271,8 +283,8 @@ class ChaosConcurrencyTest {
          * @param orderId 成交订单标识
          * @param random 当前工作线程随机源
          * @throws InterruptedException 成交事件发布期间线程被中断时抛出
-         * @note reservation 使用 CAS 扣减剩余冻结金额；账本 tradeDebit/tradeCredit 各自保持资产守恒，
-         * 成交事件可能先于 CREATE 到达状态机缓存。
+         * @note reservation 使用 CAS 扣减剩余冻结金额；成交事件携带买卖双方，
+         * 由状态机消费时执行买方冻结到卖方可用的原子结算，成交事件可能先于 CREATE 到达状态机缓存。
          */
         private void match(long userId,
                            long orderId,
@@ -283,7 +295,11 @@ class ChaosConcurrencyTest {
             }
             long amount = random.nextLong(1L, 11L);
             java.util.concurrent.atomic.AtomicLong reservation = reservations.get(orderId);
-            if (reservation != null) {
+            if (reservation == null) {
+                // 没有冻结预留就不能向状态机伪造成交事实。
+                return;
+            }
+            {
                 long current;
                 do {
                     current = reservation.get();
@@ -292,17 +308,27 @@ class ChaosConcurrencyTest {
                     }
                 // CAS 只扣减本订单剩余预留，竞争失败时重新读取最新冻结数量。
                 } while (!reservation.compareAndSet(current, current - amount));
-                if (current >= amount) {
-                    if (ledger.tradeDebit(userId, amount)) {
-                        ledger.tradeCredit(userId, amount);
-                    } else {
-                        reservation.addAndGet(amount);
-                    }
+                if (current < amount) {
+                    return;
                 }
             }
             long round = random.nextInt(8);
-            dispatcher.publishBlocking(OrderEvent.matchFilled(
-                    orderId * 100L + 10L + round, orderId, amount));
+            long tradeId = orderId * 100L + 10L + round;
+            long sellerUserId = sellerFor(userId);
+            try {
+                dispatcher.publishBlocking(OrderEvent.matchFilled(
+                        tradeId, orderId, amount, tradeId, userId,
+                        sellerUserId, amount));
+            } catch (InterruptedException interrupted) {
+                reservation.addAndGet(amount);
+                throw interrupted;
+            }
+        }
+
+        /** 为每个买方选择不同账户作为对手方，覆盖真实双边转账。 */
+        private long sellerFor(long buyerUserId) {
+            int buyerIndex = (int) (buyerUserId - 10_000L);
+            return userIds[(buyerIndex + 1) % USER_COUNT];
         }
     }
 

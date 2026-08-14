@@ -3,7 +3,7 @@ package com.cex.core.engine.ledger;
 /**
  * 用户账本余额的一致性快照。
  *
- * <p>余额使用最小资金单位表示；available、frozen、traded 三项应满足资产守恒等式。
+ * <p>余额使用最小资金单位表示；available、frozen、traded 三项均不得为负，且应满足资产守恒等式。
  * 快照不可变，适合并发读取。</p>
  */
 public final class LedgerBalance {
@@ -14,9 +14,9 @@ public final class LedgerBalance {
     private final long available;
     /** 冻结余额，资金单位为资产最小单位，属于守恒总量。 */
     private final long frozen;
-    /** 有符号成交结算偏移，借记增加、贷记减少，参与资产守恒。 */
+    /** 已完成但尚未转移出本账本的成交借记余额。 */
     private final long traded;
-    /** 开户时确定的资产守恒常量。 */
+    /** 当前账户所有权对应的资产守恒基线，跨账户结算时随转入转出调整。 */
     private final long conservationConstant;
 
     /**
@@ -25,7 +25,7 @@ public final class LedgerBalance {
      * @param userId 用户标识
      * @param available 可用余额，使用资产最小单位
      * @param frozen 冻结余额，使用资产最小单位
-     * @param traded 有符号成交结算偏移，使用资产最小单位
+     * @param traded 已完成但尚未转移出本账本的成交借记余额
      * @param conservationConstant 资产守恒常量
      */
     LedgerBalance(long userId,
@@ -68,9 +68,9 @@ public final class LedgerBalance {
     }
 
     /**
-     * 获取有符号成交结算偏移。
+     * 获取成交借记余额。
      *
-     * @return 借记增加、贷记减少的成交结算偏移
+     * @return 非负的成交借记余额
      */
     public long getTraded() {
         return traded;
@@ -79,7 +79,7 @@ public final class LedgerBalance {
     /**
      * 获取资产守恒常量。
      *
-     * @return 开户时确定的守恒常量
+     * @return 当前账户资产守恒基线
      */
     public long getConservationConstant() {
         return conservationConstant;
@@ -88,11 +88,12 @@ public final class LedgerBalance {
     /**
      * 校验当前余额是否满足资产守恒规则。
      *
-     * @return available + frozen + traded 等于守恒常量时返回 true
+     * @return 三项余额均非负且总和等于守恒常量时返回 true
      * @note 快照不可变，因此本次校验不受并发余额变更影响。
      */
     public boolean isConserved() {
-        return Math.addExact(Math.addExact(available, frozen), traded)
+        return available >= 0L && frozen >= 0L && traded >= 0L
+                && Math.addExact(Math.addExact(available, frozen), traded)
                 == conservationConstant;
     }
 }

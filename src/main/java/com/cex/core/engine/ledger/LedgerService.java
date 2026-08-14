@@ -17,6 +17,9 @@ public final class LedgerService {
 
     /** 按用户标识保存内存账本账户，账户对象只在对应分片锁内修改。 */
     private final ConcurrentHashMap<Long, LedgerAccount> accounts = new ConcurrentHashMap<>();
+    /** 已成功结算的成交幂等索引，避免同一 tradeId 重复转账。 */
+    private final ConcurrentHashMap<Long, SettledTrade> settledTrades =
+            new ConcurrentHashMap<>();
     /** 账本锁分片数组，用于避免全局锁并降低每账户锁对象数量。 */
     private final ReentrantLock[] stripes;
     /** 锁分片掩码，用于将用户标识映射到固定分片。 */
@@ -118,12 +121,12 @@ public final class LedgerService {
     }
 
     /**
-     * 将冻结资金借记到成交结算偏移桶。
+     * 将冻结资金借记到本账户的成交待转余额。
      *
      * @param userId 用户资产账户标识
      * @param amount 成交借记金额，使用资产最小资金单位且必须为正数
      * @return 冻结余额充足并完成借记时返回 true，否则返回 false
-     * @note 在同一临界区执行 frozen 减少与 traded 增加，保证 available + frozen + traded 不变。
+     * @note 在同一临界区执行 frozen 减少与 traded 增加，保证余额非负且守恒。
      * @note 禁止同一成交流水重复调用，否则应由上层 eventId 幂等机制拦截。
      */
     public boolean tradeDebit(long userId, long amount) {
@@ -146,12 +149,12 @@ public final class LedgerService {
     }
 
     /**
-     * 增加可用余额并扣减对应的成交结算偏移。
+     * 将本账户已有的成交待转余额转回可用余额。
      *
      * @param userId 用户资产账户标识
      * @param amount 成交贷记金额，使用资产最小资金单位且必须为正数
      * @return 成交贷记完成时返回 true
-     * @note available 增加与 traded 减少在同一用户分片锁内完成，资产守恒常量保持不变。
+     * @note 只有 traded 足够时才允许贷记，禁止无对应借记的资金增加。
      */
     public boolean tradeCredit(long userId, long amount) {
         requirePositive(amount);
@@ -159,6 +162,10 @@ public final class LedgerService {
         ReentrantLock lock = lockFor(userId);
         lock.lock();
         try {
+            // 贷记只能消费本账户已有的成交借记，禁止凭空制造可用余额。
+            if (account.traded < amount) {
+                return false;
+            }
             long newAvailable = Math.addExact(account.available, amount);
             long newTraded = Math.subtractExact(account.traded, amount);
             account.available = newAvailable;
@@ -166,6 +173,77 @@ public final class LedgerService {
             return true;
         } finally {
             lock.unlock();
+        }
+    }
+
+    /**
+     * 将买方已冻结资金原子转移到卖方可用余额。
+     *
+     * <p>该操作是成交结算的真实资金路径：买方减少冻结余额，卖方增加可用余额，
+     * 不使用有符号偏移掩盖资金流转。两个账户按锁分片序号排序加锁，避免交叉成交死锁。</p>
+     *
+     * @param tradeId 成交幂等标识
+     * @param buyerUserId 买方账户
+     * @param sellerUserId 卖方账户
+     * @param amount 成交金额，必须为正数
+     * @return 资金充足且首次结算成功，或相同 tradeId 已成功结算时返回 true；资金不足返回 false
+     * @throws IllegalArgumentException 参数非法、买卖双方相同或 tradeId 复用方式冲突时抛出
+     */
+    public boolean settleTrade(long tradeId,
+                               long buyerUserId,
+                               long sellerUserId,
+                               long amount) {
+        requirePositive(tradeId);
+        requirePositive(amount);
+        if (buyerUserId == sellerUserId) {
+            throw new IllegalArgumentException("buyer and seller must be different accounts");
+        }
+
+        LedgerAccount buyer = account(buyerUserId);
+        LedgerAccount seller = account(sellerUserId);
+        ReentrantLock buyerLock = lockFor(buyerUserId);
+        ReentrantLock sellerLock = lockFor(sellerUserId);
+        ReentrantLock first = buyerLock;
+        ReentrantLock second = sellerLock;
+        if (stripeIndex(sellerUserId) < stripeIndex(buyerUserId)) {
+            first = sellerLock;
+            second = buyerLock;
+        }
+
+        first.lock();
+        if (second != first) {
+            second.lock();
+        }
+        try {
+            SettledTrade existing = settledTrades.get(tradeId);
+            if (existing != null) {
+                if (!existing.matches(buyerUserId, sellerUserId, amount)) {
+                    throw new IllegalArgumentException("tradeId already used for another settlement: "
+                            + tradeId);
+                }
+                return true;
+            }
+            if (buyer.frozen < amount) {
+                return false;
+            }
+
+            long newBuyerFrozen = Math.subtractExact(buyer.frozen, amount);
+            long newSellerAvailable = Math.addExact(seller.available, amount);
+            long newBuyerConstant = Math.subtractExact(buyer.conservationConstant, amount);
+            long newSellerConstant = Math.addExact(seller.conservationConstant, amount);
+
+            buyer.frozen = newBuyerFrozen;
+            buyer.conservationConstant = newBuyerConstant;
+            seller.available = newSellerAvailable;
+            seller.conservationConstant = newSellerConstant;
+            settledTrades.put(tradeId,
+                    new SettledTrade(buyerUserId, sellerUserId, amount));
+            return true;
+        } finally {
+            if (second != first) {
+                second.unlock();
+            }
+            first.unlock();
         }
     }
 
@@ -186,6 +264,15 @@ public final class LedgerService {
         } finally {
             lock.unlock();
         }
+    }
+
+    /**
+     * 获取已成功结算的成交数量，用于监控和混沌测试确认真实结算路径被执行。
+     *
+     * @return 已写入幂等索引的成交数量
+     */
+    public long settledTradeCount() {
+        return settledTrades.size();
     }
 
     /**
@@ -210,9 +297,14 @@ public final class LedgerService {
      * @return 用户对应的非公平分片锁
      */
     private ReentrantLock lockFor(long userId) {
+        return stripes[stripeIndex(userId)];
+    }
+
+    /** 计算用户对应的锁分片序号。 */
+    private int stripeIndex(long userId) {
         int hash = Long.hashCode(userId);
         hash ^= hash >>> 16;
-        return stripes[hash & stripeMask];
+        return hash & stripeMask;
     }
 
     /**
@@ -232,13 +324,13 @@ public final class LedgerService {
 
         /** 账户所属用户标识。 */
         private final long userId;
-        /** 开户时确定的资产守恒常量，资金单位为资产最小单位。 */
-        private final long conservationConstant;
+        /** 当前账户资产守恒基线，资金单位为资产最小单位。 */
+        private long conservationConstant;
         /** 可用余额，资金单位为资产最小单位。 */
         private long available;
         /** 冻结余额，资金单位为资产最小单位。 */
         private long frozen;
-        /** 有符号成交结算偏移，参与 available + frozen + traded 守恒。 */
+        /** 非负成交待转余额，参与 available + frozen + traded 守恒。 */
         private long traded;
 
         /**
@@ -251,6 +343,26 @@ public final class LedgerService {
             this.userId = userId;
             this.available = initialAvailable;
             this.conservationConstant = initialAvailable;
+        }
+    }
+
+    /** 已成功结算成交的不可变幂等记录。 */
+    private static final class SettledTrade {
+
+        private final long buyerUserId;
+        private final long sellerUserId;
+        private final long amount;
+
+        private SettledTrade(long buyerUserId, long sellerUserId, long amount) {
+            this.buyerUserId = buyerUserId;
+            this.sellerUserId = sellerUserId;
+            this.amount = amount;
+        }
+
+        private boolean matches(long buyerUserId, long sellerUserId, long amount) {
+            return this.buyerUserId == buyerUserId
+                    && this.sellerUserId == sellerUserId
+                    && this.amount == amount;
         }
     }
 }

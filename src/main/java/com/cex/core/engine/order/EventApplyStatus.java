@@ -13,5 +13,7 @@ public enum EventApplyStatus {
     /** eventId 已处理或已在待处理队列中，禁止再次执行。 */
     DUPLICATE,
     /** 事件因终态或业务状态不允许而被忽略。 */
-    IGNORED
+    IGNORED,
+    /** 成交事件因买方冻结资金不足或结算事实不完整而未推进。 */
+    SETTLEMENT_REJECTED
 }

@@ -1,10 +1,13 @@
 package com.cex.core.engine.order;
 
 import com.cex.core.engine.event.OrderEvent;
+import com.cex.core.engine.ledger.LedgerBalance;
+import com.cex.core.engine.ledger.LedgerService;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * 订单状态机乱序和幂等测试工具。
@@ -97,5 +100,76 @@ class OrderStateMachineTest {
 
         assertEquals(EventApplyStatus.IGNORED, released.getStatus());
         assertEquals(OrderState.CREATED, machine.get(10L).getState());
+    }
+
+    @Test
+    void matchedOrderSettlesBuyerFrozenFundsToSeller() {
+        LedgerService ledger = new LedgerService(4);
+        ledger.openAccount(7L, 1_000L);
+        ledger.openAccount(8L, 500L);
+        assertTrue(ledger.freeze(7L, 100L));
+
+        OrderStateMachine machine = new OrderStateMachine(ledger);
+        machine.apply(OrderEvent.created(1L, 10L, 7L,
+                "BTC-USDT", 50_000L, 10L));
+
+        EventApplyResult result = machine.apply(OrderEvent.matchFilled(
+                2L, 10L, 10L, 100L, 7L, 8L, 100L));
+
+        assertEquals(EventApplyStatus.APPLIED, result.getStatus());
+        assertEquals(OrderState.FILLED, machine.get(10L).getState());
+        LedgerBalance buyer = ledger.snapshot(7L);
+        LedgerBalance seller = ledger.snapshot(8L);
+        assertEquals(900L, buyer.getAvailable());
+        assertEquals(0L, buyer.getFrozen());
+        assertEquals(600L, seller.getAvailable());
+        assertTrue(buyer.isConserved());
+        assertTrue(seller.isConserved());
+
+        assertEquals(EventApplyStatus.DUPLICATE,
+                machine.apply(OrderEvent.matchFilled(
+                        2L, 10L, 10L, 100L, 7L, 8L, 100L)).getStatus());
+        assertEquals(600L, ledger.snapshot(8L).getAvailable());
+    }
+
+    @Test
+    void matchIsNotAppliedWhenSettlementFundsAreMissing() {
+        LedgerService ledger = new LedgerService(4);
+        ledger.openAccount(7L, 1_000L);
+        ledger.openAccount(8L, 500L);
+        OrderStateMachine machine = new OrderStateMachine(ledger);
+        machine.apply(OrderEvent.created(1L, 10L, 7L,
+                "BTC-USDT", 50_000L, 10L));
+
+        EventApplyResult result = machine.apply(OrderEvent.matchFilled(
+                2L, 10L, 10L, 100L, 7L, 8L, 100L));
+
+        assertEquals(EventApplyStatus.SETTLEMENT_REJECTED, result.getStatus());
+        assertEquals(OrderState.CREATED, machine.get(10L).getState());
+        assertEquals(0L, machine.get(10L).getFilledQuantity());
+        assertEquals(1_000L, ledger.snapshot(7L).getAvailable());
+        assertEquals(500L, ledger.snapshot(8L).getAvailable());
+    }
+
+    @Test
+    void bufferedMatchCanRetrySettlementAfterFundsBecomeAvailable() {
+        LedgerService ledger = new LedgerService(4);
+        ledger.openAccount(7L, 1_000L);
+        ledger.openAccount(8L, 500L);
+        OrderStateMachine machine = new OrderStateMachine(ledger);
+        OrderEvent match = OrderEvent.matchFilled(
+                2L, 10L, 10L, 100L, 7L, 8L, 100L);
+
+        assertEquals(EventApplyStatus.BUFFERED, machine.apply(match).getStatus());
+        assertEquals(EventApplyStatus.SETTLEMENT_REJECTED,
+                machine.apply(OrderEvent.created(1L, 10L, 7L,
+                        "BTC-USDT", 50_000L, 10L)).getStatus());
+        assertEquals(1, machine.pendingEventCount(10L));
+
+        assertTrue(ledger.freeze(7L, 100L));
+        assertEquals(EventApplyStatus.APPLIED, machine.apply(match).getStatus());
+        assertEquals(0, machine.pendingEventCount(10L));
+        assertEquals(OrderState.FILLED, machine.get(10L).getState());
+        assertEquals(600L, ledger.snapshot(8L).getAvailable());
     }
 }
