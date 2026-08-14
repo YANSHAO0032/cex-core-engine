@@ -240,7 +240,16 @@ public final class OrderStateMachine {
                     || aggregate.state == OrderState.RISK_HOLD) {
                 return false;
             }
+            aggregate.stateBeforeRiskHold = aggregate.state;
             aggregate.state = OrderState.RISK_HOLD;
+            return true;
+        }
+
+        if (type == EventType.RISK_RELEASED) {
+            if (aggregate.state != OrderState.RISK_HOLD) {
+                return false;
+            }
+            aggregate.state = aggregate.stateBeforeRiskHold;
             return true;
         }
 
@@ -297,6 +306,9 @@ public final class OrderStateMachine {
         if (type == EventType.RISK_HOLD) {
             return OrderEvent.riskHold(eventId, orderId);
         }
+        if (type == EventType.RISK_RELEASED) {
+            return OrderEvent.riskReleased(eventId, orderId);
+        }
         return OrderEvent.matchFilled(eventId, orderId, fillQuantity);
     }
 
@@ -331,6 +343,8 @@ public final class OrderStateMachine {
         private long filledQuantity;
         /** 当前订单状态。 */
         private OrderState state = OrderState.CREATED;
+        /** 进入 RISK_HOLD 前的活跃状态，用于审批通过后恢复。 */
+        private OrderState stateBeforeRiskHold = OrderState.CREATED;
 
         /**
          * 创建可变订单内部聚合。

@@ -114,6 +114,18 @@ public final class OrderEvent {
     }
 
     /**
+     * 构造风控审批通过后的放行事件。
+     *
+     * @param eventId 审批事件幂等标识
+     * @param orderId 需要从风控挂起恢复的订单标识
+     * @return 风控放行类型订单事件
+     */
+    public static OrderEvent riskReleased(long eventId, long orderId) {
+        return new OrderEvent(eventId, orderId, EventType.RISK_RELEASED,
+                0L, null, 0L, 0L, 0L);
+    }
+
+    /**
      * 获取事件标识。
      *
      * @return 事件幂等标识

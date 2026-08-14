@@ -13,5 +13,7 @@ public enum EventType {
     /** 成交事件，携带本次撮合成交数量。 */
     MATCH_FILLED,
     /** 风控超阈值事件，要求订单进入风险冻结状态。 */
-    RISK_HOLD
+    RISK_HOLD,
+    /** Risk approval passed and the held order can become active again. */
+    RISK_RELEASED
 }

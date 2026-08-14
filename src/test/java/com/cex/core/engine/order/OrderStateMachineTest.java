@@ -71,4 +71,31 @@ class OrderStateMachineTest {
         assertEquals(EventApplyStatus.IGNORED, ignored.getStatus());
         assertEquals(OrderState.CANCELLED, machine.get(10L).getState());
     }
+
+    /** 验证审批通过事件只释放 RISK_HOLD 订单，并恢复挂起前状态。 */
+    @Test
+    void riskReleaseRestoresTheStateBeforeHold() {
+        OrderStateMachine machine = new OrderStateMachine();
+        machine.apply(OrderEvent.created(1L, 10L, 7L, "BTC-USDT", 50_000L, 10L));
+        machine.apply(OrderEvent.matchFilled(2L, 10L, 4L));
+        machine.apply(OrderEvent.riskHold(3L, 10L));
+
+        EventApplyResult released = machine.apply(OrderEvent.riskReleased(4L, 10L));
+
+        assertEquals(EventApplyStatus.APPLIED, released.getStatus());
+        assertEquals(OrderState.PARTIAL_FILLED, machine.get(10L).getState());
+        assertEquals(4L, machine.get(10L).getFilledQuantity());
+    }
+
+    /** 验证非挂起订单收到放行事件时不会改变业务状态。 */
+    @Test
+    void riskReleaseIsIgnoredWhenOrderIsNotHeld() {
+        OrderStateMachine machine = new OrderStateMachine();
+        machine.apply(OrderEvent.created(1L, 10L, 7L, "BTC-USDT", 50_000L, 10L));
+
+        EventApplyResult released = machine.apply(OrderEvent.riskReleased(4L, 10L));
+
+        assertEquals(EventApplyStatus.IGNORED, released.getStatus());
+        assertEquals(OrderState.CREATED, machine.get(10L).getState());
+    }
 }

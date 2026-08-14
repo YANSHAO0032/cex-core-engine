@@ -37,6 +37,11 @@ src/main/java/com/cex/core/engine
 │   ├── OrderStateMachine.java       # 订单状态聚合和重放
 │   └── PrimitiveLongSet.java        # primitive long 开放寻址集合
 └── risk
+    ├── ApprovalDecision.java        # 审批结果枚举
+    ├── ApprovalDecisionProvider.java# 审批决策接口
+    ├── ApprovalTask.java            # 纯内存审批任务
+    ├── ApprovalTaskService.java     # 异步审批任务服务
+    ├── ApprovalTaskStatus.java      # 审批任务状态
     ├── RiskDecision.java            # 风控判定结果
     ├── RiskEngine.java              # 用户成交金额风控
     ├── RiskState.java               # 风控状态
@@ -58,8 +63,14 @@ flowchart LR
     RE --> W[用户 10 秒 SlidingWindow]
     RE -->|超过阈值| RH[RISK_HOLD Event]
     RH --> D
+    RE -->|超阈值提交| AT[ApprovalTaskService]
+    AT -->|APPROVED| RR[RISK_RELEASED Event]
+    AT -->|REJECTED| RC[ORDER_CANCELLED Event]
+    RR --> D
+    RC --> D
 
     S --> L[LedgerService]
+    AT --> L
     L --> A[ConcurrentHashMap 用户账户]
     A --> LS[用户锁分片]
 ```
@@ -69,7 +80,7 @@ flowchart LR
 1. 兼容路径使用 `OrderEvent`、`MpscRingBuffer` 和 `apply`，便于调试和读取状态快照。
 2. 高吞吐路径使用 `PrimitiveEventRingBuffer`、`PrimitiveEventDispatcher` 和 `applyFast`，事件字段直接写入固定 primitive 槽位，减少热路径对象创建。
 
-风控计算与订单状态更新解耦。`RiskEngine` 只负责累计成交金额和生成判定；超出阈值后生成独立的 `RISK_HOLD` 事件，再由状态机处理订单状态。
+风控计算与订单状态更新解耦。`RiskEngine` 负责累计成交金额和生成判定；超出阈值后生成独立的 `RISK_HOLD` 事件，并向 `ApprovalTaskService` 提交纯内存异步审批任务。审批通过时，审批 worker 调用账本 `tradeDebit` 扣减冻结资金并发布 `RISK_RELEASED` 放行事件；审批拒绝时调用 `unfreeze` 解冻资金并发布 `ORDER_CANCELLED` 撤单事件。审批任务以 `taskId` 幂等提交，重复审批请求不会重复扣减或重复解冻。
 
 ## 4. 订单状态机图
 
@@ -86,6 +97,9 @@ stateDiagram-v2
     CREATED --> RISK_HOLD: RISK_HOLD
     PARTIAL_FILLED --> RISK_HOLD: RISK_HOLD
     RISK_HOLD --> RISK_HOLD: MATCH_FILLED(忽略)
+    RISK_HOLD --> CREATED: RISK_RELEASED(审批通过，原状态 CREATED)
+    RISK_HOLD --> PARTIAL_FILLED: RISK_RELEASED(审批通过，原状态 PARTIAL_FILLED)
+    RISK_HOLD --> CANCELLED: ORDER_CANCELLED(审批拒绝)
     FILLED --> FILLED: 迟到事件(忽略)
     CANCELLED --> CANCELLED: 迟到事件(忽略)
 ```
@@ -95,7 +109,9 @@ stateDiagram-v2
 - `ORDER_CREATED` 创建订单聚合，重复创建不会覆盖已经累计的成交事实。
 - `MATCH_FILLED` 按剩余数量截断成交量，成交量达到订单数量后进入 `FILLED`，否则进入 `PARTIAL_FILLED`。
 - `ORDER_CANCELLED` 只能影响未完成订单；`FILLED` 和 `CANCELLED` 是终态。
-- `RISK_HOLD` 暂停订单后续成交，处于 `RISK_HOLD` 的订单不会继续累计成交量。
+- `RISK_HOLD` 暂停订单后续成交，进入挂起时记录挂起前活跃状态，处于 `RISK_HOLD` 的订单不会继续累计成交量。
+- `RISK_RELEASED` 只释放处于 `RISK_HOLD` 的订单，并恢复到挂起前的 `CREATED` 或 `PARTIAL_FILLED`。
+- 审批拒绝复用 `ORDER_CANCELLED`，订单进入 `CANCELLED` 终态，同时由审批服务完成冻结资金解冻。
 - 每个订单维护已处理 `eventId` 集合。重复事件只返回 `DUPLICATE` 或被忽略，不会重复累计成交。
 
 ## 5. 并发模型
@@ -139,6 +155,35 @@ hash -> stripeMask -> ReentrantLock[stripe]
 | `synchronized` | 语法简单 | 锁粒度和调度控制较弱 | 未选作核心账本方案 |
 | `ReentrantLock` | 可配置非公平锁，适合显式临界区 | 存在分片碰撞 | 账本、状态机、风控窗口 |
 | CAS | 无锁、适合单值更新 | 多余额字段难以组成一致快照，失败重试可能放大 CPU 消耗 | RingBuffer 序号、primitive 集合、测试预留额 |
+
+### 5.4 风控审批工作流：RISK_HOLD + ApprovalTask
+
+`ApprovalTaskService` 补齐了测评要求中的异步审批链路，整体仍然只依赖 JDK 原生并发工具：
+
+```mermaid
+sequenceDiagram
+    participant R as RiskEngine
+    participant S as OrderStateMachine
+    participant A as ApprovalTaskService
+    participant L as LedgerService
+
+    R->>S: RISK_HOLD(riskEventId)
+    R->>A: submit(taskId, approvalEventId)
+    A->>A: worker 调用 ApprovalDecisionProvider
+    alt APPROVED
+        A->>L: tradeDebit(userId, amount)
+        A->>S: RISK_RELEASED(approvalEventId)
+    else REJECTED
+        A->>L: unfreeze(userId, amount)
+        A->>S: ORDER_CANCELLED(approvalEventId)
+    end
+```
+
+- `submit` 使用 `ConcurrentHashMap.putIfAbsent(taskId)` 做任务幂等，重复审批任务不会重复进入队列。
+- worker 使用单线程 `LinkedBlockingQueue` 异步消费审批任务，避免审批流程进入高频撮合事件热路径。
+- 审批通过时，账本先从冻结金额扣减到 `traded`，再发布 `RISK_RELEASED`，订单恢复到进入 `RISK_HOLD` 前的活跃态。
+- 审批拒绝时，账本先解冻资金，再发布 `ORDER_CANCELLED`，订单进入终态 `CANCELLED`。
+- 审批策略返回空结果、冻结余额不足或解冻失败时，任务进入 `FAILED`，订单保持 `RISK_HOLD`，避免状态和资金侧产生半完成语义。
 
 ## 6. 资产一致性证明
 
@@ -248,9 +293,9 @@ sequenceDiagram
 
 ```text
 Event pipeline benchmark (500000 events, 16 producers / 1 consumer)
-Before: TPS=1660363.93, avg/event=0.60 us, GC collections=0, GC time=0 ms
-After : TPS=3793079.91, avg/event=0.26 us, GC collections=0, GC time=0 ms
-Speedup: 2.28x, GC collections delta: 0 -> 0
+Before: TPS=2286582.93, avg/event=0.44 us, GC collections=0, GC time=0 ms
+After : TPS=2481144.54, avg/event=0.40 us, GC collections=0, GC time=0 ms
+Speedup: 1.09x, GC collections delta: 0 -> 0
 ```
 
 其中：
@@ -284,8 +329,8 @@ Remove-Item Env:MAVEN_OPTS
 最近一次运行结果：
 
 ```text
-Chaos metrics: operations=21616969, TPS=360207.85, avgLatency=0.16 us,
-P99=0.70 us, expectedExceptions=216938, interrupts=5888
+Chaos metrics: operations=21686993, TPS=361390.20, avgLatency=0.15 us,
+P99=0.70 us, expectedExceptions=216545, interrupts=5887
 ```
 
 最终断言：
@@ -312,11 +357,11 @@ mvn -q test
 Remove-Item Env:MAVEN_OPTS
 ```
 
-完整测试覆盖领域模型、账本并发、订单乱序与幂等、事件分发、风险窗口、Benchmark 和 Chaos 流程。
+完整测试覆盖领域模型、账本并发、订单乱序与幂等、事件分发、风险窗口、ApprovalTask 审批闭环、Benchmark 和 Chaos 流程。
 
 ## 12. 使用边界
 
-- 当前账本和事件队列完全驻留内存，不提供 WAL、快照或进程崩溃恢复。
+- 当前账本、审批任务和事件队列完全驻留内存，不提供 WAL、快照或进程崩溃恢复。
 - 当前实现是结算核心模块，不包含撮合算法、网络协议、认证授权和持久化存储。
 - `long` 金额必须由上层统一定义精度和溢出边界，禁止混用不同资产精度。
 - `publish` 返回 `false` 时，调用方必须实施重试、降速或上游背压策略。

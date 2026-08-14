@@ -136,6 +136,34 @@ public final class RiskEngine {
     }
 
     /**
+     * Record a trade, apply RISK_HOLD when needed, and submit an async
+     * in-memory approval task for the held order.
+     *
+     * @return created approval task when risk hold is triggered; otherwise null
+     */
+    public ApprovalTask recordTradeAndSubmitApproval(OrderStateMachine stateMachine,
+                                                     ApprovalTaskService approvalTasks,
+                                                     long taskId,
+                                                     long riskEventId,
+                                                     long approvalEventId,
+                                                     long userId,
+                                                     long orderId,
+                                                     long tradeId,
+                                                     long amount,
+                                                     long timestampMillis) {
+        if (approvalTasks == null) {
+            throw new NullPointerException("approvalTasks");
+        }
+        RiskDecision decision = recordTradeAndApply(stateMachine, riskEventId,
+                userId, orderId, tradeId, amount, timestampMillis);
+        if (!decision.isRiskHold()) {
+            return null;
+        }
+        return approvalTasks.submit(taskId, approvalEventId, userId, orderId,
+                amount, timestampMillis);
+    }
+
+    /**
      * 清理指定用户滑动窗口中的过期成交。
      *
      * @param userId 用户标识
