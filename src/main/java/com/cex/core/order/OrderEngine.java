@@ -104,6 +104,39 @@ public final class OrderEngine implements AutoCloseable {
         }
         applyFreezeLocked(context);
 
+        if (rejected) {
+            if (!context.hasEffect(OrderEffect.SETTLE_APPLIED)) {
+                applyUnfreezeLocked(context);
+                transitionLocked(context, OrderStatus.CANCELED);
+            }
+            return ReconcileResult.NONE;
+        }
+        if (cancelled && !filled) {
+            if (!context.hasEffect(OrderEffect.SETTLE_APPLIED)) {
+                applyUnfreezeLocked(context);
+                transitionLocked(context, OrderStatus.CANCELED);
+            }
+            return ReconcileResult.NONE;
+        }
+
+        if (context.status() == OrderStatus.INIT) {
+            if (approved) {
+                transitionLocked(context, OrderStatus.NEW);
+            } else {
+                ReconcileResult riskResult = evaluateInitialRiskLocked(context);
+                if (riskResult.approvalEvent != null || context.status() == OrderStatus.RISK_HOLD) {
+                    return riskResult;
+                }
+            }
+        }
+
+        if (context.status() == OrderStatus.RISK_HOLD) {
+            if (!approved) {
+                return ReconcileResult.NONE;
+            }
+            transitionLocked(context, OrderStatus.NEW);
+        }
+
         if (filled) {
             if (!context.hasEffect(OrderEffect.UNFREEZE_APPLIED)) {
                 applySettleLocked(context);
@@ -115,34 +148,34 @@ public final class OrderEngine implements AutoCloseable {
             transitionLocked(context, OrderStatus.FILLED);
             return ReconcileResult.NONE;
         }
-        if (rejected || cancelled) {
+        if (cancelled) {
             if (!context.hasEffect(OrderEffect.SETTLE_APPLIED)) {
                 applyUnfreezeLocked(context);
                 transitionLocked(context, OrderStatus.CANCELED);
             }
             return ReconcileResult.NONE;
         }
-        if (approved && !rejected) {
-            transitionLocked(context, OrderStatus.NEW);
+        return ReconcileResult.NONE;
+    }
+
+    private ReconcileResult evaluateInitialRiskLocked(OrderContext context) {
+        TradeWindow window = tradeWindows.computeIfAbsent(
+                context.userId(), id -> new TradeWindow(RISK_WINDOW_MILLIS));
+        long now = clock.currentTimeMillis();
+        RiskContext riskContext = new RiskContext(
+                context.orderId(), context.userId(), context.amount(), now, window.currentSum(now));
+        if (riskPipeline.evaluate(riskContext) == RiskDecision.HOLD) {
+            transitionLocked(context, OrderStatus.RISK_HOLD);
+            metrics.riskHold();
+            if (context.applyEffectLocked(OrderEffect.APPROVAL_SCHEDULED, () -> { })) {
+                metrics.approvalScheduled();
+                return new ReconcileResult(new OrderEvent(
+                        context.orderId(), context.userId(), context.amount(), now,
+                        OrderEventType.ORDER_CREATED));
+            }
             return ReconcileResult.NONE;
         }
-        if (context.status() == OrderStatus.INIT || context.status() == OrderStatus.NEW) {
-            TradeWindow window = tradeWindows.computeIfAbsent(context.userId(), id -> new TradeWindow(RISK_WINDOW_MILLIS));
-            long now = clock.currentTimeMillis();
-            RiskContext riskContext = new RiskContext(context.orderId(), context.userId(), context.amount(),
-                    now, window.currentSum(now));
-            if (riskPipeline.evaluate(riskContext) == RiskDecision.HOLD) {
-                transitionLocked(context, OrderStatus.RISK_HOLD);
-                metrics.riskHold();
-                if (context.applyEffectLocked(OrderEffect.APPROVAL_SCHEDULED, () -> { })) {
-                    metrics.approvalScheduled();
-                    return new ReconcileResult(new OrderEvent(context.orderId(), context.userId(), context.amount(), now,
-                            OrderEventType.ORDER_CREATED));
-                }
-            } else {
-                transitionLocked(context, OrderStatus.NEW);
-            }
-        }
+        transitionLocked(context, OrderStatus.NEW);
         return ReconcileResult.NONE;
     }
 
