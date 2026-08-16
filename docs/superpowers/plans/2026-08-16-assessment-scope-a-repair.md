@@ -758,7 +758,8 @@ Expected: all three runs meet every chaos acceptance condition from Task 3.
 - [ ] **Step 3: Run a fresh full suite and save its console output as the documentation source**
 
 ```powershell
-mvn clean test | Tee-Object -FilePath target/final-verification.log
+New-Item -ItemType Directory -Force -Path .superpowers | Out-Null
+mvn clean test | Tee-Object -FilePath .superpowers/final-verification.log
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 ```
 
@@ -789,7 +790,7 @@ Assertions: per-order terminal convergence, >=500,000 transitions, settle/unfree
             coverage, invariant failures=0, asset delta=0, no deadlock, termination PASS
 ```
 
-- [ ] **Step 6: Update both benchmark sections using `target/final-verification.log`**
+- [ ] **Step 6: Update both benchmark sections using `.superpowers/final-verification.log`**
 
 Create separate README tables titled:
 

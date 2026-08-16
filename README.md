@@ -166,12 +166,13 @@ Derived OrderStatus
        | PASS                              | HOLD / schedule approval
        v                                   v
      [NEW]                             [RISK_HOLD]
-       | MATCH_FILLED / settle             | APPROVAL_PASSED
-       | + risk record                     v
-       v                                  [NEW]
-    [FILLED]                                |
-       ^                                    | APPROVAL_REJECTED / unfreeze
-       | late duplicate                     v
+       | MATCH_FILLED / settle             | MATCH_FILLED / cache fact
+       | + risk record                     +---------> [RISK_HOLD]
+       v                                   | APPROVAL_PASSED
+    [FILLED]                                |   + cached fill / settle -> [FILLED]
+       ^                                    |   + no fill -> [NEW]
+       | late duplicate                     | APPROVAL_REJECTED / unfreeze
+       |                                    v
        |                                [CANCELED]
        |
        +-- late ORDER_CANCELLED: conflict metric, no unfreeze
@@ -181,7 +182,9 @@ Derived OrderStatus
   [INIT]
     | MATCH_FILLED / cache FILLED_SEEN
     v
-  [INIT + FILLED_SEEN] --ORDER_CREATED / freeze + settle + risk record--> [FILLED]
+  [INIT + FILLED_SEEN] --ORDER_CREATED / freeze + risk evaluation--> [NEW or RISK_HOLD]
+  [NEW + FILLED_SEEN] --settle + risk record--> [FILLED]
+  [RISK_HOLD + FILLED_SEEN] --wait for approval; no settlement--> [RISK_HOLD]
 
   [INIT]
     | ORDER_CANCELLED / cache CANCELLED_SEEN
@@ -224,12 +227,13 @@ CAS 失败时重试；如果位已经存在，返回 duplicate，但仍继续进
 1. 检查 FILLED/CANCELED 冲突，以及 APPROVED/REJECTED 冲突。
 2. 如果没有 `CREATED_SEEN`，只缓存事实并返回，不改变账户资金。
 3. 如果没有 `FREEZE_APPLIED`，先执行一次冻结。
-4. 如果存在 `FILLED_SEEN`，执行一次结算，记录一次风险成交，再迁移到 `FILLED`。
-5. 否则如果存在 `REJECTED_SEEN` 或 `CANCELLED_SEEN`，执行一次解冻并迁移到 `CANCELED`。
-6. 否则如果存在 `APPROVED_SEEN` 且不存在 `REJECTED_SEEN`，迁移到 `NEW`。
-7. 否则执行风险规则：`PASS` 迁移到 `NEW`，`HOLD` 迁移到 `RISK_HOLD` 并最多调度一次审批。
+4. 如果存在 `REJECTED_SEEN`，在尚未结算时执行一次解冻并迁移到 `CANCELED`；审批拒绝优先于通过。
+5. 如果只有 `CANCELLED_SEEN` 而没有 `FILLED_SEEN`，执行一次解冻并迁移到 `CANCELED`。
+6. `INIT` 订单先进行一次初始风控评估：`PASS` 迁移到 `NEW`，`HOLD` 迁移到 `RISK_HOLD` 并最多调度一次审批；缓存的审批通过事实可直接迁移到 `NEW`。
+7. `RISK_HOLD` 在未审批通过时只缓存 `FILLED_SEEN`，不执行结算；审批通过后迁移到 `NEW` 并继续消费缓存事实。
+8. 允许结算时，如果存在 `FILLED_SEEN`，执行一次结算、记录一次风险成交并迁移到 `FILLED`。
 
-这套顺序把“观察到什么”和“已经做过什么”分开处理，因此消息顺序不直接决定资金副作用次数。
+这套顺序把“观察到什么”和“已经做过什么”分开处理，因此消息顺序不直接决定资金副作用次数。初始风控只在 `INIT` 阶段执行一次，重复消息不会让已经接受的 `NEW` 订单因后续窗口变化重新进入挂起。
 
 ### 4. 风控与审批规则
 
@@ -238,6 +242,7 @@ CAS 失败时重试；如果位已经存在，返回 duplicate，但仍继续进
 - `TradeWindow` 默认窗口为 10 秒，保存成功结算金额；`SlidingWindowAmountRule` 在最近窗口金额严格超过阈值时返回 `HOLD`。
 - 审批使用固定 worker 和 `ArrayBlockingQueue`。队列满时 `CallerRunsPolicy` 提供有界背压。
 - `ApprovalTask` 只产生 `APPROVAL_PASSED` 或 `APPROVAL_REJECTED`，审批结果重新进入 `OrderEngine.process`。
+- `RISK_HOLD` 期间的成交事实只缓存不结算；审批通过后才消费缓存成交，审批拒绝则解冻并终止为 `CANCELED`。
 
 ### 5. 重复和冲突规则
 
@@ -350,9 +355,9 @@ MATCH_FILLED
 ORDER_CREATED
   -> CREATED_SEEN = 1
   -> freeze 一次
-  -> settle 一次
-  -> RISK_RECORDED 一次
-  -> FILLED
+  -> 初始风险评估一次
+  -> PASS: NEW 后 settle 一次并进入 FILLED
+  -> HOLD: 保持 RISK_HOLD，不结算，等待审批结果
 ```
 
 #### CANCEL 先于 CREATE
@@ -392,7 +397,8 @@ Maven Surefire 的运行参数为：
 - `TradeWindow` 使用 primitive `long[]` 时间戳和金额环形数组，维护 `head`、`size`、`rollingSum`；窗口淘汰后复用环槽，不保存完整成交事件历史。
 - `LatencyHistogram` 使用固定 bucket 和 `LongAdder`，不创建 500,000 个 boxed latency 样本。
 - Chaos 使用 16 个长生命周期 worker，而不是为每条测试事件创建 pending Runnable。
-- Benchmark 预先创建 16 个可重复使用的 duplicate event 对象，并先执行 50,000 次 warmup，再执行 500,000 次测量。
+- Duplicate Hot-Path Benchmark 预先创建 16 个可重复使用的 duplicate event 对象，并先执行 50,000 次 warmup，再执行 500,000 次测量。
+- Representative Lifecycle Benchmark 使用 300,000 个独立订单和 600,000 次事件调用，覆盖创建、成交、撤单以及终态先于创建的乱序路径，产生 525,000 次真实状态迁移。
 - `StripedLockManager` 的 256 把锁、每用户 `TradeWindow`、风险规则数组和统计结构在生命周期内复用；审批队列使用 `ArrayBlockingQueue` 限制待处理任务数量。
 - 不引入全局事件对象池：池化可能延长对象存活和引用链，增加归还竞态；本实现优先复用固定数组和有限容量结构，让 G1 回收短生命周期事件。
 
@@ -402,33 +408,60 @@ Maven Surefire 的运行参数为：
 
 ## Benchmark 结果
 
-### 测试方法
+### Representative Lifecycle Benchmark
 
 - 测试类：`PerformanceTest`
 - JDK：Microsoft OpenJDK 21.0.12
 - JVM 堆：`-Xms128m -Xmx256m -XX:+UseG1GC`
 - 并发线程：16
-- Warmup：50,000 次
-- Measurement：500,000 次
-- 负载：重复处理已完成订单的 `MATCH_FILLED` 事件，验证幂等热路径
+- 订单数：300,000
+- Measurement：600,000 次事件调用、525,000 次真实状态迁移
+- 负载：等量覆盖 CREATE→FILL、CREATE→CANCEL、FILL→CREATE 和 CANCEL→CREATE
 - 断言阈值：TPS `>= 10,000`，平均延迟 `< 1ms`
 
-### 最近一次实测输出
+| 指标 | 结果 |
+|---|---:|
+| Measurement Operations | 600,000 |
+| State Transitions | 525,000 |
+| Threads | 16 |
+| TPS | 3,667,288.88 |
+| Average latency | 3.58 us |
+| P50 | 10.0 us |
+| P95 | 10.0 us |
+| P99 | 10.0 us |
+| MAX | 6,734.4 us |
+| Freeze count | 300,000 |
+| Settle count | 150,000 |
+| Unfreeze count | 150,000 |
+| Heap Max | 256 MB |
+| Heap Used | 82 MB |
+| GC Count | 6 |
+| GC Time | 14 ms |
+| Old/Full GC Count | 0 |
+| Old/Full GC Time | 0 ms |
+| Invariant result | PASS |
+
+### Duplicate Idempotency Hot-Path Benchmark
+
+- Warmup：50,000 次
+- Measurement：500,000 次
+- 负载：重复处理已完成订单的 `MATCH_FILLED`，只测量幂等重复事件热路径
+- 定位：信息性指标，不作为完整状态机吞吐量的唯一依据
 
 | 指标 | 结果 |
 |---|---:|
 | Measurement Operations | 500,000 |
 | Threads | 16 |
-| TPS | 7,723,236.28 |
-| Average latency | 1.50 us |
+| TPS | 14,571,779.13 |
+| Average latency | 0.60 us |
 | P50 | 10.0 us |
 | P95 | 10.0 us |
-| P99 | 25.0 us |
-| MAX | 1,711.8 us |
+| P99 | 10.0 us |
+| MAX | 3,070.4 us |
 | Heap Max | 256 MB |
-| Heap Used | 199 MB |
-| GC Count | 1 |
-| GC Time | 1 ms |
+| Heap Used | 85 MB |
+| GC Count | 3 |
+| GC Time | 3 ms |
 | Old/Full GC Count | 0 |
 | Old/Full GC Time | 0 ms |
 
@@ -441,32 +474,39 @@ TPS、调度和堆使用量会受到 JIT、CPU、系统调度及测试顺序影�
 测试类：`ChaosInvariantTest`。
 
 - 固定种子：`20260816`，可通过 `-DCHAOS_SEED` 覆盖。
-- 订单数：270,000；每个用户预置 2 个资产单位。
+- 订单数：300,000；每个用户预置 2 个资产单位。
 - worker：16 个固定线程，长生命周期执行订单循环。
-- 每个订单生成 CREATE 和 MATCH；部分订单先发 MATCH 再发重复 MATCH 再发 CREATE，其他订单先发重复 CREATE 再发 MATCH。
-- 每 17 个订单注入一次 `Thread.interrupt()`；每 256 个订单注入 `Thread.yield()` 和 `LockSupport.parkNanos(1)`。
+- 使用种子打乱的等量场景循环：顺序成交、乱序成交、顺序撤单、乱序撤单，以及 CREATE 前同时收到 FILL/CANCEL 的终态冲突；各场景均包含必要的重复事实。
+- 每 256 个订单按种子选择一次 `Thread.yield()`、10-100 微秒 `LockSupport.parkNanos` 或 interrupt-status 注入，并统计每类注入次数。
 - watchdog 每 1ms 检查一次资产不变量；worker 每 1024 次操作额外检查一次。
-- 结束时调用 `ThreadMXBean.findDeadlockedThreads()`，并验证 worker 和 watchdog 都能终止。
+- worker 的 `Future` 必须逐个成功完成；结束时调用 `ThreadMXBean.findDeadlockedThreads()`，并验证 worker 和 watchdog 都能终止。
 
 ### 最近一次实测输出
 
 | 指标 | 结果 |
 |---|---:|
 | CHAOS SEED | 20260816 |
-| Processed events | 825,883 |
-| Accepted facts | 540,000 |
-| Duplicate events | 285,883 |
-| Out-of-order events | 27,000 |
-| State transitions | 526,500 |
-| Freeze count | 270,000 |
-| Settle count | 270,000 |
-| Unfreeze count | 0 |
-| Invariant snapshots | 393 |
+| Processed events | 900,389 |
+| Accepted facts | 660,000 |
+| Duplicate events | 240,389 |
+| Out-of-order events | 360,000 |
+| State transitions | 540,000 |
+| Freeze count | 300,000 |
+| Settle count | 180,000 |
+| Unfreeze count | 120,000 |
+| Terminal conflicts | 60,000 |
+| Expected filled | 180,000 |
+| Expected canceled | 120,000 |
+| Yield injections | 382 |
+| Park injections | 401 |
+| Interrupt injections | 389 |
+| Invariant snapshots | 503 |
 | Invariant failures | 0 |
+| Asset delta | 0 |
 | Deadlock check | PASS |
 | Termination check | PASS |
 
-Chaos 的关键验收条件是：`stateTransitions >= 500,000`、`invariantFailures == 0`、总资产差为 0、死锁检查为空、worker 正常终止、每个订单恰好结算一次。
+Chaos 的关键验收条件是：每个订单收敛到场景预定终态、`stateTransitions >= 500,000`、成交/撤单/冲突与三类扰动均实际覆盖、`invariantFailures == 0`、总资产差为 0、死锁检查为空且所有线程正常终止。
 
 ## 构建和完整验证
 
@@ -497,19 +537,19 @@ mvn clean test
 | `LedgerInvariantTest` | freeze、settle、unfreeze、溢出、失败原子性和并发账本 |
 | `InvariantCheckerTest` | 全 stripe 一致快照 |
 | `StripedLockManagerTest` | stripe 映射和锁数量 |
-| `OrderContextTest` | Fact Bits、Effect Bits 和状态上下文 |
+| `OrderContextTest` | Fact Bits、Effect Bits、状态上下文和异步状态安全发布 |
 | `OrderMetadataTest` | 元数据固定与冲突拒绝 |
 | `OutOfOrderStateMachineTest` | CREATE/MATCH/CANCEL 乱序收敛 |
 | `TerminalConflictTest` | FILLED/CANCELED 终态冲突 |
 | `RiskEngineTest` | 风险窗口、规则动态更新和 HOLD |
-| `ApprovalTest` | 有界审批队列、审批事件回流和 quiescence |
-| `ChaosInvariantTest` | 16 worker、重复、乱序、interrupt、watchdog、死锁 |
-| `PerformanceTest` | 500k 操作、延迟、吞吐、堆和 GC |
+| `ApprovalTest` | 有界审批队列、审批事件回流、挂起成交门禁和 quiescence |
+| `ChaosInvariantTest` | 16 worker、成交/撤单/冲突、重复、乱序、三类扰动、watchdog、死锁 |
+| `PerformanceTest` | 代表性生命周期与重复幂等热路径、延迟、吞吐、堆和 GC |
 
 最近一次完整验证结果：
 
 ```text
-Tests run: 38, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 43, Failures: 0, Errors: 0, Skipped: 0
 BUILD SUCCESS
 ```
 
