@@ -1,79 +1,162 @@
-# CEX Core Technical Assessment
+# CEX Core Engine
 
-纯 Java 21 / JUC 的内存交易核心测评工程。重点是订单事实乱序、重复投递、高并发和故障注入下的资产正确性；不实现完整撮合订单簿、网络协议或持久化系统。
+纯 Java 21 / JUC 的内存交易核心测评工程。项目围绕一个单资产、全成交订单生命周期展开，重点验证以下问题：订单事实乱序、重复投递、多线程竞争、异步审批、故障注入和严苛堆内存限制下，资产是否始终正确、状态是否最终收敛、系统是否能够被测量和解释。
 
-## 1. Overview
+本项目不实现完整撮合订单簿、网络协议、数据库持久化或生产级清算系统；它是一个可运行、可测试、可解释的核心状态处理样例。
 
-- 金额热路径统一使用 primitive `long`，所有加减使用 checked arithmetic。
-- `OrderEvent` 通过 `OrderEngine.process` 进入统一事实入口。
-- Fact Bits 表达已观察事实，Effect Bits 表达已经完成的资金副作用；二者严格分离。
-- 同一用户的账户、订单副作用和 TradeWindow 共用一个 canonical striped lock。
-- Risk Pipeline 使用 volatile copy-on-write 规则数组；Approval 使用有界异步执行器并重新投递审批事件。
-- Chaos 测试使用 16 个长生命周期 worker，持续检查资产不变量，并确定性产生超过 500,000 次真实状态迁移。
+## 设计目标
 
-## 2. Requirements Mapping
+### 正确性目标
 
-| Assessment requirement | Implementation |
-|---|---|
-| Asset consistency | `AccountLedger` + `InvariantChecker` |
-| Out-of-order state machine | `OrderContext` Fact Bits + `OrderEngine` reconciliation |
-| Idempotency | CAS fact registration + lock-protected Effect Bits |
-| Fine-grained concurrency | One canonical `StripedLockManager` |
-| Dynamic risk workflow | `RiskPipeline` + ordered `RiskRule[]` |
-| 10-second window | `TradeWindow` primitive ring buffer + `SlidingWindowAmountRule` |
-| Async approval | `ApprovalService` + `ApprovalTask` |
-| Chaos/failure handling | `ChaosInvariantTest` |
-| 500k real transitions | deterministic `stateTransitions` assertion |
-| Performance | `PerformanceTest` + `LatencyHistogram` + `GcMetrics` |
-| Memory | primitive fields, bounded queues, no event history, `-Xmx256m` |
+- 消息层允许 at-least-once、duplicate 和 out-of-order；资金副作用必须 exactly-once。
+- `MATCH_FILLED`、`ORDER_CANCELLED`、审批结果可以早于 `ORDER_CREATED` 到达，系统先保存事实，待事实完整后再收敛。
+- `available`、`frozen` 与 `systemSettledAmount` 的资产总量始终满足不变量。
+- 重复消息不能造成重复冻结、重复结算、重复解冻或重复记录风控成交。
+- 同一订单的元数据一旦建立，后续事件的 `userId` 和 `amount` 不允许不一致。
 
-## 3. Architecture
+### 并发与性能目标
 
-```mermaid
-flowchart TD
-    E[OrderEvent] --> OE[OrderEngine.process]
-    OE --> F[CAS Fact Bits]
-    F --> L[Canonical user stripe]
-    L --> R[Deterministic reconcile]
-    R --> RP[RiskPipeline]
-    R --> AL[AccountLedger]
-    RP --> TW[Per-user TradeWindow]
-    RP --> AH[RISK_HOLD]
-    AH --> AS[Bounded ApprovalService]
-    AS --> AP[APPROVAL_PASSED / APPROVAL_REJECTED]
-    AP --> OE
-    AL --> INV[InvariantChecker]
+- 以用户为串行化边界，不使用全局订单锁；不同用户可以并行处理。
+- 事实登记使用 CAS，资金事务使用 canonical striped lock，在正确性和锁竞争之间取得平衡。
+- 审批使用有界队列，避免异步任务无界堆积。
+- 在 `-Xmx256m` 下完成 500,000 次 benchmark 操作，并对吞吐、延迟和 GC 做实际采样。
+
+### 可验证性目标
+
+- Chaos 测试使用固定随机种子、16 个长生命周期 worker、watchdog、死锁检测和终止检测。
+- 单元测试覆盖金额溢出、账本不变量、乱序状态机、终态冲突、审批、风险窗口、并发锁和指标统计。
+- README 中的 Benchmark 与 Chaos 数据来自真实 `mvn clean test` 输出，不把测试阈值当成生产容量承诺。
+
+## 项目结构
+
+```text
+cex-core-engine/
+├── pom.xml
+├── README.md
+├── src/main/java/com/cex/core/
+│   ├── account/
+│   │   ├── Account.java                 # available / frozen 账户余额
+│   │   ├── AccountLedger.java           # 冻结、结算、解冻和总资产
+│   │   └── InvariantChecker.java        # 全 stripe 一致快照检查
+│   ├── concurrent/
+│   │   └── StripedLockManager.java      # 预创建的 canonical ReentrantLock stripes
+│   ├── metrics/
+│   │   ├── GcMetrics.java               # GC MXBean 快照
+│   │   └── LatencyHistogram.java        # 固定 bucket 延迟统计
+│   ├── order/
+│   │   ├── OrderEvent.java              # 不可变订单事件
+│   │   ├── OrderEngine.java             # 事实入口与 reconcile 核心
+│   │   ├── OrderContext.java            # 元数据、Fact Bits、Effect Bits、状态
+│   │   ├── OrderFact.java               # 观察事实位
+│   │   ├── OrderEffect.java             # 已应用副作用位
+│   │   ├── OrderStatus.java             # 派生状态枚举
+│   │   └── OrderEngineMetrics.java      # LongAdder 指标
+│   ├── risk/
+│   │   ├── RiskPipeline.java            # volatile 规则数组 + copy-on-write
+│   │   ├── RiskRule.java                # 风控规则接口
+│   │   ├── TradeWindow.java             # primitive ring buffer 风控窗口
+│   │   ├── SlidingWindowAmountRule.java # 10 秒成交金额规则
+│   │   ├── ApprovalService.java         # 固定 worker + 有界队列
+│   │   └── ApprovalTask.java            # 审批决策转事件
+│   └── util/
+│       └── MoneyMath.java               # checked long arithmetic
+└── src/test/java/com/cex/core/
+    ├── account/                         # 账本与不变量测试
+    ├── chaos/                           # 乱序、重复、interrupt、watchdog
+    ├── concurrent/                      # striped lock 测试
+    ├── order/                           # 事实、元数据、状态机和冲突
+    ├── performance/                     # 500k benchmark
+    ├── risk/                            # 风控与审批
+    └── util/                            # 金额运算
 ```
 
-`OrderEngine` 先登记事实，再进入 user stripe。资金 mutation 与 Effect commit 在同一个临界区；Approval 的提交和 callback 在释放 stripe 后进行。
+### 主要职责边界
 
-## 4. State / Fact Model
+| 组件 | 职责 | 不负责的事情 |
+|---|---|---|
+| `OrderEngine` | 接收事件、登记事实、按用户锁 reconcile、调度审批 | 网络重试、消息持久化、撮合 |
+| `OrderContext` | 保存单订单的不可变元数据、事实位、效果位和派生状态 | 修改账户余额 |
+| `AccountLedger` | 执行冻结、结算、解冻，维护总资产 | 决定订单状态 |
+| `RiskPipeline` | 按顺序执行风控规则 | 执行资金副作用 |
+| `ApprovalService` | 异步产生审批事件 | 直接修改订单或账本 |
+| `InvariantChecker` | 在全量锁保护下检查快照 | 修复不变量错误 |
 
-订单不是单一 `status` 字段，而是：
+## 系统架构图
+
+```mermaid
+flowchart LR
+    E["OrderEvent"] --> I["OrderEngine.process"]
+    I --> M["ConcurrentHashMap<br/>OrderContext"]
+    M --> F["Fact Bits<br/>AtomicInteger CAS"]
+    F --> L["Canonical user stripe<br/>ReentrantLock"]
+    L --> R["Deterministic reconcile"]
+    R --> S["RiskPipeline<br/>volatile RiskRule[]"]
+    R --> A["AccountLedger<br/>freeze / settle / unfreeze"]
+    R --> W["Per-user TradeWindow<br/>primitive ring buffer"]
+    S --> H["RISK_HOLD"]
+    H --> Q["ApprovalService<br/>bounded queue"]
+    Q --> P["APPROVAL_PASSED / REJECTED"]
+    P --> I
+    A --> C["InvariantChecker<br/>all stripes in order"]
+    I --> X["OrderEngineMetrics"]
+```
+
+### 热路径
+
+1. `OrderEngine.process(event)` 校验事件并在 `ConcurrentHashMap` 中创建或获取 `OrderContext`。
+2. `OrderContext.registerFact` 通过 `AtomicInteger.compareAndSet` 登记事实位；重复事实只计数，不直接返回。
+3. 根据 `userId` 获取 256 个 stripe 中的一个 canonical `ReentrantLock`。
+4. 在锁内执行 `reconcile`：冻结、风控、审批调度、结算、解冻和状态迁移。
+5. 释放用户锁后，审批任务才进入异步执行器；审批结果重新作为事件回到 `process`，不在 callback 中直接改领域对象。
+
+## 订单状态机
+
+### 状态与事实
+
+订单状态不是单一可被消息覆盖的字段，而是以下信息的派生结果：
 
 ```text
 Immutable Metadata
-+ Observed Fact Bits
-+ Applied Effect Bits
-+ Derived OrderStatus
+        +
+Observed Fact Bits
+        +
+Applied Effect Bits
+        |
+        v
+Derived OrderStatus
 ```
 
-状态枚举严格为 `INIT`、`NEW`、`RISK_HOLD`、`FILLED`、`CANCELED`。乱序消息不会伪造额外状态，而是先缓存事实，待 CREATE 补齐后统一 reconcile。
+状态枚举只有：
 
-### Fact Combination
+| 状态 | 含义 | 资产含义 |
+|---|---|---|
+| `INIT` | 尚未完成正常订单初始化，或只收到乱序终态事实 | 不因乱序事实产生资金变化 |
+| `NEW` | 创建已确认、冻结已完成、风控通过 | 订单金额处于 `frozen` |
+| `RISK_HOLD` | 创建已确认、冻结已完成、风控要求审批 | 订单金额仍处于 `frozen` |
+| `FILLED` | 成交事实已确认并完成结算 | `frozen` 减少，`systemSettledAmount` 增加 |
+| `CANCELED` | 撤单或审批拒绝已确认并完成解冻 | `frozen` 减少，`available` 增加 |
 
-| CREATED | FILLED | CANCELLED | Result |
-|---:|---:|---:|---|
-| 0 | 0 | 0 | `INIT`, 等待 CREATE |
-| 0 | 1 | 0 | `INIT`, 缓存成交事实 |
-| 0 | 0 | 1 | `INIT`, 缓存撤单事实 |
-| 1 | 1 | 0 | `FILLED` |
-| 1 | 0 | 1 | `CANCELED` |
-| 1 | 1 | 1 | External terminal conflict；禁止双副作用 |
+事实位与事件的映射：
 
-## 5. Complete Out-of-Order State Transition
+| 事件 | Fact Bit | 是否可以早于 `ORDER_CREATED` |
+|---|---|---:|
+| `ORDER_CREATED` | `CREATED_SEEN` | 否 |
+| `MATCH_FILLED` | `FILLED_SEEN` | 是 |
+| `ORDER_CANCELLED` | `CANCELLED_SEEN` | 是 |
+| `APPROVAL_PASSED` | `APPROVED_SEEN` | 可以缓存 |
+| `APPROVAL_REJECTED` | `REJECTED_SEEN` | 可以缓存 |
 
-状态机不是按消息到达顺序直接覆盖 `status`，而是先登记 Fact Bits，再由 reconcile 根据完整事实集合和 Effect Bits 收敛。下面的 ASCII 图覆盖正常路径、两种乱序路径、审批路径、重复消息和终态冲突：
+效果位与业务副作用的映射：
+
+| Effect Bit | 副作用 | 幂等保护 |
+|---|---|---|
+| `FREEZE_APPLIED` | `available -= amount`、`frozen += amount` | 同一用户锁内 check/mutate/commit |
+| `SETTLE_APPLIED` | `frozen -= amount`、`systemSettledAmount += amount` | 同一用户锁内只执行一次 |
+| `UNFREEZE_APPLIED` | `frozen -= amount`、`available += amount` | 同一用户锁内只执行一次 |
+| `RISK_RECORDED` | 将已结算金额写入 `TradeWindow` | 同一用户锁内只记录一次 |
+| `APPROVAL_SCHEDULED` | 标记审批任务已提交 | 防止重复提交审批 |
+
+### 完整 ASCII 状态转移图
 
 ```text
   [INIT: no CREATE fact]
@@ -111,142 +194,344 @@ Immutable Metadata
   [CANCELED] + [FILLED fact] --> [CANCELED], conflict metric, no second terminal effect
 ```
 
-`MATCH_FILLED` 或 `ORDER_CANCELLED` 先到达时只登记事实，不冻结资金；`ORDER_CREATED` 到达后统一执行一次冻结，再根据已观察事实执行结算或解冻。若 FILLED 与 CANCELED 同时存在，当前实现保留先完成的合法终态副作用，第二个互斥副作用被 Effect Bits 阻止并计入冲突指标。成交事实已先于 CREATE 到达时，结算侧不再反向进入本地 Risk Hold；该事实代表外部撮合已确认成交。
+`FILLED` 和 `CANCELED` 同时出现时，互斥资金副作用以第一次成功提交的 Effect Bit 为准。如果两个终态事实在第一次 reconcile 前都已存在，代码按 `FILLED` 分支优先处理；如果某一终态已经先完成结算或解冻，后续相反事实只记录冲突，不执行第二个终态副作用。
 
-## 6. Exactly-Once Asset Effects
+## 状态机处理规则
 
-消息层允许 at-least-once、duplicate 和 out-of-order；业务副作用要求 exactly-once。实现依靠：
+### 1. 事件入口与元数据规则
 
-1. Fact registration 是单调 CAS；重复 fact 只增加 duplicate metric。
-2. 重复事件不能直接 return，仍然进入补偿式 reconcile。
-3. `FREEZE_APPLIED`、`SETTLE_APPLIED`、`UNFREEZE_APPLIED` 等 Effect Bits 独立于 Facts。
-4. `check effect + ledger mutation + effect commit` 位于同一 canonical user stripe。
-5. 只有 mutation 成功后 `applyEffectLocked` 才提交 bit。
+- 所有事件必须经过 `OrderEngine.process`，不允许调用方直接操作 `OrderContext` 或 `AccountLedger`。
+- 第一个事件创建 `OrderContext` 并固定 `orderId`、`userId`、`amount`。
+- 后续事件必须通过 `validateMetadata`；元数据不一致抛出 `OrderMetadataMismatchException`，同时增加冲突指标。
+- 金额统一使用 `long`，由 `MoneyMath` 使用 `Math.addExact` / `Math.subtractExact` 做 checked arithmetic。
 
-## 7. Concurrency, Data Structures and Interrupt Model
+### 2. 事实登记规则
 
-### 极端乱序下的一致性
-
-- `OrderContext.factBits` 是 `AtomicInteger`，每个事实只允许通过 CAS 从 `0` 变为 `1`；乱序消息只补齐事实集合，不会把状态回退或伪造中间状态。
-- Fact Bits 与 Effect Bits 分离。`FREEZE_APPLIED`、`SETTLE_APPLIED`、`UNFREEZE_APPLIED`、`RISK_RECORDED` 和 `APPROVAL_SCHEDULED` 分别记录副作用是否已经完成；重复消息即使重新进入 reconcile，也不会重复扣款、解冻或记录成交。
-- 事实登记是无锁的；事实登记之后一定进入 reconcile，避免“重复事件直接 return”导致上一线程只登记事实、尚未完成副作用时没有补偿机会。
-- `ConcurrentHashMap<Long, OrderContext>` 保存订单上下文，`ConcurrentHashMap<Long, TradeWindow>` 保存每个用户唯一的窗口对象；订单元数据首次建立后保持不可变，后续事件元数据不一致会拒绝。
-
-### 低锁方案与锁顺序
-
-- `StripedLockManager` 预创建 256 个 `ReentrantLock`，通过 userId 的 hash 映射到 canonical stripe。相同用户严格串行，不同 stripe 可并行；不为每个事件创建锁，也没有全局订单锁。
-- `OrderContext` 的状态、Effect Bits、账户 `available/frozen`、用户 TradeWindow 的 `head/size/rollingSum` 都在同一个 user stripe 内更新。冻结的“available 减少 + frozen 增加”、结算的“frozen 减少 + systemSettled 增加”和解冻均为一个不可拆分的业务临界区。
-- `Effect check -> ledger mutation -> Effect commit` 在同一 stripe 中完成；只有 mutation 成功才提交 Effect Bit。结算还会先用 CAS 预留 `systemSettledAmount`，避免溢出或余额错误造成部分更新。
-- 账户表与 system total 只在建户的 user stripe 及 ledger monitor 下更新；`InvariantChecker` 按 stripe `0 -> N-1` 顺序全量加锁，读取一致快照后逆序释放，避免多锁反向获取造成死锁。普通交易路径不获取全量锁。
-- Approval worker 使用固定线程数和 `ArrayBlockingQueue`；审批只生成 `APPROVAL_PASSED` / `APPROVAL_REJECTED` 事件，在释放 user stripe 后重新进入 `OrderEngine.process`，不在异步线程直接改领域状态。
-
-核心资金临界区使用 `lock.lock()`，不使用 `lockInterruptibly()`；Java interrupt 只是协作式信号，不具备资金 rollback 语义。临界区内没有 IO、sleep、park 或 Approval callback。收到中断的 worker 仍完成已经接受的事件。
-
-## 8. Dynamic Risk Workflow
-
-`RiskPipeline` 读取 volatile 的规则数组，注册/删除/替换走低频 copy-on-write 更新；读取路径无全局锁并按顺序 short-circuit。`TradeWindow` 只在对应 user stripe 下访问，使用 primitive timestamp/amount 数组、head、size 和 rolling sum。`SlidingWindowAmountRule` 判断最近 10 秒已成功 settle 的金额是否严格超过阈值。
-
-Approval 由固定 worker 数和 `ArrayBlockingQueue` 组成，使用 `CallerRunsPolicy` 做有界背压。它只产生 `APPROVAL_PASSED` 或 `APPROVAL_REJECTED`，结果重新进入 `OrderEngine.process`，不直接改 OrderContext、Account、Ledger 或 TradeWindow。
-
-## 9. Asset Invariant
+`Fact Bits` 是单调集合，只允许从 0 增加为 1：
 
 ```text
-Σ(account.available + account.frozen) + systemSettledAmount
-= initialTotalAsset
+current = factBits.get()
+updated = current | eventMask
+compareAndSet(current, updated)
 ```
 
-`InvariantChecker` 按 stripe `0 -> N` 顺序获取全部锁，读取一致快照后按逆序释放。Chaos 运行期间 watchdog 周期性检查，结束时再做最终检查；PerformanceTest 不启用 watchdog。
+CAS 失败时重试；如果位已经存在，返回 duplicate，但仍继续进入 reconcile。这样可以补偿“前一个线程已经登记事实、但还没有完成资金副作用”的并发窗口。
 
-## 10. Chaos / Failure Injection
+### 3. Reconcile 顺序
 
-- 16 个长生命周期 worker，而不是 500,000 个 pending Runnable。
-- 固定 `CHAOS_SEED`，默认 `20260816`，可用 system property 覆盖。
-- 生成 CREATE/MATCH 合法生命周期，随机改变顺序并重复事件。
-- 注入 `interrupt`、`Thread.yield()`、`LockSupport.parkNanos()`；故障点位于资金临界区之外。
-- `awaitTermination` 超时和 `ThreadMXBean.findDeadlockedThreads()` 同时检查。
-- 最终断言 `invariantFailures == 0`、`deadlockedThreads == null`、`stateTransitions >= 500000`。
+在同一用户 stripe 内，`OrderEngine` 按以下顺序收敛：
 
-## 11. Memory / GC Optimization under `-Xmx256m`
+1. 检查 FILLED/CANCELED 冲突，以及 APPROVED/REJECTED 冲突。
+2. 如果没有 `CREATED_SEEN`，只缓存事实并返回，不改变账户资金。
+3. 如果没有 `FREEZE_APPLIED`，先执行一次冻结。
+4. 如果存在 `FILLED_SEEN`，执行一次结算，记录一次风险成交，再迁移到 `FILLED`。
+5. 否则如果存在 `REJECTED_SEEN` 或 `CANCELLED_SEEN`，执行一次解冻并迁移到 `CANCELED`。
+6. 否则如果存在 `APPROVED_SEEN` 且不存在 `REJECTED_SEEN`，迁移到 `NEW`。
+7. 否则执行风险规则：`PASS` 迁移到 `NEW`，`HOLD` 迁移到 `RISK_HOLD` 并最多调度一次审批。
 
-内存上限按 Maven Surefire 的 `-Xms128m -Xmx256m -XX:+UseG1GC` 执行。设计目标不是“零分配”，而是在 500k 级别事件、16 个 worker 和审批队列存在时保持对象数量有界、避免历史数据线性增长：
+这套顺序把“观察到什么”和“已经做过什么”分开处理，因此消息顺序不直接决定资金副作用次数。
 
-- 金额、ID、时间和状态位使用 primitive `long` / `int` / bit mask；热路径不使用 `BigDecimal`、反射、序列化或 boxed latency 样本。
-- `TradeWindow` 使用固定容量的 primitive `long[]` 时间戳/金额环形数组，成交记录复用环槽；过期记录从 head 淘汰，`rollingSum` 增量维护，不保留完整事件历史。
-- `LatencyHistogram` 使用固定 bucket 计数，复用计数数组；`GcMetrics` 只保存计数器和本次测试的汇总值，不保存每次 GC 或每次延迟对象。
-- 256 个 canonical `ReentrantLock`、每用户 `TradeWindow`、volatile copy-on-write 的规则数组在生命周期内复用；规则读取不创建临时集合。Approval 使用有界 `ArrayBlockingQueue`，队列满时 `CallerRunsPolicy` 让提交线程承担任务，防止 pending task 无界堆积。
-- 订单上下文只保留当前事实位、效果位和少量元数据，不保留事件列表；测试使用 16 个长生命周期 worker，而不是为 500k 个事件创建 500k 个待执行 Runnable。
-- 不引入全局事件对象池：池化会延长对象引用存活、增加并发归还复杂度；本实现优先复用固定数组、锁、窗口和统计结构，并让短生命周期事件在 G1 下自然回收。
-- G1 在 Java 21 下负责小堆下的分区回收；`GcMetrics` 输出 collector count/time，测试报告实际 heap、GC 和 Full GC 数据，不无证据宣称 zero allocation 或 Full GC 为零。
+### 4. 风控与审批规则
 
-## 12. Assumptions / Trade-offs
+- `RiskPipeline` 读取 volatile 的 `RiskRule[]`，规则按注册顺序执行，遇到第一个 `HOLD` 即短路。
+- 规则更新使用 synchronized copy-on-write；读路径不获取全局锁。
+- `TradeWindow` 默认窗口为 10 秒，保存成功结算金额；`SlidingWindowAmountRule` 在最近窗口金额严格超过阈值时返回 `HOLD`。
+- 审批使用固定 worker 和 `ArrayBlockingQueue`。队列满时 `CallerRunsPolicy` 提供有界背压。
+- `ApprovalTask` 只产生 `APPROVAL_PASSED` 或 `APPROVAL_REJECTED`，审批结果重新进入 `OrderEngine.process`。
 
-- 题目只实现 full fill，不扩展 partial fill、TradeId、撮合订单簿、双边 base/quote 结算。
-- `systemSettledAmount` 是题目单资产不变量中的系统已成交总资金，不是生产交易所完整清算模型。
-- Risk Hold 时资金保持 frozen；Approval PASS 不重复 freeze，REJECT 只 unfreeze 一次。
-- 无数据库时，“落库”解释为进入正式可交易的内存状态。
-- FILLED/CANCELED 同时到达缺少权威 matching sequence；本实现保留先完成的合法副作用，记录 conflict，并禁止第二次互斥资金副作用。生产系统应提供 per-order monotonic sequence/version 做权威裁决。
+### 5. 重复和冲突规则
 
-## 13. Test Matrix
+- 重复事实：计入 `duplicateEvents`，重新 reconcile，但 Effect Bit 已存在时不重复执行副作用。
+- 乱序事实：计入 `outOfOrderEvents`，在缺少 CREATE 时只缓存。
+- FILLED/CANCELED 冲突：计入 `conflictingTerminalEvents`，已完成的一侧获准，另一侧不再执行互斥副作用。
+- APPROVED/REJECTED 冲突：计入 `approvalConflictEvents`；如果 REJECTED 已存在，则拒绝分支优先，避免审批通过后又执行拒绝资金操作。
 
-- `MoneyMathTest`
-- `LedgerInvariantTest`
-- `InvariantCheckerTest`
-- `OrderMetadataTest`
-- `OrderContextTest`
-- `OutOfOrderStateMachineTest`
-- `TerminalConflictTest`
-- `RiskEngineTest`
-- `ApprovalTest`
-- `ChaosInvariantTest`
-- `PerformanceTest`
+## 并发模型
 
-## 14. Measured Performance Result
+### 用户级 striped lock
 
-以下为一次 `mvn clean test` 在本机 JDK 21、Surefire `-Xmx256m` 下的真实输出：
+`StripedLockManager` 预创建 256 个 `ReentrantLock`，通过 `Long.hashCode(userId) & (stripeCount - 1)` 计算 stripe：
 
 ```text
-Measurement Operations: 500000
-Threads:                16
-TPS:                    8470613.75
-Average latency:        1.31 us
-P50:                    10.0 us
-P95:                    10.0 us
-P99:                    25.0 us
-MAX:                    712.9 us
-Heap Max:               256 MB
-Heap Used:              44 MB
-GC Count:               1
-GC Time:                1 ms
-Old/Full GC Count:      0
-Old/Full GC Time:       0 ms
+userId -> stripeIndex -> canonical ReentrantLock
 ```
 
-该结果是当前机器的一次观测值，会受 JIT、CPU 和调度影响；测试仍对 TPS `>= 10000` 和平均延迟 `< 1ms` 做真实断言。
+- 同一用户的订单状态、账本余额、风控窗口和效果位在同一把锁下串行。
+- 不同用户如果落在不同 stripe，可以并行；不为每个订单或每个事件创建锁。
+- 该方案是低锁而非无锁：Fact 登记走 CAS，资金复合事务必须加锁。
+- 热路径没有全局锁；全量锁只在 `InvariantChecker` 的一致快照期间使用。
 
-## 15. Build and Acceptance
+### 共享数据结构
 
-当前机器默认 Maven 可能仍指向旧 JDK，因此使用本机已安装的 JDK 21 执行：
+| 数据 | 容器/同步方式 | 访问规则 |
+|---|---|---|
+| 订单上下文 | `ConcurrentHashMap<Long, OrderContext>` | 元数据固定；事实 CAS；状态和效果在用户锁内改 |
+| 账户 | `ConcurrentHashMap<Long, Account>` | 账户字段只在对应用户锁内修改 |
+| 已结算总额 | `AtomicLong` | 结算在用户锁内执行，使用 CAS 保证 checked reserve |
+| 风控窗口 | `ConcurrentHashMap<Long, TradeWindow>` | 窗口数组和 rolling sum 在用户锁内访问 |
+| 风控规则 | volatile `RiskRule[]` | 读无锁，改规则时 copy-on-write |
+| 指标 | `LongAdder` / `AtomicLong` | 只做观测，不参与领域决策 |
+
+### 锁顺序与中断
+
+- 普通交易：先获取一个用户 stripe，再执行订单和账本操作，释放后才提交审批任务。
+- `InvariantChecker`：按 stripe `0 -> N-1` 获取，检查完成后按逆序释放；所有需要全量读取的路径遵守同一顺序。
+- `AccountLedger.createAccount` 先获取用户 stripe，再进入 ledger monitor；因此不会形成 monitor -> stripe 的反向等待。
+- 资金临界区使用 `lock.lock()`，不使用 `lockInterruptibly()`。Java interrupt 是协作式信号，不提供资金事务 rollback 语义；worker 即使收到 interrupt，也必须完成已接受的资金操作。
+- 临界区内不执行 IO、sleep、park 或审批 callback，降低长时间持锁和死锁风险。
+
+## 资产一致性证明
+
+### 不变量定义
+
+设：
+
+- `A_i`：用户 `i` 的 `available`；
+- `F_i`：用户 `i` 的 `frozen`；
+- `S`：`systemSettledAmount`；
+- `T0`：建户和初始系统结算额确定后的 `initialTotalAsset`。
+
+系统要求始终满足：
+
+```text
+Σ(A_i + F_i) + S = T0
+```
+
+### 每个资金操作的守恒关系
+
+| 操作 | 变化 | 总量变化 |
+|---|---|---:|
+| 建户 | `T0 += available + frozen`，同时新增账户余额 | 0 |
+| Freeze(x) | `A_i -= x`，`F_i += x` | 0 |
+| Unfreeze(x) | `F_i -= x`，`A_i += x` | 0 |
+| Settle(x) | `F_i -= x`，`S += x` | 0 |
+| 重复 Effect | 不再执行 mutation | 0 |
+
+因此，如果初始状态满足不变量，且所有变更只通过上述原子业务操作发生，则每次操作后仍满足不变量。
+
+### 为什么并发下仍成立
+
+1. 同一用户的 `A_i/F_i` 变化由同一 stripe 串行化。
+2. `Effect check -> mutation -> Effect commit` 在同一临界区内完成，重复事件不能绕过效果位再次扣款。
+3. `settleLocked` 在减少 frozen 前先 CAS 预留 `systemSettledAmount`；余额不足或算术溢出不会留下半个结算。
+4. `InvariantChecker` 获取全部 stripe 后再读取账户集合和初始总量，避免读到一半冻结、一半解冻的混合快照。
+5. `MoneyMath` 的 checked arithmetic 将 long 溢出转化为异常，而不是静默破坏总量。
+
+测试不只检查最终值，还在 Chaos 运行期间由 watchdog 周期性调用 `InvariantChecker.check()`；最终同时断言失败次数为 0、总量差为 0、无死锁、所有 worker 终止。
+
+## 乱序事件收敛方案
+
+### 收敛模型
+
+事件到达顺序与业务因果顺序分离：
+
+```text
+event arrival
+    -> validate immutable metadata
+    -> register monotonic fact
+    -> lock user stripe
+    -> reconcile complete fact set + effect set
+    -> unlock
+    -> optionally enqueue approval
+```
+
+对于同一订单、同一元数据、非冲突事实集合，最终状态由事实集合和已提交效果集合决定，而不是由某条消息是否重复决定。效果位使 reconcile 可重复执行。
+
+### 典型乱序场景
+
+#### MATCH 先于 CREATE
+
+```text
+MATCH_FILLED
+  -> FILLED_SEEN = 1
+  -> status 仍为 INIT
+  -> 不冻结、不结算
+
+ORDER_CREATED
+  -> CREATED_SEEN = 1
+  -> freeze 一次
+  -> settle 一次
+  -> RISK_RECORDED 一次
+  -> FILLED
+```
+
+#### CANCEL 先于 CREATE
+
+```text
+ORDER_CANCELLED
+  -> CANCELLED_SEEN = 1
+  -> status 仍为 INIT
+  -> 不冻结、不解冻
+
+ORDER_CREATED
+  -> CREATED_SEEN = 1
+  -> freeze 一次
+  -> unfreeze 一次
+  -> CANCELED
+```
+
+#### Duplicate 与并发重复
+
+两个线程可能同时看到同一个事实未登记，也可能一个线程刚登记事实、另一个线程先开始 reconcile。CAS 保证事实位只成功登记一次；用户锁保证效果位和账本操作只成功提交一次，重复事件仍会执行一次补偿式 reconcile。
+
+#### 终态冲突
+
+`MATCH_FILLED` 与 `ORDER_CANCELLED` 都是合法事实，但缺少外部撮合序列号时无法推断真实权威顺序。实现不做双重资金操作：第一次成功完成结算或解冻的一侧保留，后一侧只增加冲突指标。生产系统若需要严格权威裁决，应引入每订单单调 sequence/version。
+
+## 内存优化方案
+
+Maven Surefire 的运行参数为：
+
+```text
+-Xms128m -Xmx256m -XX:+UseG1GC
+```
+
+### 对象和数据结构策略
+
+- 金额、ID、时间和状态位使用 primitive `long` / `int` / bit mask，金额不使用 `BigDecimal`。
+- `TradeWindow` 使用 primitive `long[]` 时间戳和金额环形数组，维护 `head`、`size`、`rollingSum`；窗口淘汰后复用环槽，不保存完整成交事件历史。
+- `LatencyHistogram` 使用固定 bucket 和 `LongAdder`，不创建 500,000 个 boxed latency 样本。
+- Chaos 使用 16 个长生命周期 worker，而不是为每条测试事件创建 pending Runnable。
+- Benchmark 预先创建 16 个可重复使用的 duplicate event 对象，并先执行 50,000 次 warmup，再执行 500,000 次测量。
+- `StripedLockManager` 的 256 把锁、每用户 `TradeWindow`、风险规则数组和统计结构在生命周期内复用；审批队列使用 `ArrayBlockingQueue` 限制待处理任务数量。
+- 不引入全局事件对象池：池化可能延长对象存活和引用链，增加归还竞态；本实现优先复用固定数组和有限容量结构，让 G1 回收短生命周期事件。
+
+### GC 观测
+
+`GcMetrics` 在 Benchmark 前后读取 `GarbageCollectorMXBean`，报告总 GC 次数/时间和 old/mixed collector 次数/时间。报告数据是一次运行的观测值，不代表所有机器都获得相同 GC 数字。
+
+## Benchmark 结果
+
+### 测试方法
+
+- 测试类：`PerformanceTest`
+- JDK：Microsoft OpenJDK 21.0.12
+- JVM 堆：`-Xms128m -Xmx256m -XX:+UseG1GC`
+- 并发线程：16
+- Warmup：50,000 次
+- Measurement：500,000 次
+- 负载：重复处理已完成订单的 `MATCH_FILLED` 事件，验证幂等热路径
+- 断言阈值：TPS `>= 10,000`，平均延迟 `< 1ms`
+
+### 最近一次实测输出
+
+| 指标 | 结果 |
+|---|---:|
+| Measurement Operations | 500,000 |
+| Threads | 16 |
+| TPS | 7,723,236.28 |
+| Average latency | 1.50 us |
+| P50 | 10.0 us |
+| P95 | 10.0 us |
+| P99 | 25.0 us |
+| MAX | 1,711.8 us |
+| Heap Max | 256 MB |
+| Heap Used | 199 MB |
+| GC Count | 1 |
+| GC Time | 1 ms |
+| Old/Full GC Count | 0 |
+| Old/Full GC Time | 0 ms |
+
+TPS、调度和堆使用量会受到 JIT、CPU、系统调度及测试顺序影响；该结果用于证明实现满足测评阈值，不应直接当作生产容量规划。
+
+## Chaos 测试结果
+
+### 测试方法
+
+测试类：`ChaosInvariantTest`。
+
+- 固定种子：`20260816`，可通过 `-DCHAOS_SEED` 覆盖。
+- 订单数：270,000；每个用户预置 2 个资产单位。
+- worker：16 个固定线程，长生命周期执行订单循环。
+- 每个订单生成 CREATE 和 MATCH；部分订单先发 MATCH 再发重复 MATCH 再发 CREATE，其他订单先发重复 CREATE 再发 MATCH。
+- 每 17 个订单注入一次 `Thread.interrupt()`；每 256 个订单注入 `Thread.yield()` 和 `LockSupport.parkNanos(1)`。
+- watchdog 每 1ms 检查一次资产不变量；worker 每 1024 次操作额外检查一次。
+- 结束时调用 `ThreadMXBean.findDeadlockedThreads()`，并验证 worker 和 watchdog 都能终止。
+
+### 最近一次实测输出
+
+| 指标 | 结果 |
+|---|---:|
+| CHAOS SEED | 20260816 |
+| Processed events | 825,883 |
+| Accepted facts | 540,000 |
+| Duplicate events | 285,883 |
+| Out-of-order events | 27,000 |
+| State transitions | 526,500 |
+| Freeze count | 270,000 |
+| Settle count | 270,000 |
+| Unfreeze count | 0 |
+| Invariant snapshots | 393 |
+| Invariant failures | 0 |
+| Deadlock check | PASS |
+| Termination check | PASS |
+
+Chaos 的关键验收条件是：`stateTransitions >= 500,000`、`invariantFailures == 0`、总资产差为 0、死锁检查为空、worker 正常终止、每个订单恰好结算一次。
+
+## 构建和完整验证
+
+### 环境要求
+
+- JDK 21；本机验证路径：`C:\Users\10703\.jdks\ms-21.0.12`
+- Maven 3.9+
+- Windows PowerShell 示例：
 
 ```powershell
 $env:JAVA_HOME='C:/Users/10703/.jdks/ms-21.0.12'
-$env:Path='C:/Users/10703/.jdks/ms-21.0.12/bin;' + $env:Path
+$env:Path="$env:JAVA_HOME/bin;$env:Path"
+java -version
+mvn -version
+```
+
+### 完整命令
+
+```powershell
 mvn clean test
 ```
 
-最近一次完整验收：`Tests run: 38, Failures: 0, Errors: 0, Skipped: 0`。
+当前完整测试矩阵：
 
-## 16. Interview Notes
+| 测试类 | 覆盖内容 |
+|---|---|
+| `MoneyMathTest` | checked arithmetic、正数和非负数校验 |
+| `LedgerInvariantTest` | freeze、settle、unfreeze、溢出、失败原子性和并发账本 |
+| `InvariantCheckerTest` | 全 stripe 一致快照 |
+| `StripedLockManagerTest` | stripe 映射和锁数量 |
+| `OrderContextTest` | Fact Bits、Effect Bits 和状态上下文 |
+| `OrderMetadataTest` | 元数据固定与冲突拒绝 |
+| `OutOfOrderStateMachineTest` | CREATE/MATCH/CANCEL 乱序收敛 |
+| `TerminalConflictTest` | FILLED/CANCELED 终态冲突 |
+| `RiskEngineTest` | 风险窗口、规则动态更新和 HOLD |
+| `ApprovalTest` | 有界审批队列、审批事件回流和 quiescence |
+| `ChaosInvariantTest` | 16 worker、重复、乱序、interrupt、watchdog、死锁 |
+| `PerformanceTest` | 500k 操作、延迟、吞吐、堆和 GC |
 
-**为什么不全部 CAS？** Fact 是单变量单调位登记；available/frozen 是多字段业务事务，必须使用 user stripe。
+最近一次完整验证结果：
 
-**为什么 duplicate event 不能直接 return？** Fact 可能已经登记但上一线程尚未完成 reconcile；重复投递是补偿机会。
+```text
+Tests run: 38, Failures: 0, Errors: 0, Skipped: 0
+BUILD SUCCESS
+```
 
-**MATCH 为什么能先于 CREATE？** 消息到达顺序不等于业务因果顺序；先保存事实，CREATE 到达后统一收敛。
+## 使用边界
 
-**如何防止重复扣款？** Fact 与 Effect 分离，Effect check/mutate/commit 在同一 stripe；重复事件仍 reconcile 但不会重复 mutation。
+### 当前明确支持
 
-**为什么 interrupt 不回滚？** Java interrupt 没有资金事务 rollback 语义；关键临界区必须完整执行。
+- 单资产余额模型：`available`、`frozen`、`systemSettledAmount`。
+- 全成交订单：一个订单最多执行一次 freeze、settle 或 unfreeze。
+- at-least-once、duplicate、out-of-order 事件处理。
+- 风控规则的运行时注册、移除和替换。
+- 10 秒成交金额窗口和异步审批结果回流。
+- 进程内并发一致性、死锁检测、内存和 GC 测量。
 
-**为什么 InvariantChecker 全量加锁？** 无锁遍历会读取跨时刻混合快照；全 stripe 顺序获取给出一致视图且避免反向多锁死锁。
+### 当前不支持或有意简化
 
-**为什么 RiskWindow 复用 user stripe？** 成交记录、过期淘汰、rolling sum 和下单风控判断属于同一用户业务串行域。
+- 不实现 partial fill、多个 `TradeId`、撮合订单簿或撮合优先级。
+- 不实现 base/quote 双资产的完整交易清算，只维护题目所需的单资产总量模型。
+- 不包含数据库、WAL、事件日志、跨进程恢复或 crash recovery；Fact Bits 和 Effect Bits 只在当前 JVM 生命周期内有效。
+- 不包含网络协议、鉴权、限流、幂等键持久化或消息 broker 语义。
+- 订单元数据必须在同一订单内保持一致；生产系统应由外部 schema/version 和持久化序列保证这一点。
+- 终态冲突没有权威撮合序列号时只能采用“先成功副作用获胜”的本地策略；生产系统应引入 per-order monotonic sequence/version。
+- Benchmark 是内存状态机热路径测量，不代表端到端交易所吞吐，也不包含网络、序列化、数据库和撮合开销。
+
+如果将该工程扩展到生产交易系统，下一步应优先补充：持久化事实日志与恢复协议、权威事件序列、双资产清算模型、跨服务幂等、监控告警和故障恢复演练。
