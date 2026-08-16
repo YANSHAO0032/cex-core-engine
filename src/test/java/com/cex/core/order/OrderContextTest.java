@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Callable;
@@ -16,6 +17,12 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
 class OrderContextTest {
+
+    @Test
+    void statusFieldIsVolatileForUnlockedReaders() throws Exception {
+        int modifiers = OrderContext.class.getDeclaredField("status").getModifiers();
+        assertTrue(Modifier.isVolatile(modifiers));
+    }
 
     @Test
     void duplicateFactRegistrationIsExposedWithoutClearingTheFact() {

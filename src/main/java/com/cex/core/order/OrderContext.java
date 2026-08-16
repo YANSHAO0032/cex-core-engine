@@ -11,7 +11,7 @@ public final class OrderContext {
     private final AtomicInteger factBits = new AtomicInteger();
 
     private int effectBits;
-    private OrderStatus status = OrderStatus.INIT;
+    private volatile OrderStatus status = OrderStatus.INIT;
     private boolean terminalConflictRecorded;
     private boolean approvalConflictRecorded;
 
