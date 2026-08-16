@@ -33,3 +33,4 @@ target/
 /logs/
 /**/logs/
 .superpowers/
+.worktrees/
