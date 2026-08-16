@@ -174,17 +174,21 @@ class PerformanceTest {
             long expectedTransitions = LIFECYCLE_ORDERS * 7L / 4L;
             double tps = operations / (elapsed / 1_000_000_000.0);
             double averageMillis = histogram.averageMicros() / 1_000.0;
+            long maxMemory = Runtime.getRuntime().maxMemory();
+            long usedMemory = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
+            long oldGcCount = gcAfter.oldCollectorCount() - gcBefore.oldCollectorCount();
 
             assertEquals(LIFECYCLE_ORDERS * 2L, operations);
             assertEquals(expectedTransitions, transitions);
+            assertEquals(LIFECYCLE_ORDERS, engine.metrics().freezeCount());
             assertEquals(LIFECYCLE_ORDERS / 2L, engine.metrics().settleCount());
             assertEquals(LIFECYCLE_ORDERS / 2L, engine.metrics().unfreezeCount());
             assertTrue(tps >= 10_000.0, () -> "TPS=" + tps);
             assertTrue(averageMillis < 1.0, () -> "average latency ms=" + averageMillis);
+            assertTrue(maxMemory <= 256L * 1024L * 1024L, () -> "max heap bytes=" + maxMemory);
+            assertTrue(oldGcCount <= 1L, () -> "old/full GC count=" + oldGcCount);
             assertTrue(ledger.invariantHolds());
 
-            long maxMemory = Runtime.getRuntime().maxMemory();
-            long usedMemory = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
             System.out.println("====================================");
             System.out.println("CEX REPRESENTATIVE LIFECYCLE REPORT");
             System.out.println("====================================");
@@ -206,8 +210,7 @@ class PerformanceTest {
                     + (gcAfter.collectionCount() - gcBefore.collectionCount()));
             System.out.println("GC Time:                 "
                     + (gcAfter.collectionTimeMillis() - gcBefore.collectionTimeMillis()) + " ms");
-            System.out.println("Old/Full GC Count:       "
-                    + (gcAfter.oldCollectorCount() - gcBefore.oldCollectorCount()));
+            System.out.println("Old/Full GC Count:       " + oldGcCount);
             System.out.println("Old/Full GC Time:        "
                     + (gcAfter.oldCollectorTimeMillis() - gcBefore.oldCollectorTimeMillis()) + " ms");
             System.out.println("Invariant result:        PASS");

@@ -148,13 +148,6 @@ public final class OrderEngine implements AutoCloseable {
             transitionLocked(context, OrderStatus.FILLED);
             return ReconcileResult.NONE;
         }
-        if (cancelled) {
-            if (!context.hasEffect(OrderEffect.SETTLE_APPLIED)) {
-                applyUnfreezeLocked(context);
-                transitionLocked(context, OrderStatus.CANCELED);
-            }
-            return ReconcileResult.NONE;
-        }
         return ReconcileResult.NONE;
     }
 
