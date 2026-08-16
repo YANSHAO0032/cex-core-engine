@@ -158,7 +158,7 @@ Derived OrderStatus
 
 ### 完整 ASCII 状态转移图
 
-```text
+<pre>
   [INIT: no CREATE fact]
        | ORDER_CREATED / freeze
        v
@@ -192,7 +192,7 @@ Derived OrderStatus
   Any state --duplicate fact--> same state, reconcile again, no duplicate effect
   [FILLED] + [CANCELED fact] --> [FILLED], conflict metric, no second terminal effect
   [CANCELED] + [FILLED fact] --> [CANCELED], conflict metric, no second terminal effect
-```
+</pre>
 
 `FILLED` 和 `CANCELED` 同时出现时，互斥资金副作用以第一次成功提交的 Effect Bit 为准。如果两个终态事实在第一次 reconcile 前都已存在，代码按 `FILLED` 分支优先处理；如果某一终态已经先完成结算或解冻，后续相反事实只记录冲突，不执行第二个终态副作用。
 
