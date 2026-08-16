@@ -19,7 +19,7 @@
 - 以用户为串行化边界，不使用全局订单锁；不同用户可以并行处理。
 - 事实登记使用 CAS，资金事务使用 canonical striped lock，在正确性和锁竞争之间取得平衡。
 - 审批使用有界队列，避免异步任务无界堆积。
-- 在 `-Xmx256m` 下完成 500,000 次 benchmark 操作，并对吞吐、延迟和 GC 做实际采样。
+- 在 `-Xmx256m` 下分别完成 600,000 次代表性生命周期调用和 500,000 次重复幂等热路径调用，并对吞吐、延迟、堆占用和 GC 做实际采样。
 
 ### 可验证性目标
 
@@ -65,7 +65,7 @@ cex-core-engine/
     ├── chaos/                           # 乱序、重复、interrupt、watchdog
     ├── concurrent/                      # striped lock 测试
     ├── order/                           # 事实、元数据、状态机和冲突
-    ├── performance/                     # 500k benchmark
+    ├── performance/                     # 代表性生命周期 + 重复幂等双场景 benchmark
     ├── risk/                            # 风控与审批
     └── util/                            # 金额运算
 ```
@@ -270,7 +270,7 @@ userId -> stripeIndex -> canonical ReentrantLock
 
 | 数据 | 容器/同步方式 | 访问规则 |
 |---|---|---|
-| 订单上下文 | `ConcurrentHashMap<Long, OrderContext>` | 元数据固定；事实 CAS；状态和效果在用户锁内改 |
+| 订单上下文 | `ConcurrentHashMap<Long, OrderContext>` | 元数据固定；事实 CAS；状态写入和效果在用户锁内完成，状态通过 `volatile` 安全发布 |
 | 账户 | `ConcurrentHashMap<Long, Account>` | 账户字段只在对应用户锁内修改 |
 | 已结算总额 | `AtomicLong` | 结算在用户锁内执行，使用 CAS 保证 checked reserve |
 | 风控窗口 | `ConcurrentHashMap<Long, TradeWindow>` | 窗口数组和 rolling sum 在用户锁内访问 |
@@ -411,6 +411,7 @@ Maven Surefire 的运行参数为：
 ### Representative Lifecycle Benchmark
 
 - 测试类：`PerformanceTest`
+- 记录样本：2026-08-16 修复完成后的一次 `mvn clean test` 输出；性能数值会随运行环境波动
 - JDK：Microsoft OpenJDK 21.0.12
 - JVM 堆：`-Xms128m -Xmx256m -XX:+UseG1GC`
 - 并发线程：16
@@ -481,7 +482,9 @@ TPS、调度和堆使用量会受到 JIT、CPU、系统调度及测试顺序影�
 - watchdog 每 1ms 检查一次资产不变量；worker 每 1024 次操作额外检查一次。
 - worker 的 `Future` 必须逐个成功完成；结束时调用 `ThreadMXBean.findDeadlockedThreads()`，并验证 worker 和 watchdog 都能终止。
 
-### 最近一次实测输出
+### 记录样本（2026-08-16）
+
+下表来自一次完整测试输出；`Invariant snapshots` 由 watchdog 调度频率决定，运行间可能波动，其验收重点是快照期间 `Invariant failures` 始终为 0。
 
 | 指标 | 结果 |
 |---|---:|
@@ -506,18 +509,18 @@ TPS、调度和堆使用量会受到 JIT、CPU、系统调度及测试顺序影�
 | Deadlock check | PASS |
 | Termination check | PASS |
 
-Chaos 的关键验收条件是：每个订单收敛到场景预定终态、`stateTransitions >= 500,000`、成交/撤单/冲突与三类扰动均实际覆盖、`invariantFailures == 0`、总资产差为 0、死锁检查为空且所有线程正常终止。
+Chaos 的关键验收条件是：每个订单收敛到场景预定终态、`stateTransitions == 540,000`（高于测评要求的 500,000 次）、成交/撤单/冲突与三类扰动均实际覆盖、`invariantFailures == 0`、总资产差为 0、死锁检查为空且所有线程正常终止。
 
 ## 构建和完整验证
 
 ### 环境要求
 
-- JDK 21；本机验证路径：`C:\Users\10703\.jdks\ms-21.0.12`
+- JDK 21；确保 `JAVA_HOME` 指向本机的 JDK 21 安装目录
 - Maven 3.9+
 - Windows PowerShell 示例：
 
 ```powershell
-$env:JAVA_HOME='C:/Users/10703/.jdks/ms-21.0.12'
+$env:JAVA_HOME='C:/path/to/jdk-21'
 $env:Path="$env:JAVA_HOME/bin;$env:Path"
 java -version
 mvn -version

@@ -1,36 +1,67 @@
+# Maven build output
 target/
-!.mvn/wrapper/maven-wrapper.jar
-!**/src/main/**/target/
-!**/src/test/**/target/
+*.class
+dependency-reduced-pom.xml
+.flattened-pom.xml
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
 
-### STS ###
-.apt_generated
-.classpath
-.factorypath
-.project
-.settings
-.springBeans
-.sts4-cache
+# Test, runtime, and JVM diagnostics
+logs/
+*.log
+*.hprof
+hs_err_pid*
+replay_pid*
+.attach_pid*
+jacoco.exec
 
-### IntelliJ IDEA ###
-.idea
+# IntelliJ IDEA
+.idea/
 *.iws
 *.iml
 *.ipr
+out/
 
-### NetBeans ###
+# Eclipse / STS
+.apt_generated/
+.classpath
+.factorypath
+.project
+.settings/
+.springBeans
+.sts4-cache/
+
+# NetBeans
 /nbproject/private/
 /nbbuild/
 /dist/
 /nbdist/
 /.nb-gradle/
-#build/
-!**/src/main/**/build/
-!**/src/test/**/build/
-**/build-image/target/
-### VS Code ###
+
+# Visual Studio Code
 .vscode/
-/logs/
-/**/logs/
+
+# Local environment files (keep examples)
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Local Codex and worktree artifacts
+.codex-qa/
 .superpowers/
 .worktrees/
+
+# Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor and temporary files
+*.swp
+*.swo
+*.tmp
+*~
