@@ -12,7 +12,16 @@ import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+/**
+ * 审批结果回流、订单乱序成交门禁与冻结资金处理的集成场景测试。
+ * 核心能力：验证审批只发布事件并经统一订单入口生效；线程安全：通过闭锁协调异步审批；使用限制：依赖测试专用内存账务组件。
+ */
 class ApprovalTest {
+    /**
+     * 场景：审批服务只发布拒绝事件，不直接修改订单状态或账务。
+     *
+     * @throws Exception 审批任务等待或服务关闭失败时抛出
+     */
     @Test
     void approvalServiceOnlyEmitsAnEvent() throws Exception {
         ApprovalService service = new ApprovalService(1, 1);
@@ -27,6 +36,11 @@ class ApprovalTest {
         } finally { service.close(); }
     }
 
+    /**
+     * 场景：审批拒绝经统一入口仅解冻一次，即使原始创建事件重复到达。
+     *
+     * @throws Exception 审批任务等待或引擎关闭失败时抛出
+     */
     @Test
     void rejectUnfreezesThroughUnifiedOrderEntryExactlyOnce() throws Exception {
         AccountLedger ledger = new AccountLedger(new StripedLockManager());
@@ -49,6 +63,11 @@ class ApprovalTest {
         } finally { engine.close(); }
     }
 
+    /**
+     * 场景：风险挂起期间乱序或重复成交被门禁拦截，拒绝后取消且不再结算。
+     *
+     * @throws Exception 审批线程同步或测试夹具关闭失败时抛出
+     */
     @Test
     void fillDuringRiskHoldWaitsAndRejectedApprovalCancelsWithoutSettlement() throws Exception {
         try (BlockingApprovalFixture fixture = new BlockingApprovalFixture(ApprovalDecision.REJECT)) {
@@ -77,6 +96,11 @@ class ApprovalTest {
         }
     }
 
+    /**
+     * 场景：审批通过后仅回放一次挂起期间缓存的成交。
+     *
+     * @throws Exception 审批线程同步或测试夹具关闭失败时抛出
+     */
     @Test
     void approvedRiskHoldAppliesCachedFillExactlyOnce() throws Exception {
         try (BlockingApprovalFixture fixture = new BlockingApprovalFixture(ApprovalDecision.PASS)) {
@@ -99,6 +123,11 @@ class ApprovalTest {
         }
     }
 
+    /**
+     * 场景：成交先于创建到达时仍先进入风险挂起，审批拒绝后不发生结算。
+     *
+     * @throws Exception 审批线程同步或测试夹具关闭失败时抛出
+     */
     @Test
     void fillBeforeCreateStillEntersRiskHoldBeforeSettlement() throws Exception {
         try (BlockingApprovalFixture fixture = new BlockingApprovalFixture(ApprovalDecision.REJECT)) {
@@ -118,13 +147,27 @@ class ApprovalTest {
         }
     }
 
+    /**
+     * 通过闭锁阻塞审批工作线程的集成测试夹具。
+     * 核心能力：稳定复现审批未返回时的订单状态；线程安全：闭锁提供跨线程可见性；使用限制：仅供本测试类使用。
+     */
     private static final class BlockingApprovalFixture implements AutoCloseable {
+        /** 测试账务账本，用于校验资金冻结与结算。 */
         private final AccountLedger ledger = new AccountLedger(new StripedLockManager());
+        /** 审批策略已开始执行的测试同步信号。 */
         private final CountDownLatch approvalEntered = new CountDownLatch(1);
+        /** 允许被阻塞审批策略返回决定的测试同步信号。 */
         private final CountDownLatch releaseApproval = new CountDownLatch(1);
+        /** 容量为 8 的测试审批服务，承载回流审批任务。 */
         private final ApprovalService approvals = new ApprovalService(1, 8);
+        /** 接收原始与审批回流事件的订单引擎。 */
         private final OrderEngine engine;
 
+        /**
+         * 建立已完成首笔成交、第二笔将触发风险审批的夹具。
+         *
+         * @param decision 解除阻塞后审批策略返回的结果
+         */
         private BlockingApprovalFixture(ApprovalDecision decision) {
             ledger.createAccount(1L, 1_000L);
             engine = new OrderEngine(
@@ -146,14 +189,22 @@ class ApprovalTest {
             process(1L, OrderEventType.MATCH_FILLED);
         }
 
+        /** 向订单引擎投递测试事件。
+         * @param orderId 订单标识
+         * @param type 订单事件类型
+         */
         private void process(long orderId, OrderEventType type) {
             engine.process(new OrderEvent(orderId, 1L, 100L, 1L, type));
         }
 
+        /** 等待审批策略进入阻塞点。
+         * @throws InterruptedException 当等待线程被中断时抛出
+         */
         private void awaitApprovalEntry() throws InterruptedException {
             assertTrue(approvalEntered.await(2L, TimeUnit.SECONDS));
         }
 
+        /** 释放审批并关闭订单引擎及其审批服务。 */
         @Override
         public void close() {
             releaseApproval.countDown();

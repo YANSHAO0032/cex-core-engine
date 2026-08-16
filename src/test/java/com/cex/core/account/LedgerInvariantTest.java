@@ -16,8 +16,15 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 import org.junit.jupiter.api.Test;
 
+/**
+ * 验证账户账本在资金迁移、异常输入与并发场景下保持资产守恒。
+ *
+ * <p>线程安全：测试通过用户条带锁协调并发任务。</p>
+ * <p>限制：覆盖内存账本行为，不涉及外部持久化或跨进程并发。</p>
+ */
 class LedgerInvariantTest {
 
+    /** 场景：冻结、解冻和结算后，可用、冻结与系统资金之和保持不变。 */
     @Test
     void freezeUnfreezeAndSettlePreserveInvariant() {
         StripedLockManager lockManager = new StripedLockManager();
@@ -36,6 +43,7 @@ class LedgerInvariantTest {
         assertTrue(ledger.invariantHolds());
     }
 
+    /** 场景：冻结金额超过可用余额时应拒绝操作。 */
     @Test
     void freezeRejectsInsufficientAvailable() {
         StripedLockManager lockManager = new StripedLockManager();
@@ -48,6 +56,7 @@ class LedgerInvariantTest {
         assertEquals("available balance is insufficient", error.getMessage());
     }
 
+    /** 场景：账户没有冻结余额时解冻请求应被拒绝。 */
     @Test
     void unfreezeRejectsInsufficientFrozen() {
         StripedLockManager lockManager = new StripedLockManager();
@@ -60,6 +69,7 @@ class LedgerInvariantTest {
         assertEquals("frozen balance is insufficient", error.getMessage());
     }
 
+    /** 场景：账户没有冻结余额时结算请求应被拒绝。 */
     @Test
     void settleRejectsInsufficientFrozen() {
         StripedLockManager lockManager = new StripedLockManager();
@@ -72,6 +82,7 @@ class LedgerInvariantTest {
         assertEquals("frozen balance is insufficient", error.getMessage());
     }
 
+    /** 场景：冻结、解冻与结算均拒绝零或负数金额。 */
     @Test
     void lockedOperationsRejectZeroAndNegativeAmounts() {
         StripedLockManager lockManager = new StripedLockManager();
@@ -86,6 +97,7 @@ class LedgerInvariantTest {
                 () -> withUserLock(lockManager, 1L, () -> ledger.settleLocked(1L, 0L)));
     }
 
+    /** 场景：创建账户导致资产总额溢出时应抛出异常。 */
     @Test
     void checkedArithmeticRejectsOverflow() {
         StripedLockManager lockManager = new StripedLockManager();
@@ -94,6 +106,7 @@ class LedgerInvariantTest {
         assertThrows(ArithmeticException.class, () -> ledger.createAccount(1L, 0L, 2L));
     }
 
+    /** 场景：溢出创建不会发布账户或修改初始资产，随后合法创建仍可成功。 */
     @Test
     void createAccountOverflowLeavesNoPublishedAccountOrTotalMutation() {
         StripedLockManager lockManager = new StripedLockManager();
@@ -111,6 +124,11 @@ class LedgerInvariantTest {
         assertEquals(Long.MAX_VALUE, ledger.initialTotalAsset());
     }
 
+    /**
+     * 场景：不同用户的并发资金操作完成后，账本资产总额仍守恒。
+     *
+     * @throws Exception 并发任务提交、结果获取或执行器关闭失败时抛出
+     */
     @Test
     void concurrentOperationsOnDifferentUsersPreserveInvariant() throws Exception {
         StripedLockManager lockManager = new StripedLockManager();
@@ -140,6 +158,11 @@ class LedgerInvariantTest {
         assertTrue(ledger.invariantHolds());
     }
 
+    /**
+     * 场景：同一用户的并发冻结与解冻操作由条带锁串行化。
+     *
+     * @throws Exception 并发任务提交、结果获取或执行器关闭失败时抛出
+     */
     @Test
     void concurrentOperationsOnSameUserRemainSerializable() throws Exception {
         StripedLockManager lockManager = new StripedLockManager();
@@ -171,6 +194,16 @@ class LedgerInvariantTest {
         assertTrue(ledger.invariantHolds());
     }
 
+    /**
+     * 构造执行冻结、结算与解冻的单用户并发工作流。
+     *
+     * @param lockManager 用户条带锁管理器
+     * @param ledger 被操作的账本
+     * @param userId 用户标识
+     * @param freezeAmount 要冻结的资产数量
+     * @param settleAmount 要结算的资产数量
+     * @return 可提交给执行器的工作任务
+     */
     private static Callable<Void> userWorkflow(
             StripedLockManager lockManager,
             AccountLedger ledger,
@@ -185,6 +218,13 @@ class LedgerInvariantTest {
         };
     }
 
+    /**
+     * 在指定用户的条带锁保护下执行操作。
+     *
+     * @param lockManager 用户条带锁管理器
+     * @param userId 用户标识
+     * @param action 要执行的操作
+     */
     private static void withUserLock(StripedLockManager lockManager, long userId, ThrowingRunnable action) {
         ReentrantLock lock = lockManager.lockForUser(userId);
         lock.lock();
@@ -195,8 +235,15 @@ class LedgerInvariantTest {
         }
     }
 
+    /**
+     * 表示可抛出受检异常的无返回值测试操作。
+     *
+     * <p>线程安全：接口实现的线程安全性由具体测试操作决定。</p>
+     * <p>限制：仅用于本测试类的锁执行辅助方法。</p>
+     */
     @FunctionalInterface
     private interface ThrowingRunnable {
+        /** 执行测试操作。 */
         void run();
     }
 }
