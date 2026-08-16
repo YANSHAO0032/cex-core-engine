@@ -1,6 +1,6 @@
 # CEX Core Technical Assessment
 
-纯 Java 17 / JUC 的内存交易核心测评工程。重点是订单事实乱序、重复投递、高并发和故障注入下的资产正确性；不实现完整撮合订单簿、网络协议或持久化系统。
+纯 Java 21 / JUC 的内存交易核心测评工程。重点是订单事实乱序、重复投递、高并发和故障注入下的资产正确性；不实现完整撮合订单簿、网络协议或持久化系统。
 
 ## 1. Overview
 
@@ -71,34 +71,47 @@ Immutable Metadata
 | 1 | 0 | 1 | `CANCELED` |
 | 1 | 1 | 1 | External terminal conflict；禁止双副作用 |
 
-## 5. Complete State Flows
+## 5. Complete Out-of-Order State Transition
 
-### MATCH before CREATE
-
-```text
-MATCH_FILLED -> INIT + FILLED_SEEN (no funds)
-ORDER_CREATED -> freeze once -> settle once -> risk record once -> FILLED
-```
-
-### CANCEL before CREATE
+状态机不是按消息到达顺序直接覆盖 `status`，而是先登记 Fact Bits，再由 reconcile 根据完整事实集合和 Effect Bits 收敛。下面的 ASCII 图覆盖正常路径、两种乱序路径、审批路径、重复消息和终态冲突：
 
 ```text
-ORDER_CANCELLED -> INIT + CANCELLED_SEEN (no funds)
-ORDER_CREATED -> freeze once -> unfreeze once -> CANCELED
+  [INIT: no CREATE fact]
+       | ORDER_CREATED / freeze
+       v
+  [Risk Pipeline]
+       | PASS                              | HOLD / schedule approval
+       v                                   v
+     [NEW]                             [RISK_HOLD]
+       | MATCH_FILLED / settle             | APPROVAL_PASSED
+       | + risk record                     v
+       v                                  [NEW]
+    [FILLED]                                |
+       ^                                    | APPROVAL_REJECTED / unfreeze
+       | late duplicate                     v
+       |                                [CANCELED]
+       |
+       +-- late ORDER_CANCELLED: conflict metric, no unfreeze
+
+  Out-of-order facts (no funds until CREATE arrives):
+
+  [INIT]
+    | MATCH_FILLED / cache FILLED_SEEN
+    v
+  [INIT + FILLED_SEEN] --ORDER_CREATED / freeze + settle + risk record--> [FILLED]
+
+  [INIT]
+    | ORDER_CANCELLED / cache CANCELLED_SEEN
+    v
+  [INIT + CANCELLED_SEEN] --ORDER_CREATED / freeze + unfreeze--> [CANCELED]
+
+  [NEW] --ORDER_CANCELLED / unfreeze--> [CANCELED]
+  Any state --duplicate fact--> same state, reconcile again, no duplicate effect
+  [FILLED] + [CANCELED fact] --> [FILLED], conflict metric, no second terminal effect
+  [CANCELED] + [FILLED fact] --> [CANCELED], conflict metric, no second terminal effect
 ```
 
-### Normal and Risk
-
-```text
-INIT --CREATE/freeze--> Risk Pipeline --PASS--> NEW
-                                      \--HOLD--> RISK_HOLD
-NEW --MATCH_FILLED/settle--> FILLED
-NEW --ORDER_CANCELLED/unfreeze--> CANCELED
-RISK_HOLD --APPROVAL_PASSED--> NEW
-RISK_HOLD --APPROVAL_REJECTED/unfreeze--> CANCELED
-```
-
-成交事实已先于 CREATE 到达时，结算侧不再反向进入本地 Risk Hold；该事实代表外部撮合已确认成交。
+`MATCH_FILLED` 或 `ORDER_CANCELLED` 先到达时只登记事实，不冻结资金；`ORDER_CREATED` 到达后统一执行一次冻结，再根据已观察事实执行结算或解冻。若 FILLED 与 CANCELED 同时存在，当前实现保留先完成的合法终态副作用，第二个互斥副作用被 Effect Bits 阻止并计入冲突指标。成交事实已先于 CREATE 到达时，结算侧不再反向进入本地 Risk Hold；该事实代表外部撮合已确认成交。
 
 ## 6. Exactly-Once Asset Effects
 
@@ -110,9 +123,22 @@ RISK_HOLD --APPROVAL_REJECTED/unfreeze--> CANCELED
 4. `check effect + ledger mutation + effect commit` 位于同一 canonical user stripe。
 5. 只有 mutation 成功后 `applyEffectLocked` 才提交 bit。
 
-## 7. Concurrency and Interrupt Model
+## 7. Concurrency, Data Structures and Interrupt Model
 
-Fact bit 是单变量 `0 -> 1`，使用 CAS；`available -= amount` 与 `frozen += amount` 是复合资金事务，使用 user-level `ReentrantLock`。不同 stripe 的用户可以并行，同一用户严格串行。
+### 极端乱序下的一致性
+
+- `OrderContext.factBits` 是 `AtomicInteger`，每个事实只允许通过 CAS 从 `0` 变为 `1`；乱序消息只补齐事实集合，不会把状态回退或伪造中间状态。
+- Fact Bits 与 Effect Bits 分离。`FREEZE_APPLIED`、`SETTLE_APPLIED`、`UNFREEZE_APPLIED`、`RISK_RECORDED` 和 `APPROVAL_SCHEDULED` 分别记录副作用是否已经完成；重复消息即使重新进入 reconcile，也不会重复扣款、解冻或记录成交。
+- 事实登记是无锁的；事实登记之后一定进入 reconcile，避免“重复事件直接 return”导致上一线程只登记事实、尚未完成副作用时没有补偿机会。
+- `ConcurrentHashMap<Long, OrderContext>` 保存订单上下文，`ConcurrentHashMap<Long, TradeWindow>` 保存每个用户唯一的窗口对象；订单元数据首次建立后保持不可变，后续事件元数据不一致会拒绝。
+
+### 低锁方案与锁顺序
+
+- `StripedLockManager` 预创建 256 个 `ReentrantLock`，通过 userId 的 hash 映射到 canonical stripe。相同用户严格串行，不同 stripe 可并行；不为每个事件创建锁，也没有全局订单锁。
+- `OrderContext` 的状态、Effect Bits、账户 `available/frozen`、用户 TradeWindow 的 `head/size/rollingSum` 都在同一个 user stripe 内更新。冻结的“available 减少 + frozen 增加”、结算的“frozen 减少 + systemSettled 增加”和解冻均为一个不可拆分的业务临界区。
+- `Effect check -> ledger mutation -> Effect commit` 在同一 stripe 中完成；只有 mutation 成功才提交 Effect Bit。结算还会先用 CAS 预留 `systemSettledAmount`，避免溢出或余额错误造成部分更新。
+- 账户表与 system total 只在建户的 user stripe 及 ledger monitor 下更新；`InvariantChecker` 按 stripe `0 -> N-1` 顺序全量加锁，读取一致快照后逆序释放，避免多锁反向获取造成死锁。普通交易路径不获取全量锁。
+- Approval worker 使用固定线程数和 `ArrayBlockingQueue`；审批只生成 `APPROVAL_PASSED` / `APPROVAL_REJECTED` 事件，在释放 user stripe 后重新进入 `OrderEngine.process`，不在异步线程直接改领域状态。
 
 核心资金临界区使用 `lock.lock()`，不使用 `lockInterruptibly()`；Java interrupt 只是协作式信号，不具备资金 rollback 语义。临界区内没有 IO、sleep、park 或 Approval callback。收到中断的 worker 仍完成已经接受的事件。
 
@@ -140,13 +166,17 @@ Approval 由固定 worker 数和 `ArrayBlockingQueue` 组成，使用 `CallerRun
 - `awaitTermination` 超时和 `ThreadMXBean.findDeadlockedThreads()` 同时检查。
 - 最终断言 `invariantFailures == 0`、`deadlockedThreads == null`、`stateTransitions >= 500000`。
 
-## 11. Memory / GC
+## 11. Memory / GC Optimization under `-Xmx256m`
 
-- 金额、ID、时间和状态位使用 primitive 字段/bit mask。
-- 不使用 `BigDecimal`、event history、500k boxed latency 数组或 500k pending tasks。
-- Risk window 使用 primitive arrays；Approval queue 有界；latency 使用固定 buckets。
-- Maven Surefire 设置 `-Xms128m -Xmx256m -XX:+UseG1GC`。
-- `GcMetrics` 输出 collector count/time；不会无证据宣称 zero allocation 或 Full GC 为零。
+内存上限按 Maven Surefire 的 `-Xms128m -Xmx256m -XX:+UseG1GC` 执行。设计目标不是“零分配”，而是在 500k 级别事件、16 个 worker 和审批队列存在时保持对象数量有界、避免历史数据线性增长：
+
+- 金额、ID、时间和状态位使用 primitive `long` / `int` / bit mask；热路径不使用 `BigDecimal`、反射、序列化或 boxed latency 样本。
+- `TradeWindow` 使用固定容量的 primitive `long[]` 时间戳/金额环形数组，成交记录复用环槽；过期记录从 head 淘汰，`rollingSum` 增量维护，不保留完整事件历史。
+- `LatencyHistogram` 使用固定 bucket 计数，复用计数数组；`GcMetrics` 只保存计数器和本次测试的汇总值，不保存每次 GC 或每次延迟对象。
+- 256 个 canonical `ReentrantLock`、每用户 `TradeWindow`、volatile copy-on-write 的规则数组在生命周期内复用；规则读取不创建临时集合。Approval 使用有界 `ArrayBlockingQueue`，队列满时 `CallerRunsPolicy` 让提交线程承担任务，防止 pending task 无界堆积。
+- 订单上下文只保留当前事实位、效果位和少量元数据，不保留事件列表；测试使用 16 个长生命周期 worker，而不是为 500k 个事件创建 500k 个待执行 Runnable。
+- 不引入全局事件对象池：池化会延长对象引用存活、增加并发归还复杂度；本实现优先复用固定数组、锁、窗口和统计结构，并让短生命周期事件在 G1 下自然回收。
+- G1 在 Java 21 下负责小堆下的分区回收；`GcMetrics` 输出 collector count/time，测试报告实际 heap、GC 和 Full GC 数据，不无证据宣称 zero allocation 或 Full GC 为零。
 
 ## 12. Assumptions / Trade-offs
 
@@ -172,19 +202,19 @@ Approval 由固定 worker 数和 `ArrayBlockingQueue` 组成，使用 `CallerRun
 
 ## 14. Measured Performance Result
 
-以下为一次 `mvn clean test` 在本机 JDK 17、Surefire `-Xmx256m` 下的真实输出：
+以下为一次 `mvn clean test` 在本机 JDK 21、Surefire `-Xmx256m` 下的真实输出：
 
 ```text
 Measurement Operations: 500000
 Threads:                16
-TPS:                    9530453.61
-Average latency:        1.06 us
+TPS:                    8470613.75
+Average latency:        1.31 us
 P50:                    10.0 us
 P95:                    10.0 us
 P99:                    25.0 us
-MAX:                    846.4 us
+MAX:                    712.9 us
 Heap Max:               256 MB
-Heap Used:              199 MB
+Heap Used:              44 MB
 GC Count:               1
 GC Time:                1 ms
 Old/Full GC Count:      0
@@ -195,15 +225,15 @@ Old/Full GC Time:       0 ms
 
 ## 15. Build and Acceptance
 
-当前机器默认 Maven 指向 JDK 11，因此使用 JDK 17 执行：
+当前机器默认 Maven 可能仍指向旧 JDK，因此使用本机已安装的 JDK 21 执行：
 
 ```powershell
-$env:JAVA_HOME='C:/Users/10703/.jdks/ms-17.0.19'
-$env:Path='C:/Users/10703/.jdks/ms-17.0.19/bin;' + $env:Path
+$env:JAVA_HOME='C:/Users/10703/.jdks/ms-21.0.12'
+$env:Path='C:/Users/10703/.jdks/ms-21.0.12/bin;' + $env:Path
 mvn clean test
 ```
 
-最近一次完整验收：`Tests run: 37, Failures: 0, Errors: 0, Skipped: 0`。
+最近一次完整验收：`Tests run: 38, Failures: 0, Errors: 0, Skipped: 0`。
 
 ## 16. Interview Notes
 
