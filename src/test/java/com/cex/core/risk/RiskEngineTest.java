@@ -12,7 +12,16 @@ import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+/**
+ * 风控阈值、规则快照替换与成交时间窗口的单元测试。
+ * 核心能力：验证 10 秒窗口过期、copy-on-write 规则更新及短路行为；线程安全：使用闭锁协调异步审批；使用限制：仅验证内存实现的确定性行为。
+ */
 class RiskEngineTest {
+    /**
+     * 场景：已结算金额超过阈值触发审批，并可通过推进时钟跨越 10 秒窗口而过期。
+     *
+     * @throws Exception 审批线程同步、结果等待或引擎关闭失败时抛出
+     */
     @Test
     void thresholdUsesSettledAmountAndExpiresWithoutSleeping() throws Exception {
         CountDownLatch approvalEntered = new CountDownLatch(1);
@@ -52,6 +61,7 @@ class RiskEngineTest {
         }
     }
 
+    /** 场景：规则管道在 HOLD 时短路，且替换与移除 copy-on-write 快照后立即生效。 */
     @Test
     void pipelineShortCircuitsAndSupportsCopyOnWriteReplacement() {
         AtomicInteger second = new AtomicInteger();
@@ -68,6 +78,7 @@ class RiskEngineTest {
         assertEquals(RiskDecision.PASS, pipeline.evaluate(context));
     }
 
+    /** 场景：成交窗口仅保留 10 秒范围内的记录并准确淘汰过期金额。 */
     @Test
     void tradeWindowEvictsExpiredEntries() {
         TradeWindow window = new TradeWindow(10_000L);
@@ -77,6 +88,14 @@ class RiskEngineTest {
         assertEquals(50L, window.currentSum(10_101L));
     }
 
+    /**
+     * 创建测试用订单事件。
+     *
+     * @param orderId 订单标识
+     * @param amount 订单金额
+     * @param type 订单事件类型
+     * @return 固定用户和时间的测试订单事件
+     */
     private static OrderEvent event(long orderId, long amount, OrderEventType type) {
         return new OrderEvent(orderId, 1L, amount, 100L, type);
     }
