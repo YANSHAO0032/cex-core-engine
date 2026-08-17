@@ -36,6 +36,8 @@ public final class TradeExecutionStore {
     private final AtomicInteger pendingRecords = new AtomicInteger();
     /** 已预留或已发布的总记录数。 */
     private final AtomicInteger totalRecords = new AtomicInteger();
+    /** 仅供同包测试在发布窗口注入失败的钩子。 */
+    private final PublicationFailureInjector publicationFailureInjector;
 
     /**
      * 使用引擎默认容量创建成交存储。
@@ -52,11 +54,25 @@ public final class TradeExecutionStore {
      * @throws IllegalArgumentException 当容量不为正或挂起容量大于总容量时抛出
      */
     public TradeExecutionStore(int maxPendingRecords, int maxTotalRecords) {
+        this(maxPendingRecords, maxTotalRecords, stage -> { });
+    }
+
+    /**
+     * 使用固定容量和同包测试发布故障注入器创建成交存储。
+     *
+     * @param maxPendingRecords 最大挂起成交记录数，必须为正且不大于总容量
+     * @param maxTotalRecords 最大总成交记录数，必须为正
+     * @param publicationFailureInjector 仅测试使用的发布阶段回调，不能为空
+     */
+    TradeExecutionStore(int maxPendingRecords, int maxTotalRecords,
+                        PublicationFailureInjector publicationFailureInjector) {
         if (maxPendingRecords <= 0 || maxTotalRecords <= 0 || maxPendingRecords > maxTotalRecords) {
             throw new IllegalArgumentException("pending and total capacities must be positive and pending <= total");
         }
         this.maxPendingRecords = maxPendingRecords;
         this.maxTotalRecords = maxTotalRecords;
+        this.publicationFailureInjector = Objects.requireNonNull(
+                publicationFailureInjector, "publicationFailureInjector");
     }
 
     /**
@@ -185,36 +201,38 @@ public final class TradeExecutionStore {
         if (!tryReserve(totalRecords, maxTotalRecords)) {
             throw capacityExceeded("total trade record capacity exceeded");
         }
-        boolean totalReserved = true;
         boolean pendingReserved = false;
         boolean published = false;
+        boolean stagedIndexes = false;
         try {
             if (!tryReserve(pendingRecords, maxPendingRecords)) {
                 throw capacityExceeded("pending trade record capacity exceeded");
             }
             pendingReserved = true;
+            injectFailure(PublicationStage.AFTER_RESERVATIONS);
 
             TradeExecutionRecord candidate = new TradeExecutionRecord(registration.execution);
-            TradeExecutionRecord existing;
-            synchronized (candidate) {
-                existing = records.putIfAbsent(tradeId, candidate);
-                if (existing == null) {
-                    addPendingIndexes(candidate);
-                    published = true;
-                }
-            }
-            if (published) {
+            stagedIndexes = true;
+            addPendingIndexes(candidate);
+            injectFailure(PublicationStage.BEFORE_RECORD_PUBLICATION);
+
+            TradeExecutionRecord existing = records.putIfAbsent(tradeId, candidate);
+            if (existing == null) {
+                published = true;
                 return candidate;
             }
+            // 该分支的既有记录已完成索引发布；集合按 tradeId 去重，绝不能移除其索引。
+            stagedIndexes = false;
             return sameOrConflict(existing, registration.execution);
         } finally {
             if (!published) {
+                if (stagedIndexes) {
+                    removePendingIndexes(registration.execution);
+                }
                 if (pendingReserved) {
                     pendingRecords.decrementAndGet();
                 }
-                if (totalReserved) {
-                    totalRecords.decrementAndGet();
-                }
+                totalRecords.decrementAndGet();
             }
         }
     }
@@ -253,7 +271,9 @@ public final class TradeExecutionStore {
     private void addPendingIndexes(TradeExecutionRecord record) {
         long tradeId = record.execution().tradeId();
         addPendingIndex(record.execution().buyOrderId(), tradeId);
+        injectFailure(PublicationStage.AFTER_BUY_INDEX);
         addPendingIndex(record.execution().sellOrderId(), tradeId);
+        injectFailure(PublicationStage.AFTER_SELL_INDEX);
     }
 
     /**
@@ -276,9 +296,18 @@ public final class TradeExecutionStore {
      * @param record 已进入终态的成交记录
      */
     private void removePendingIndexes(TradeExecutionRecord record) {
-        long tradeId = record.execution().tradeId();
-        removePendingIndex(record.execution().buyOrderId(), tradeId);
-        removePendingIndex(record.execution().sellOrderId(), tradeId);
+        removePendingIndexes(record.execution());
+    }
+
+    /**
+     * 从双方订单索引删除指定成交的标识。
+     *
+     * @param execution 被删除的权威成交载荷
+     */
+    private void removePendingIndexes(TradeExecution execution) {
+        long tradeId = execution.tradeId();
+        removePendingIndex(execution.buyOrderId(), tradeId);
+        removePendingIndex(execution.sellOrderId(), tradeId);
     }
 
     /**
@@ -356,6 +385,38 @@ public final class TradeExecutionStore {
      */
     private static PendingCapacityExceededException capacityExceeded(String message) {
         return new PendingCapacityExceededException(message);
+    }
+
+    /**
+     * 在仅测试使用的发布阶段调用故障注入器。
+     *
+     * @param stage 当前发布阶段
+     */
+    private void injectFailure(PublicationStage stage) {
+        publicationFailureInjector.before(stage);
+    }
+
+    /** 同包测试可注入故障的记录发布阶段。 */
+    enum PublicationStage {
+        /** 双容量已经预留但尚未写入任何订单索引。 */
+        AFTER_RESERVATIONS,
+        /** 买方订单索引已经写入。 */
+        AFTER_BUY_INDEX,
+        /** 卖方订单索引已经写入。 */
+        AFTER_SELL_INDEX,
+        /** 两个订单索引已经完整暂存，记录映射尚未发布。 */
+        BEFORE_RECORD_PUBLICATION
+    }
+
+    /** 仅供同包测试在记录发布阶段注入失败的最小回调。 */
+    @FunctionalInterface
+    interface PublicationFailureInjector {
+        /**
+         * 处理当前发布阶段，测试可通过抛出运行时异常模拟失败。
+         *
+         * @param stage 当前发布阶段
+         */
+        void before(PublicationStage stage);
     }
 
     /**

@@ -2,6 +2,7 @@ package com.cex.core.trade;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -19,6 +20,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -147,13 +150,129 @@ class TradeExecutionStoreTest {
             }
 
             start.countDown();
-            TradeExecutionRecord original = futures.getFirst().get();
+            TradeExecutionRecord original = getWithin(futures.getFirst());
             for (Future<TradeExecutionRecord> future : futures) {
-                assertSame(original, future.get());
+                assertSame(original, getWithin(future));
             }
             assertEquals(1, store.pendingCount());
             assertEquals(1, store.totalCount());
         } finally {
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5L, TimeUnit.SECONDS));
+        }
+    }
+
+    /** 场景：并发结算与拒绝只允许一个终态获胜，等待任务必须在限定时间内结束。 */
+    @Test
+    void concurrentTerminalTransitionsChooseOneStateAndReleasePendingOnce() throws Exception {
+        TradeExecutionStore store = new TradeExecutionStore(1, 1);
+        TradeExecutionRecord record = store.register(execution(1L, 10L, 20L));
+        CountDownLatch start = new CountDownLatch(1);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> settled = executor.submit(() -> {
+                await(start);
+                store.markSettled(1L, 100L);
+            });
+            Future<?> rejected = executor.submit(() -> {
+                await(start);
+                store.markRejected(1L, "rejected concurrently", 101L);
+            });
+
+            start.countDown();
+            getWithin(settled);
+            getWithin(rejected);
+
+            assertTrue(record.state() == TradeExecutionState.SETTLED
+                    || record.state() == TradeExecutionState.REJECTED);
+            assertEquals(0, store.pendingCount());
+            assertEquals(1, store.totalCount());
+            assertTrue(store.pendingTradeIds(10L).isEmpty());
+            assertTrue(store.pendingTradeIds(20L).isEmpty());
+        } finally {
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5L, TimeUnit.SECONDS));
+        }
+    }
+
+    /** 场景：挂起、已结算和已拒绝记录都将精确重复绑定到同一权威实例和状态。 */
+    @Test
+    void duplicatesPreserveOriginalRecordAndStateAcrossAllLifecycleStates() {
+        TradeExecution pending = execution(1L, 10L, 20L);
+        TradeExecution settled = execution(2L, 11L, 21L);
+        TradeExecution rejected = execution(3L, 12L, 22L);
+        TradeExecutionStore store = new TradeExecutionStore(3, 3);
+        TradeExecutionRecord pendingRecord = store.register(pending);
+        TradeExecutionRecord settledRecord = store.register(settled);
+        TradeExecutionRecord rejectedRecord = store.register(rejected);
+        store.markSettled(2L, 100L);
+        store.markRejected(3L, "deterministic rejection", 101L);
+
+        assertSame(pendingRecord, store.register(pending));
+        assertEquals(TradeExecutionState.PENDING, pendingRecord.state());
+        assertSame(settledRecord, store.register(settled));
+        assertEquals(TradeExecutionState.SETTLED, settledRecord.state());
+        assertSame(rejectedRecord, store.register(rejected));
+        assertEquals(TradeExecutionState.REJECTED, rejectedRecord.state());
+        assertEquals("deterministic rejection", rejectedRecord.rejectionReason());
+    }
+
+    /** 场景：每个发布阶段发生故障都不得可见记录、残留索引或泄漏容量，并可随后重试。 */
+    @Test
+    void publicationFailuresRollBackEveryStageBeforeMakingRecordVisible() {
+        for (TradeExecutionStore.PublicationStage failedStage
+                : TradeExecutionStore.PublicationStage.values()) {
+            AtomicBoolean failOnce = new AtomicBoolean(true);
+            TradeExecutionStore store = new TradeExecutionStore(1, 1, stage -> {
+                if (stage == failedStage && failOnce.compareAndSet(true, false)) {
+                    throw new InjectedPublicationFailure(stage);
+                }
+            });
+            TradeExecution execution = execution(1L, 10L, 20L);
+
+            assertThrows(InjectedPublicationFailure.class, () -> store.register(execution));
+            assertPublicationRolledBack(store, execution);
+
+            TradeExecutionRecord recovered = store.register(execution);
+            assertSame(recovered, store.record(1L));
+            assertEquals(List.of(1L), store.pendingTradeIds(10L));
+            assertEquals(List.of(1L), store.pendingTradeIds(20L));
+        }
+    }
+
+    /** 场景：首个登记者发布失败后，同载荷等待者释放登记槽、在限定时间内重试并成功。 */
+    @Test
+    void ownerPublicationFailureReleasesInFlightSlotForWaitingDuplicateRetry() throws Exception {
+        CountDownLatch ownerAtFailurePoint = new CountDownLatch(1);
+        CountDownLatch allowOwnerFailure = new CountDownLatch(1);
+        AtomicBoolean failOnce = new AtomicBoolean(true);
+        TradeExecutionStore store = new TradeExecutionStore(1, 1, stage -> {
+            if (stage == TradeExecutionStore.PublicationStage.AFTER_RESERVATIONS
+                    && failOnce.compareAndSet(true, false)) {
+                ownerAtFailurePoint.countDown();
+                await(allowOwnerFailure);
+                throw new InjectedPublicationFailure(stage);
+            }
+        });
+        TradeExecution execution = execution(1L, 10L, 20L);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<TradeExecutionRecord> owner = executor.submit(() -> store.register(execution));
+            assertTrue(ownerAtFailurePoint.await(5L, TimeUnit.SECONDS));
+            Future<TradeExecutionRecord> duplicate = executor.submit(() -> store.register(execution));
+
+            allowOwnerFailure.countDown();
+            ExecutionException ownerFailure = assertThrows(ExecutionException.class, () -> getWithin(owner));
+            assertTrue(ownerFailure.getCause() instanceof InjectedPublicationFailure);
+            TradeExecutionRecord recovered = getWithin(duplicate);
+
+            assertSame(recovered, store.record(1L));
+            assertEquals(1, store.pendingCount());
+            assertEquals(1, store.totalCount());
+            assertEquals(List.of(1L), store.pendingTradeIds(10L));
+            assertEquals(List.of(1L), store.pendingTradeIds(20L));
+        } finally {
+            allowOwnerFailure.countDown();
             executor.shutdownNow();
             assertTrue(executor.awaitTermination(5L, TimeUnit.SECONDS));
         }
@@ -168,14 +287,76 @@ class TradeExecutionStoreTest {
      * @throws ExecutionException 当任务抛出未预期异常时抛出
      */
     private static int completedTrueCount(Collection<Future<Boolean>> futures)
-            throws InterruptedException, ExecutionException {
+            throws InterruptedException, ExecutionException, TimeoutException {
         int accepted = 0;
         for (Future<Boolean> future : futures) {
-            if (future.get()) {
+            if (getWithin(future)) {
                 accepted++;
             }
         }
         return accepted;
+    }
+
+    /**
+     * 在限定时间内获取并发任务结果。
+     *
+     * @param future 待完成的任务
+     * @param <T> 任务结果类型
+     * @return 任务结果
+     * @throws InterruptedException 当当前线程被中断时抛出
+     * @throws ExecutionException 当任务抛出未预期异常时抛出
+     * @throws TimeoutException 当任务未在限定时间内完成时抛出
+     */
+    private static <T> T getWithin(Future<T> future)
+            throws InterruptedException, ExecutionException, TimeoutException {
+        return future.get(5L, TimeUnit.SECONDS);
+    }
+
+    /**
+     * 等待测试同步信号，并将中断转换为失败以保留线程中断状态。
+     *
+     * @param latch 待等待的同步信号
+     */
+    private static void await(CountDownLatch latch) {
+        try {
+            if (!latch.await(5L, TimeUnit.SECONDS)) {
+                throw new AssertionError("timed out waiting for test synchronization");
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("interrupted while waiting for test synchronization", interrupted);
+        }
+    }
+
+    /**
+     * 断言一次失败发布没有遗留任何可观察存储状态。
+     *
+     * @param store 被检查的成交存储
+     * @param execution 被拒绝发布的成交
+     */
+    private static void assertPublicationRolledBack(TradeExecutionStore store, TradeExecution execution) {
+        assertNull(store.record(execution.tradeId()));
+        assertTrue(store.pendingTradeIds(execution.buyOrderId()).isEmpty());
+        assertTrue(store.pendingTradeIds(execution.sellOrderId()).isEmpty());
+        assertEquals(0, store.pendingCount());
+        assertEquals(0, store.totalCount());
+    }
+
+    /**
+     * 测试专用的可控发布失败。
+     *
+     * <p>线程安全：异常本身不可变，可由任意登记线程抛出。</p>
+     * <p>使用限制：只用于验证包可见发布故障注入点。</p>
+     */
+    private static final class InjectedPublicationFailure extends RuntimeException {
+        /**
+         * 以发生失败的发布阶段创建异常。
+         *
+         * @param stage 触发失败的阶段
+         */
+        private InjectedPublicationFailure(TradeExecutionStore.PublicationStage stage) {
+            super("injected publication failure at " + stage);
+        }
     }
 
     /**
