@@ -1,5 +1,6 @@
 package com.cex.core.order;
 
+import com.cex.core.risk.RiskDecision;
 import java.util.Collections;
 import java.util.NavigableMap;
 import java.util.Objects;
@@ -23,6 +24,7 @@ public final class OrderContext {
 
     private final long orderId;
     private final long userId;
+    private final OrderSubmission originalSubmission;
     private final OrderSide side;
     private final TradingPair pair;
     private final long originalBaseQuantity;
@@ -51,6 +53,7 @@ public final class OrderContext {
     private OrderContext(OrderSubmission submission) {
         this.orderId = submission.orderId();
         this.userId = submission.userId();
+        this.originalSubmission = submission;
         this.side = submission.side();
         this.pair = submission.pair();
         this.originalBaseQuantity = submission.baseQuantity();
@@ -74,6 +77,7 @@ public final class OrderContext {
     private OrderContext(long orderId, long userId, long amount) {
         this.orderId = orderId;
         this.userId = userId;
+        this.originalSubmission = null;
         this.side = OrderSide.BUY;
         this.pair = LEGACY_PAIR;
         this.originalBaseQuantity = amount;
@@ -178,6 +182,54 @@ public final class OrderContext {
 
     /** @return 当前可见订单状态 */
     public OrderStatus status() { return status; }
+
+    /**
+     * 校验候选强类型提交与创建本上下文的原始载荷完全一致。
+     *
+     * @param submission 候选订单提交，不能为空
+     * @throws NullPointerException 当提交为 {@code null} 时抛出
+     * @throws OrderMetadataMismatchException 当上下文来自旧版事件或任一提交组件不一致时抛出
+     * @note 比较使用不可变原始提交，不依赖会随成交推进的剩余量、状态或最后序号。
+     */
+    void validateSubmission(OrderSubmission submission) {
+        Objects.requireNonNull(submission, "submission");
+        if (originalSubmission == null || !originalSubmission.equals(submission)) {
+            throw new OrderMetadataMismatchException(
+                    "order submission metadata mismatch for orderId=" + orderId);
+        }
+    }
+
+    /**
+     * 在首次发布前应用创建阶段的最小风控分类。
+     *
+     * @param riskDecision 创建阶段风控结论，不能为空
+     * @throws NullPointerException 当风控结论为 {@code null} 时抛出
+     * @throws IllegalStateException 当上下文不是尚未发布的强类型新单时抛出
+     * @note 调用方必须持有用户锁；本方法只在资金冻结成功后、订单发布前写入 {@code NEW/RISK_HOLD}。
+     */
+    void classifyInitialRiskLocked(RiskDecision riskDecision) {
+        Objects.requireNonNull(riskDecision, "riskDecision");
+        if (originalSubmission == null || status != OrderStatus.NEW) {
+            throw new IllegalStateException("initial risk classification requires a typed NEW order");
+        }
+        status = riskDecision == RiskDecision.HOLD
+                ? OrderStatus.RISK_HOLD
+                : OrderStatus.NEW;
+    }
+
+    /**
+     * 将已通过审批的强类型暂挂订单恢复为新单。
+     *
+     * @return 本次发生 {@code RISK_HOLD -> NEW} 迁移时为 {@code true}
+     * @note 调用方必须持有用户锁；拒绝审批的撤单请求生成由后续风险集成任务负责。
+     */
+    boolean approveRiskHoldLocked() {
+        if (originalSubmission != null && status == OrderStatus.RISK_HOLD) {
+            status = OrderStatus.NEW;
+            return true;
+        }
+        return false;
+    }
 
     /**
      * 在迁移期旧版引擎的用户锁内更新兼容状态。
