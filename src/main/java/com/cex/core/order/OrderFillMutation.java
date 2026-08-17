@@ -51,6 +51,13 @@ public final class OrderFillMutation {
     long remainingReservedAmount() { return remainingReservedAmount; }
 
     /**
+     * 判断本次变更提交后订单是否已经完全成交。
+     *
+     * @return 提交后剩余基础资产数量为零时为 {@code true}
+     */
+    public boolean complete() { return remainingBaseQuantity == 0L; }
+
+    /**
      * 返回完全成交买单尚未花费且应随成交原子释放的报价资产。
      *
      * @return 非负的买方报价资产释放额；非最终买单或卖单为零

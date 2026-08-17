@@ -85,47 +85,83 @@ public final class OrderEngineMetrics {
         tradeRejectedCount.increment();
     }
 
-    /** @return 部分成交次数 */
+    /**
+     * 获取部分成交次数。
+     *
+     * @return 部分成交次数
+     */
     public long partialFillCount() {
         return partialFillCount.sum();
     }
 
-    /** @return 成功双边结算次数 */
+    /**
+     * 获取成功双边结算次数。
+     *
+     * @return 成功双边结算次数
+     */
     public long settledTradeCount() {
         return settledTradeCount.sum();
     }
 
-    /** @return 精确重复成交投递次数 */
+    /**
+     * 获取精确重复成交投递次数。
+     *
+     * @return 精确重复成交投递次数
+     */
     public long duplicateTradeCount() {
         return duplicateTradeCount.sum();
     }
 
-    /** @return 当前挂起成交记录数 */
+    /**
+     * 获取当前挂起成交记录数。
+     *
+     * @return 当前挂起成交记录数
+     */
     public int pendingTradeCount() {
         return pendingTradeCount.get();
     }
 
-    /** @return 成交元数据冲突次数 */
+    /**
+     * 获取成交元数据冲突次数。
+     *
+     * @return 成交元数据冲突次数
+     */
     public long tradeMetadataConflictCount() {
         return tradeMetadataConflictCount.sum();
     }
 
-    /** @return 权威序号空洞次数 */
+    /**
+     * 获取权威序号空洞次数。
+     *
+     * @return 权威序号空洞次数
+     */
     public long sequenceGapCount() {
         return sequenceGapCount.sum();
     }
 
-    /** @return 首次等待撤单确认次数 */
+    /**
+     * 获取首次等待撤单确认次数。
+     *
+     * @return 首次等待撤单确认次数
+     */
     public long pendingCancelCount() {
         return pendingCancelCount.sum();
     }
 
-    /** @return 过期撤单确认次数 */
+    /**
+     * 获取过期撤单确认次数。
+     *
+     * @return 过期撤单确认次数
+     */
     public long staleCancelConfirmationCount() {
         return staleCancelConfirmationCount.sum();
     }
 
-    /** @return 确定拒绝成交次数 */
+    /**
+     * 获取确定拒绝成交次数。
+     *
+     * @return 确定拒绝成交次数
+     */
     public long tradeRejectedCount() {
         return tradeRejectedCount.sum();
     }

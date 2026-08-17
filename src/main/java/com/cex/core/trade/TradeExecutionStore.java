@@ -85,12 +85,26 @@ public final class TradeExecutionStore {
      * @note 先检查已发布记录；并发同 ID 调用由独立登记槽协调，保证精确重复即使容量已满也返回原记录，竞争失败的容量预留会回滚。
      */
     public TradeExecutionRecord register(TradeExecution execution) {
+        return registerWithOutcome(execution).record();
+    }
+
+    /**
+     * 登记成交并在线性化结果中返回当前调用是否为精确重复。
+     *
+     * @param execution 待登记的权威成交，不能为空
+     * @return 同时包含权威记录与本次调用重复标志的不可变结果
+     * @throws TradeMetadataMismatchException 当相同成交标识载荷不同
+     * @throws PendingCapacityExceededException 当新成交标识超过挂起或总记录容量
+     * @note 并发同 ID 调用共享登记槽；只有最终成功发布记录的调用返回非重复，等待后命中已发布记录的调用均返回重复。
+     */
+    public TradeRegistrationOutcome registerWithOutcome(TradeExecution execution) {
         Objects.requireNonNull(execution, "execution");
         long tradeId = execution.tradeId();
         for (;;) {
             TradeExecutionRecord existing = records.get(tradeId);
             if (existing != null) {
-                return sameOrConflict(existing, execution);
+                return new TradeRegistrationOutcome(
+                        sameOrConflict(existing, execution), true);
             }
 
             Registration candidate = new Registration(execution);
@@ -194,9 +208,9 @@ public final class TradeExecutionStore {
      * 由当前线程完成其独占登记槽的容量预留和发布。
      *
      * @param registration 当前成交标识的独占登记槽
-     * @return 新建记录或极端竞争下已有的精确重复记录
+     * @return 新建记录或极端竞争下已有精确重复记录的注册结果
      */
-    private TradeExecutionRecord registerOwned(Registration registration) {
+    private TradeRegistrationOutcome registerOwned(Registration registration) {
         long tradeId = registration.execution.tradeId();
         if (!tryReserve(totalRecords, maxTotalRecords)) {
             throw capacityExceeded("total trade record capacity exceeded");
@@ -219,11 +233,12 @@ public final class TradeExecutionStore {
             TradeExecutionRecord existing = records.putIfAbsent(tradeId, candidate);
             if (existing == null) {
                 published = true;
-                return candidate;
+                return new TradeRegistrationOutcome(candidate, false);
             }
             // 该分支的既有记录已完成索引发布；集合按 tradeId 去重，绝不能移除其索引。
             stagedIndexes = false;
-            return sameOrConflict(existing, registration.execution);
+            return new TradeRegistrationOutcome(
+                    sameOrConflict(existing, registration.execution), true);
         } finally {
             if (!published) {
                 if (stagedIndexes) {

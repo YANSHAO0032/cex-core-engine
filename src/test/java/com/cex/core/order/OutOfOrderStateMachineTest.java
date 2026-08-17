@@ -11,7 +11,13 @@ import com.cex.core.account.BalanceSnapshot;
 import com.cex.core.concurrent.StripedLockManager;
 import com.cex.core.trade.TradeExecutionState;
 import com.cex.core.trade.TradeResult;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -95,6 +101,97 @@ class OutOfOrderStateMachineTest {
             assertTrue(fixture.engine.metrics().duplicateTradeCount() >= 19L);
             assertEquals(0, fixture.engine.metrics().pendingTradeCount());
             assertTrue(fixture.ledger.allAssetInvariantsHold());
+        }
+    }
+
+    /** 场景：32 个线程首次并发提交同一成交时，业务结果与重复指标都必须精确收敛为 1+31。 */
+    @Test
+    void concurrentFirstTradeCountsEveryDuplicateExactlyOnce() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            fixture.submitBoth();
+            TradeExecution execution = fixture.fullExecution(1L, 2L, 2L);
+            CountDownLatch start = new CountDownLatch(1);
+            ExecutorService executor = Executors.newFixedThreadPool(32);
+            try {
+                List<Future<TradeResult>> futures = new ArrayList<>();
+                for (int index = 0; index < 32; index++) {
+                    futures.add(executor.submit(() -> {
+                        start.await();
+                        return fixture.engine.onTrade(execution);
+                    }));
+                }
+
+                start.countDown();
+                int settled = 0;
+                int duplicates = 0;
+                for (Future<TradeResult> future : futures) {
+                    TradeResult result = future.get(5L, TimeUnit.SECONDS);
+                    if (result == TradeResult.SETTLED) {
+                        settled++;
+                    } else if (result == TradeResult.DUPLICATE) {
+                        duplicates++;
+                    }
+                }
+
+                assertEquals(1, settled);
+                assertEquals(31, duplicates);
+                assertEquals(1L, fixture.engine.metrics().settledTradeCount());
+                assertEquals(31L, fixture.engine.metrics().duplicateTradeCount());
+                assertTrue(fixture.ledger.allAssetInvariantsHold());
+            } finally {
+                start.countDown();
+                executor.shutdownNow();
+                assertTrue(executor.awaitTermination(5L, TimeUnit.SECONDS));
+            }
+        }
+    }
+
+    /** 场景：同一未来序号成交的顺序重放不得重复累计序号空洞。 */
+    @Test
+    void sequentialDuplicateGapCountsSequenceGapOnce() {
+        try (Fixture fixture = new Fixture()) {
+            fixture.submitBoth();
+            TradeExecution execution = fixture.fullExecution(1L, 3L, 3L);
+
+            assertEquals(TradeResult.PENDING, fixture.engine.onTrade(execution));
+            assertEquals(TradeResult.PENDING, fixture.engine.onTrade(execution));
+
+            assertEquals(1L, fixture.engine.metrics().sequenceGapCount());
+            assertEquals(1L, fixture.engine.metrics().duplicateTradeCount());
+            assertEquals(1, fixture.engine.metrics().pendingTradeCount());
+        }
+    }
+
+    /** 场景：同一未来序号成交的并发首次投递只累计一个空洞和 31 个重复。 */
+    @Test
+    void concurrentDuplicateGapCountsSequenceGapOnce() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            fixture.submitBoth();
+            TradeExecution execution = fixture.fullExecution(1L, 3L, 3L);
+            CountDownLatch start = new CountDownLatch(1);
+            ExecutorService executor = Executors.newFixedThreadPool(32);
+            try {
+                List<Future<TradeResult>> futures = new ArrayList<>();
+                for (int index = 0; index < 32; index++) {
+                    futures.add(executor.submit(() -> {
+                        start.await();
+                        return fixture.engine.onTrade(execution);
+                    }));
+                }
+
+                start.countDown();
+                for (Future<TradeResult> future : futures) {
+                    assertEquals(TradeResult.PENDING,
+                            future.get(5L, TimeUnit.SECONDS));
+                }
+                assertEquals(1L, fixture.engine.metrics().sequenceGapCount());
+                assertEquals(31L, fixture.engine.metrics().duplicateTradeCount());
+                assertEquals(1, fixture.engine.metrics().pendingTradeCount());
+            } finally {
+                start.countDown();
+                executor.shutdownNow();
+                assertTrue(executor.awaitTermination(5L, TimeUnit.SECONDS));
+            }
         }
     }
 

@@ -126,6 +126,25 @@ class CounterpartyOutOfOrderTest {
         assertTrue(fixture.ledger.allAssetInvariantsHold());
     }
 
+    /** 场景：双方等待撤单确认时发生 2/10 部分成交，状态保持等待且指标仍累计一次部分成交。 */
+    @Test
+    void pendingCancelPartialTradeStillCountsAsPartialFill() {
+        Fixture fixture = readyFixture();
+        fixture.engine.requestCancel(new CancelRequest(90L, BUY_ORDER_ID, 10L));
+        fixture.engine.requestCancel(new CancelRequest(91L, SELL_ORDER_ID, 10L));
+
+        assertEquals(TradeResult.SETTLED,
+                fixture.engine.onTrade(fixture.execution(1L, 2L, 200L, 2L, 2L)));
+
+        assertEquals(OrderStatus.PENDING_CANCEL, fixture.buyOrder().status());
+        assertEquals(OrderStatus.PENDING_CANCEL, fixture.sellOrder().status());
+        assertEquals(2L, fixture.buyOrder().cumulativeBaseFilled());
+        assertEquals(2L, fixture.sellOrder().cumulativeBaseFilled());
+        assertEquals(1L, fixture.engine.metrics().partialFillCount());
+        assertEquals(1L, fixture.engine.metrics().settledTradeCount());
+        assertTrue(fixture.ledger.allAssetInvariantsHold());
+    }
+
     private Fixture readyFixture() {
         Fixture fixture = fixture();
         fixture.engine.submit(fixture.buySubmission());

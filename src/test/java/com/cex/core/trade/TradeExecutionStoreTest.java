@@ -31,6 +31,7 @@ import org.junit.jupiter.api.Test;
  * <p>使用限制：仅验证进程内存储，不覆盖后续双边结算协调器。</p>
  */
 class TradeExecutionStoreTest {
+    /** 成交存储测试使用的固定交易对。 */
     private static final TradingPair BTC_USDT = new TradingPair(new AssetId("BTC"), new AssetId("USDT"));
 
     /** 场景：相同载荷必须返回原记录，而冲突载荷绝不替换最初记录。 */
@@ -154,6 +155,50 @@ class TradeExecutionStoreTest {
             for (Future<TradeExecutionRecord> future : futures) {
                 assertSame(original, getWithin(future));
             }
+            assertEquals(1, store.pendingCount());
+            assertEquals(1, store.totalCount());
+        } finally {
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5L, TimeUnit.SECONDS));
+        }
+    }
+
+    /** 场景：注册结果必须在线性化点精确区分一个首次登记与其余 31 个并发重复。 */
+    @Test
+    void concurrentRegistrationOutcomeIdentifiesOneNewAndThirtyOneDuplicates() throws Exception {
+        TradeExecutionStore store = new TradeExecutionStore(1, 1);
+        TradeExecution execution = execution(1L, 10L, 20L);
+        CountDownLatch start = new CountDownLatch(1);
+        ExecutorService executor = Executors.newFixedThreadPool(16);
+        try {
+            List<Future<TradeRegistrationOutcome>> futures = new ArrayList<>();
+            for (int index = 0; index < 32; index++) {
+                futures.add(executor.submit(() -> {
+                    start.await();
+                    return store.registerWithOutcome(execution);
+                }));
+            }
+
+            start.countDown();
+            TradeExecutionRecord original = null;
+            int newRegistrations = 0;
+            int duplicates = 0;
+            for (Future<TradeRegistrationOutcome> future : futures) {
+                TradeRegistrationOutcome outcome = getWithin(future);
+                if (original == null) {
+                    original = outcome.record();
+                }
+                assertSame(original, outcome.record());
+                if (outcome.duplicate()) {
+                    duplicates++;
+                } else {
+                    newRegistrations++;
+                }
+            }
+
+            assertNotNull(original);
+            assertEquals(1, newRegistrations);
+            assertEquals(31, duplicates);
             assertEquals(1, store.pendingCount());
             assertEquals(1, store.totalCount());
         } finally {

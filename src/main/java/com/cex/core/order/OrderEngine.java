@@ -18,6 +18,7 @@ import com.cex.core.trade.TradeExecutionRecord;
 import com.cex.core.trade.TradeExecutionState;
 import com.cex.core.trade.TradeExecutionStore;
 import com.cex.core.trade.TradeMetadataMismatchException;
+import com.cex.core.trade.TradeRegistrationOutcome;
 import com.cex.core.trade.TradeResult;
 import com.cex.core.trade.TradeSettlementCoordinator;
 import java.util.ArrayDeque;
@@ -190,10 +191,11 @@ public final class OrderEngine implements AutoCloseable {
      */
     public TradeResult onTrade(TradeExecution execution) {
         Objects.requireNonNull(execution, "execution");
-        boolean knownTrade = tradeStore.record(execution.tradeId()) != null;
         try {
-            TradeExecutionRecord record = tradeStore.register(execution);
-            if (knownTrade) {
+            TradeRegistrationOutcome registration =
+                    tradeStore.registerWithOutcome(execution);
+            TradeExecutionRecord record = registration.record();
+            if (registration.duplicate()) {
                 metrics.duplicateTrade();
             }
             if (record.state().isTerminal()) {
@@ -201,7 +203,9 @@ public final class OrderEngine implements AutoCloseable {
             }
 
             TradeResult result = attemptStoredTrade(record);
-            if (result == TradeResult.PENDING && hasVisibleSequenceGap(execution)) {
+            if (!registration.duplicate()
+                    && result == TradeResult.PENDING
+                    && hasVisibleSequenceGap(execution)) {
                 metrics.sequenceGap();
             }
             if (isBilateralTerminalProgress(result)) {
