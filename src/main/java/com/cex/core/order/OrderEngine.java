@@ -204,12 +204,14 @@ public final class OrderEngine implements AutoCloseable {
      * @return 首次提交、相同请求重复或订单已终态
      * @throws NullPointerException 当请求为 {@code null} 时抛出
      * @throws IllegalArgumentException 当订单不存在或不同请求标识已绑定该订单时抛出
-     * @note 状态在用户锁内先进入 {@link OrderStatus#PENDING_CANCEL}，外部发送和后续序号排空均在锁外执行。
+     * @note 状态在用户锁内先进入 {@link OrderStatus#PENDING_CANCEL}；仅一个线程可占用发送中状态，外部发送和后续序号排空均在锁外执行。
+     * @note sink 抛出时交付状态回滚为已登记，相同请求 ID 可重试；sink 成功后精确重复不再发送。
      */
     public CancelRequestResult requestCancel(CancelRequest request) {
         Objects.requireNonNull(request, "request");
         OrderContext context = requireOrder(request.orderId());
         CancelRequestResult result;
+        boolean deliveryClaimed;
         ReentrantLock userLock = locks.lockForUser(context.userId());
         userLock.lock();
         try {
@@ -223,15 +225,37 @@ public final class OrderEngine implements AutoCloseable {
                             "different cancel request already registered for orderId="
                                     + request.orderId());
                 }
-                return CancelRequestResult.DUPLICATE;
+                result = CancelRequestResult.DUPLICATE;
+            } else {
+                orderStateMachine.requestCancelLocked(context, request);
+                result = CancelRequestResult.SUBMITTED;
             }
-            orderStateMachine.requestCancelLocked(context, request);
-            result = CancelRequestResult.SUBMITTED;
+            deliveryClaimed = context.tryStartCancelRequestDeliveryLocked(
+                    request.cancelRequestId());
         } finally {
             userLock.unlock();
         }
 
-        cancelRequestSink.submit(request);
+        if (!deliveryClaimed) {
+            return result;
+        }
+        try {
+            cancelRequestSink.submit(request);
+        } catch (RuntimeException | Error deliveryFailure) {
+            userLock.lock();
+            try {
+                context.failCancelRequestDeliveryLocked(request.cancelRequestId());
+            } finally {
+                userLock.unlock();
+            }
+            throw deliveryFailure;
+        }
+        userLock.lock();
+        try {
+            context.completeCancelRequestDeliveryLocked(request.cancelRequestId());
+        } finally {
+            userLock.unlock();
+        }
         drainFromOrders(request.orderId());
         return result;
     }

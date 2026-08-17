@@ -24,6 +24,7 @@ public final class OrderContext {
 
     private final long orderId;
     private final long userId;
+    /** 创建本强类型上下文的完整不可变载荷；旧版适配上下文为 {@code null}。 */
     private final OrderSubmission originalSubmission;
     private final OrderSide side;
     private final TradingPair pair;
@@ -41,7 +42,11 @@ public final class OrderContext {
     private long remainingReservedAmount;
     private long lastAppliedSequence;
     private final NavigableMap<Long, SequencedOrderEvent> pendingEvents;
+    /** 已登记的稳定撤单请求标识；尚未登记时为零。 */
     private long cancelRequestId;
+    /** 撤单请求在本地登记与外部发送之间的用户锁内交付状态。 */
+    private CancelRequestDeliveryState cancelRequestDeliveryState =
+            CancelRequestDeliveryState.NOT_REGISTERED;
     private boolean terminalConflictRecorded;
     private boolean approvalConflictRecorded;
 
@@ -291,7 +296,79 @@ public final class OrderContext {
 
     void startCancelLocked(long requestId) {
         cancelRequestId = requestId;
+        cancelRequestDeliveryState = CancelRequestDeliveryState.REGISTERED;
         status = OrderStatus.PENDING_CANCEL;
+    }
+
+    /**
+     * 尝试独占同一撤单请求的下一次外部发送。
+     *
+     * @param requestId 必须等于已登记标识的撤单请求 ID
+     * @return 从 {@code REGISTERED} 成功迁移为 {@code SENDING} 时为 {@code true}；正在发送或已发送时为 {@code false}
+     * @throws IllegalArgumentException 当请求标识与已登记值不一致时抛出
+     * @note 调用方必须持有订单所属用户锁；只有返回 {@code true} 的线程才能在释放锁后调用外部 sink。
+     */
+    boolean tryStartCancelRequestDeliveryLocked(long requestId) {
+        requireRegisteredCancelRequestId(requestId);
+        if (cancelRequestDeliveryState != CancelRequestDeliveryState.REGISTERED) {
+            return false;
+        }
+        cancelRequestDeliveryState = CancelRequestDeliveryState.SENDING;
+        return true;
+    }
+
+    /**
+     * 提交已成功完成的外部撤单请求发送。
+     *
+     * @param requestId 必须等于当前正在发送的撤单请求 ID
+     * @throws IllegalArgumentException 当请求标识与已登记值不一致时抛出
+     * @throws IllegalStateException 当请求当前不处于发送中时抛出
+     * @note 调用方必须在外部 sink 返回成功后重新获取用户锁再调用本方法。
+     */
+    void completeCancelRequestDeliveryLocked(long requestId) {
+        requireSendingCancelRequest(requestId);
+        cancelRequestDeliveryState = CancelRequestDeliveryState.SENT;
+    }
+
+    /**
+     * 回滚失败的外部撤单请求发送，使相同请求标识可以再次尝试。
+     *
+     * @param requestId 必须等于当前正在发送的撤单请求 ID
+     * @throws IllegalArgumentException 当请求标识与已登记值不一致时抛出
+     * @throws IllegalStateException 当请求当前不处于发送中时抛出
+     * @note 调用方必须在外部 sink 抛出后重新获取用户锁再调用本方法；订单状态继续保持 {@code PENDING_CANCEL}。
+     */
+    void failCancelRequestDeliveryLocked(long requestId) {
+        requireSendingCancelRequest(requestId);
+        cancelRequestDeliveryState = CancelRequestDeliveryState.REGISTERED;
+    }
+
+    /**
+     * 校验请求标识与当前已登记撤单一致。
+     *
+     * @param requestId 候选撤单请求标识
+     * @throws IllegalArgumentException 当尚未登记或标识不一致时抛出
+     */
+    private void requireRegisteredCancelRequestId(long requestId) {
+        if (cancelRequestId == 0L || cancelRequestId != requestId) {
+            throw new IllegalArgumentException(
+                    "cancel request ID mismatch for orderId=" + orderId);
+        }
+    }
+
+    /**
+     * 校验请求标识一致且交付状态为发送中。
+     *
+     * @param requestId 候选撤单请求标识
+     * @throws IllegalArgumentException 当标识不一致时抛出
+     * @throws IllegalStateException 当交付状态不是发送中时抛出
+     */
+    private void requireSendingCancelRequest(long requestId) {
+        requireRegisteredCancelRequestId(requestId);
+        if (cancelRequestDeliveryState != CancelRequestDeliveryState.SENDING) {
+            throw new IllegalStateException(
+                    "cancel request is not being delivered for orderId=" + orderId);
+        }
     }
 
     /**
@@ -405,6 +482,23 @@ public final class OrderContext {
         }
         approvalConflictRecorded = true;
         return true;
+    }
+
+    /**
+     * 单个撤单请求从本地登记到外部发送完成的互斥状态。
+     *
+     * <p>线程安全：字段只在订单所属用户锁内读取和迁移。</p>
+     * <p>使用限制：状态不表示外部撤单已确认；确认仍由 {@link CancelConfirmation} 独立推进订单序号。</p>
+     */
+    private enum CancelRequestDeliveryState {
+        /** 尚未登记本地撤单请求。 */
+        NOT_REGISTERED,
+        /** 已登记但当前没有线程执行外部发送，可由同 ID 调用重试。 */
+        REGISTERED,
+        /** 一个线程已独占发送权并正在用户锁外调用外部 sink。 */
+        SENDING,
+        /** 外部 sink 已成功返回，相同请求后续只返回幂等结果。 */
+        SENT
     }
 
     /**

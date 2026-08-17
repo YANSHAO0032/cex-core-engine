@@ -1,9 +1,11 @@
 package com.cex.core.order;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.cex.core.account.AccountLedger;
 import com.cex.core.account.BalanceSnapshot;
@@ -18,6 +20,12 @@ import com.cex.core.risk.RiskPipeline;
 import com.cex.core.trade.TradeExecutionState;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -35,6 +43,7 @@ class SequencedOrderEngineTest {
     private static final long BUY_ORDER_ID = 1_001L;
     private static final long SELL_ORDER_ID = 2_002L;
 
+    /** 测试结束时需要关闭的引擎资源。 */
     private final List<OrderEngine> engines = new ArrayList<>();
 
     /** 关闭每个场景创建的审批执行器。 */
@@ -110,6 +119,94 @@ class SequencedOrderEngineTest {
         assertEquals(TradeExecutionState.SETTLED, fixture.engine.trade(1L).state());
     }
 
+    /** 场景：撤单发送失败保留等待态，同 ID 可重发一次，成功后精确重复不再调用外部边界。 */
+    @Test
+    void failedCancelDeliveryRetriesSameIdAndSuccessfulDeliveryIsIdempotent() {
+        AtomicInteger attempts = new AtomicInteger();
+        CancelRequestSink sink = request -> {
+            assertEquals(90L, request.cancelRequestId());
+            if (attempts.incrementAndGet() == 1) {
+                throw new IllegalStateException("injected first delivery failure");
+            }
+        };
+        Fixture fixture = fixture(1_000L, sink);
+        OrderContext order = fixture.engine.submit(fixture.buySubmission());
+        CancelRequest request = new CancelRequest(90L, BUY_ORDER_ID, 10L);
+
+        assertThrows(IllegalStateException.class,
+                () -> fixture.engine.requestCancel(request));
+        assertEquals(1, attempts.get());
+        assertEquals(OrderStatus.PENDING_CANCEL, order.status());
+
+        assertEquals(CancelRequestResult.DUPLICATE,
+                fixture.engine.requestCancel(request));
+        assertEquals(2, attempts.get());
+        assertEquals(OrderStatus.PENDING_CANCEL, order.status());
+
+        assertEquals(CancelRequestResult.DUPLICATE,
+                fixture.engine.requestCancel(request));
+        assertEquals(2, attempts.get());
+    }
+
+    /** 场景：同 ID 并发重试只能有一个线程占用发送权，其他调用不得并行触发 sink。 */
+    @Test
+    void concurrentSameIdRetryDoesNotStartParallelDelivery() throws Exception {
+        StripedLockManager locks = new StripedLockManager(16);
+        AccountLedger ledger = ledger(locks, 1_000L);
+        AtomicInteger attempts = new AtomicInteger();
+        CountDownLatch retryEnteredSink = new CountDownLatch(1);
+        CountDownLatch releaseRetry = new CountDownLatch(1);
+        CancelRequestSink sink = request -> {
+            assertFalse(locks.lockForUser(BUYER_ID).isHeldByCurrentThread());
+            int attempt = attempts.incrementAndGet();
+            if (attempt == 1) {
+                throw new IllegalStateException("injected first delivery failure");
+            }
+            if (attempt > 2) {
+                throw new AssertionError("parallel duplicate delivery");
+            }
+            retryEnteredSink.countDown();
+            try {
+                if (!releaseRetry.await(2L, TimeUnit.SECONDS)) {
+                    throw new AssertionError("retry release timed out");
+                }
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError("retry delivery interrupted", interrupted);
+            }
+        };
+        ApprovalService approvals = new ApprovalService(1, 16);
+        OrderEngine engine = new OrderEngine(
+                ledger, new RiskPipeline(), new ManualClock(1L), approvals,
+                event -> ApprovalDecision.PASS, sink);
+        engines.add(engine);
+        engine.submit(new OrderSubmission(
+                BUY_ORDER_ID, BUYER_ID, OrderSide.BUY, BTC_USDT,
+                10L, 1_000L, 1_000L, 1L, 10L));
+        CancelRequest request = new CancelRequest(90L, BUY_ORDER_ID, 10L);
+        assertThrows(IllegalStateException.class, () -> engine.requestCancel(request));
+
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<CancelRequestResult> retry =
+                    executor.submit(() -> engine.requestCancel(request));
+            assertTrue(retryEnteredSink.await(2L, TimeUnit.SECONDS));
+
+            assertEquals(CancelRequestResult.DUPLICATE, engine.requestCancel(request));
+            assertEquals(2, attempts.get());
+
+            releaseRetry.countDown();
+            assertEquals(CancelRequestResult.DUPLICATE,
+                    retry.get(2L, TimeUnit.SECONDS));
+            assertEquals(CancelRequestResult.DUPLICATE, engine.requestCancel(request));
+            assertEquals(2, attempts.get());
+        } finally {
+            releaseRetry.countDown();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(2L, TimeUnit.SECONDS));
+        }
+    }
+
     /** 场景：最小风险分类可暂挂强类型订单，审批通过后恢复为可成交状态。 */
     @Test
     void approvalPassReleasesRiskHeldTypedOrder() {
@@ -163,9 +260,17 @@ class SequencedOrderEngineTest {
     }
 
     private Fixture fixture(long buyerQuoteAvailable) {
+        return fixture(buyerQuoteAvailable, request -> { });
+    }
+
+    private Fixture fixture(
+            long buyerQuoteAvailable, CancelRequestSink cancelRequestSink) {
         StripedLockManager locks = new StripedLockManager(16);
         AccountLedger ledger = ledger(locks, buyerQuoteAvailable);
-        OrderEngine engine = new OrderEngine(ledger);
+        ApprovalService approvals = new ApprovalService(1, 16);
+        OrderEngine engine = new OrderEngine(
+                ledger, new RiskPipeline(), new ManualClock(1L), approvals,
+                event -> ApprovalDecision.PASS, cancelRequestSink);
         engines.add(engine);
         return new Fixture(ledger, engine);
     }
