@@ -25,6 +25,7 @@ import com.cex.core.risk.Clock;
 import com.cex.core.risk.RiskWindowKey;
 import com.cex.core.risk.TradeWindow;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.locks.ReentrantLock;
@@ -166,6 +167,28 @@ class TradeSettlementCoordinatorTest {
                 fixture.ledger.balance(fixture.sellerId, BTC));
         assertEquals(0L, fixture.buyer.cumulativeBaseFilled());
         assertEquals(0L, fixture.seller.cumulativeBaseFilled());
+    }
+
+    /** 场景：风险窗口准备失败不得把尚无成交的新买方窗口提前发布到共享映射。 */
+    @Test
+    void riskWindowPreparationFailureDoesNotPublishAnyNewWindowKey() {
+        Fixture fixture = readyBuyerAndSeller(10L, 200L, 10L, 2L);
+        RiskWindowKey buyerKey = new RiskWindowKey(fixture.buyerId, USDT);
+        RiskWindowKey sellerKey = new RiskWindowKey(fixture.sellerId, USDT);
+        TradeWindow sellerWindow = new TradeWindow(10_000L);
+        sellerWindow.record(0L, Long.MAX_VALUE);
+        fixture.tradeWindows.put(sellerKey, sellerWindow);
+        Set<RiskWindowKey> keysBefore = Set.copyOf(fixture.tradeWindows.keySet());
+        int sizeBefore = fixture.tradeWindows.size();
+
+        assertEquals(TradeResult.REJECTED,
+                fixture.coordinator.accept(
+                        fixture.execution(1L, 1L, 1L, 2L, 2L)));
+
+        assertEquals(sizeBefore, fixture.tradeWindows.size());
+        assertEquals(keysBefore, fixture.tradeWindows.keySet());
+        assertFalse(fixture.tradeWindows.containsKey(buyerKey));
+        assertEquals(Long.MAX_VALUE, sellerWindow.currentSum(0L));
     }
 
     /** 场景：可注入时钟属于锁外依赖，读取时间时不得持有任一用户资金锁。 */

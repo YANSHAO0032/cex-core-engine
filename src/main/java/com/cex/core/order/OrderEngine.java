@@ -222,54 +222,15 @@ public final class OrderEngine implements AutoCloseable {
     public CancelRequestResult requestCancel(CancelRequest request) {
         Objects.requireNonNull(request, "request");
         OrderContext context = requireOrder(request.orderId());
-        CancelRequestResult result;
-        boolean deliveryClaimed;
+        CancelRequestAttempt attempt;
         ReentrantLock userLock = locks.lockForUser(context.userId());
         userLock.lock();
         try {
-            if (context.status() == OrderStatus.FILLED
-                    || context.status() == OrderStatus.CANCELED) {
-                return CancelRequestResult.ALREADY_TERMINAL;
-            }
-            if (context.cancelRequestId() != 0L) {
-                if (context.cancelRequestId() != request.cancelRequestId()) {
-                    throw new IllegalArgumentException(
-                            "different cancel request already registered for orderId="
-                                    + request.orderId());
-                }
-                result = CancelRequestResult.DUPLICATE;
-            } else {
-                orderStateMachine.requestCancelLocked(context, request);
-                result = CancelRequestResult.SUBMITTED;
-            }
-            deliveryClaimed = context.tryStartCancelRequestDeliveryLocked(
-                    request.cancelRequestId());
+            attempt = prepareCancelRequestLocked(context, request);
         } finally {
             userLock.unlock();
         }
-
-        if (!deliveryClaimed) {
-            return result;
-        }
-        try {
-            cancelRequestSink.submit(request);
-        } catch (RuntimeException | Error deliveryFailure) {
-            userLock.lock();
-            try {
-                context.failCancelRequestDeliveryLocked(request.cancelRequestId());
-            } finally {
-                userLock.unlock();
-            }
-            throw deliveryFailure;
-        }
-        userLock.lock();
-        try {
-            context.completeCancelRequestDeliveryLocked(request.cancelRequestId());
-        } finally {
-            userLock.unlock();
-        }
-        drainFromOrders(request.orderId());
-        return result;
+        return deliverCancelRequest(context, request, attempt);
     }
 
     /**
@@ -328,6 +289,7 @@ public final class OrderEngine implements AutoCloseable {
         }
 
         CancelRequest riskCancelRequest;
+        CancelRequestAttempt attempt;
         userLock.lock();
         try {
             if (context.status() == OrderStatus.RISK_HOLD) {
@@ -338,15 +300,82 @@ public final class OrderEngine implements AutoCloseable {
             } else {
                 return;
             }
+            attempt = prepareCancelRequestLocked(context, riskCancelRequest);
         } finally {
             userLock.unlock();
         }
-        if (riskCancelRequest != null) {
-            CancelRequestResult cancelResult = requestCancel(riskCancelRequest);
-            if (cancelResult == CancelRequestResult.SUBMITTED) {
-                metrics.approvalReject();
-            }
+        if (attempt.result == CancelRequestResult.SUBMITTED) {
+            metrics.approvalReject();
         }
+        deliverCancelRequest(context, riskCancelRequest, attempt);
+    }
+
+    /**
+     * 在已持用户锁时登记撤单并尝试取得唯一发送权。
+     *
+     * @param context 撤单所属订单上下文
+     * @param request 待登记的稳定撤单请求
+     * @return 撤单登记结果及本线程是否取得发送权
+     * @throws IllegalArgumentException 当不同撤单请求标识已绑定该订单时抛出
+     * @note 状态校验、{@link OrderStatus#PENDING_CANCEL} 登记与发送权竞争共享同一线性化临界区；调用方必须已持所属用户锁。
+     */
+    private CancelRequestAttempt prepareCancelRequestLocked(
+            OrderContext context, CancelRequest request) {
+        if (context.status() == OrderStatus.FILLED
+                || context.status() == OrderStatus.CANCELED) {
+            return new CancelRequestAttempt(CancelRequestResult.ALREADY_TERMINAL, false);
+        }
+        CancelRequestResult result;
+        if (context.cancelRequestId() != 0L) {
+            if (context.cancelRequestId() != request.cancelRequestId()) {
+                throw new IllegalArgumentException(
+                        "different cancel request already registered for orderId="
+                                + request.orderId());
+            }
+            result = CancelRequestResult.DUPLICATE;
+        } else {
+            orderStateMachine.requestCancelLocked(context, request);
+            result = CancelRequestResult.SUBMITTED;
+        }
+        boolean deliveryClaimed = context.tryStartCancelRequestDeliveryLocked(
+                request.cancelRequestId());
+        return new CancelRequestAttempt(result, deliveryClaimed);
+    }
+
+    /**
+     * 在用户锁外发送已取得发送权的撤单请求并收敛交付状态。
+     *
+     * @param context 撤单所属订单上下文
+     * @param request 已登记的稳定撤单请求
+     * @param attempt 锁内登记与发送权竞争结果
+     * @return 首次提交、相同请求重复或订单已终态
+     * @note 外部 sink 始终在用户锁外调用；发送失败回滚为可重试状态，成功后再排空该订单的权威事件。
+     */
+    private CancelRequestResult deliverCancelRequest(
+            OrderContext context, CancelRequest request, CancelRequestAttempt attempt) {
+        if (!attempt.deliveryClaimed) {
+            return attempt.result;
+        }
+        ReentrantLock userLock = locks.lockForUser(context.userId());
+        try {
+            cancelRequestSink.submit(request);
+        } catch (RuntimeException | Error deliveryFailure) {
+            userLock.lock();
+            try {
+                context.failCancelRequestDeliveryLocked(request.cancelRequestId());
+            } finally {
+                userLock.unlock();
+            }
+            throw deliveryFailure;
+        }
+        userLock.lock();
+        try {
+            context.completeCancelRequestDeliveryLocked(request.cancelRequestId());
+        } finally {
+            userLock.unlock();
+        }
+        drainFromOrders(request.orderId());
+        return attempt.result;
     }
 
     /**
@@ -926,6 +955,29 @@ public final class OrderEngine implements AutoCloseable {
          */
         private ReconcileResult(OrderSubmission approvalSubmission) {
             this.approvalSubmission = approvalSubmission;
+        }
+    }
+
+    /**
+     * 用户锁内撤单登记与发送权竞争的不可变结果。
+     * 实例仅跨越一次锁外发送调用，不对外发布。
+     */
+    private static final class CancelRequestAttempt {
+        /** 撤单首次登记、重复或已终态结果。 */
+        private final CancelRequestResult result;
+        /** 当前线程是否取得该撤单请求的唯一发送权。 */
+        private final boolean deliveryClaimed;
+
+        /**
+         * 创建撤单登记与发送权竞争结果。
+         *
+         * @param result 撤单登记业务结果
+         * @param deliveryClaimed 当前线程是否取得唯一发送权
+         */
+        private CancelRequestAttempt(
+                CancelRequestResult result, boolean deliveryClaimed) {
+            this.result = result;
+            this.deliveryClaimed = deliveryClaimed;
         }
     }
 }

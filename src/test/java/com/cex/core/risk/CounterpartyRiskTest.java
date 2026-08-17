@@ -17,10 +17,14 @@ import com.cex.core.order.OrderSubmission;
 import com.cex.core.order.TradeExecution;
 import com.cex.core.order.TradingPair;
 import com.cex.core.trade.TradeResult;
+import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -306,18 +310,114 @@ class CounterpartyRiskTest {
     }
 
     /**
+     * 场景：并发 PASS/REJECT 只能一个决策取得用户锁内线性化点。
+     *
+     * @throws Exception 当审批闭锁、反射测试锁替换或线程等待失败时抛出
+     */
+    @Test
+    void concurrentPassCannotInterleaveInsideRejectedApprovalTransition() throws Exception {
+        StripedLockManager locks = new StripedLockManager(16);
+        AccountLedger ledger = ledger(locks);
+        ApprovalService approvals = new ApprovalService(1, 8);
+        CountDownLatch approvalEntered = new CountDownLatch(1);
+        CountDownLatch releaseAutomaticApproval = new CountDownLatch(1);
+        List<CancelRequest> requests = new ArrayList<>();
+        OrderEngine engine = new OrderEngine(
+                ledger,
+                new RiskPipeline(context -> RiskDecision.HOLD),
+                new ManualClock(100L),
+                approvals,
+                submission -> {
+                    approvalEntered.countDown();
+                    try {
+                        releaseAutomaticApproval.await();
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                    }
+                    return ApprovalDecision.PASS;
+                },
+                requests::add);
+        try {
+            OrderContext order = engine.submit(
+                    buySubmission(11L, 101L, 10L, 1_000L, 1_000L));
+            assertTrue(approvalEntered.await(2L, TimeUnit.SECONDS));
+            ApprovalHandoffLock handoffLock = new ApprovalHandoffLock("approval-reject");
+            replaceUserLock(locks, 101L, handoffLock);
+            AtomicReference<Throwable> rejectFailure = new AtomicReference<>();
+            Thread reject = new Thread(() -> {
+                try {
+                    engine.onApproval(new ApprovalResult(
+                            order.orderId(), ApprovalDecision.REJECT, 200L));
+                } catch (Throwable failure) {
+                    rejectFailure.set(failure);
+                }
+            }, "approval-reject");
+
+            reject.start();
+            assertTrue(handoffLock.awaitFirstRelease());
+            engine.onApproval(new ApprovalResult(
+                    order.orderId(), ApprovalDecision.PASS, 201L));
+            handoffLock.continueReject();
+            reject.join(2_000L);
+
+            assertTrue(!reject.isAlive());
+            assertEquals(null, rejectFailure.get());
+            assertEquals(0L, engine.metrics().approvalPassCount());
+            assertEquals(1L, engine.metrics().approvalRejectCount());
+            assertEquals(OrderStatus.PENDING_CANCEL, order.status());
+            assertEquals(1, requests.size());
+
+            releaseAutomaticApproval.countDown();
+            engine.awaitApprovals(2L, TimeUnit.SECONDS);
+            assertEquals(0L, engine.metrics().approvalPassCount());
+            assertEquals(1L, engine.metrics().approvalRejectCount());
+        } finally {
+            releaseAutomaticApproval.countDown();
+            engine.close();
+        }
+    }
+
+    /**
      * 创建包含买卖双方多资产余额的测试账本。
      *
      * @return 初始化完成的独立多资产账本
      */
     private static AccountLedger ledger() {
-        AccountLedger ledger = new AccountLedger(new StripedLockManager(16));
+        return ledger(new StripedLockManager(16));
+    }
+
+    /**
+     * 使用指定条带锁创建多资产测试账本。
+     *
+     * @param locks 账本与引擎共享的条带锁管理器
+     * @return 初始化完成的独立多资产账本
+     */
+    private static AccountLedger ledger(StripedLockManager locks) {
+        AccountLedger ledger = new AccountLedger(locks);
         ledger.createBalance(101L, BTC, 0L);
         ledger.createBalance(101L, USDT, 10_000L);
         ledger.createBalance(202L, BTC, 20L);
         ledger.createBalance(202L, USDT, 0L);
         ledger.createBalance(202L, USDC, 0L);
         return ledger;
+    }
+
+    /**
+     * 将指定用户条带替换为可控交接锁，仅用于确定性复现审批线性化竞态。
+     *
+     * @param locks 待修改的测试锁管理器
+     * @param userId 需要拦截的用户标识
+     * @param replacement 替换后的可控锁
+     * @throws ReflectiveOperationException 当无法访问测试锁数组时抛出
+     */
+    private static void replaceUserLock(
+            StripedLockManager locks,
+            long userId,
+            ReentrantLock replacement) throws ReflectiveOperationException {
+        Field stripesField = StripedLockManager.class.getDeclaredField("stripes");
+        stripesField.setAccessible(true);
+        ReentrantLock[] stripes = (ReentrantLock[]) stripesField.get(locks);
+        stripes[locks.stripeIndexForUser(userId)] = replacement;
     }
 
     /**
@@ -352,5 +452,69 @@ class CounterpartyRiskTest {
         return new OrderSubmission(
                 orderId, userId, OrderSide.SELL, BTC_USDT,
                 base, reserve, riskQuote, 1L, 100L);
+    }
+
+    /**
+     * 在指定线程首次释放审批锁后暂停该线程的测试锁。
+     *
+     * <p>核心能力：把 REJECT 的第一次 unlock 与后续逻辑分开，以确定性验证中间是否允许 PASS 插入。</p>
+     * <p>线程安全：原子标识保证只拦截一次，闭锁协调测试线程与审批线程。</p>
+     * <p>使用限制：只用于本测试类，不能进入生产代码。</p>
+     */
+    private static final class ApprovalHandoffLock extends ReentrantLock {
+        /** 需要在首次 unlock 后暂停的线程名称。 */
+        private final String interceptedThreadName;
+        /** 已完成目标 unlock 的通知闭锁。 */
+        private final CountDownLatch firstRelease = new CountDownLatch(1);
+        /** 允许目标线程继续执行的闭锁。 */
+        private final CountDownLatch continueReject = new CountDownLatch(1);
+        /** 是否已经执行过一次确定性交接。 */
+        private final AtomicBoolean intercepted = new AtomicBoolean();
+
+        /**
+         * 创建审批交接锁。
+         *
+         * @param interceptedThreadName 要拦截的审批线程名称
+         */
+        private ApprovalHandoffLock(String interceptedThreadName) {
+            this.interceptedThreadName = interceptedThreadName;
+        }
+
+        /**
+         * 释放锁，并在目标线程首次释放后等待测试线程继续信号。
+         *
+         * @note 先实际释放底层锁再等待，使竞争审批能够取得同一用户锁。
+         */
+        @Override
+        public void unlock() {
+            super.unlock();
+            if (Thread.currentThread().getName().equals(interceptedThreadName)
+                    && intercepted.compareAndSet(false, true)) {
+                firstRelease.countDown();
+                try {
+                    if (!continueReject.await(2L, TimeUnit.SECONDS)) {
+                        throw new AssertionError("approval handoff timed out");
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("approval handoff interrupted", interrupted);
+                }
+            }
+        }
+
+        /**
+         * 等待被测审批线程第一次释放用户锁。
+         *
+         * @return 两秒内观察到第一次释放时为 {@code true}
+         * @throws InterruptedException 当测试线程等待期间被中断时抛出
+         */
+        private boolean awaitFirstRelease() throws InterruptedException {
+            return firstRelease.await(2L, TimeUnit.SECONDS);
+        }
+
+        /** 允许被暂停的 REJECT 审批线程继续执行。 */
+        private void continueReject() {
+            continueReject.countDown();
+        }
     }
 }

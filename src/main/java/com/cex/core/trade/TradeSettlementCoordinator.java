@@ -262,8 +262,12 @@ public final class TradeSettlementCoordinator {
         OrderFillMutation buyerMutation;
         OrderFillMutation sellerMutation;
         TradeLedgerMutation ledgerMutation;
+        RiskWindowKey buyerWindowKey;
+        RiskWindowKey sellerWindowKey;
         TradeWindow buyerWindow;
         TradeWindow sellerWindow;
+        boolean publishBuyerWindow;
+        boolean publishSellerWindow;
         TradeWindowMutation buyerWindowMutation;
         TradeWindowMutation sellerWindowMutation;
         try {
@@ -278,14 +282,20 @@ public final class TradeSettlementCoordinator {
                     execution.baseQuantity(),
                     execution.quoteQuantity(),
                     buyerMutation.buyerQuoteReleaseAmount());
-            RiskWindowKey buyerWindowKey = new RiskWindowKey(
+            buyerWindowKey = new RiskWindowKey(
                     buyer.userId(), execution.pair().quoteAsset());
-            RiskWindowKey sellerWindowKey = new RiskWindowKey(
+            sellerWindowKey = new RiskWindowKey(
                     seller.userId(), execution.pair().quoteAsset());
-            buyerWindow = tradeWindows.computeIfAbsent(
-                    buyerWindowKey, ignored -> new TradeWindow(RISK_WINDOW_MILLIS));
-            sellerWindow = tradeWindows.computeIfAbsent(
-                    sellerWindowKey, ignored -> new TradeWindow(RISK_WINDOW_MILLIS));
+            buyerWindow = tradeWindows.get(buyerWindowKey);
+            publishBuyerWindow = buyerWindow == null;
+            if (publishBuyerWindow) {
+                buyerWindow = new TradeWindow(RISK_WINDOW_MILLIS);
+            }
+            sellerWindow = tradeWindows.get(sellerWindowKey);
+            publishSellerWindow = sellerWindow == null;
+            if (publishSellerWindow) {
+                sellerWindow = new TradeWindow(RISK_WINDOW_MILLIS);
+            }
             buyerWindowMutation = buyerWindow.prepareRecord(
                     riskRecordedAtMillis, execution.quoteQuantity());
             sellerWindowMutation = sellerWindow.prepareRecord(
@@ -303,6 +313,13 @@ public final class TradeSettlementCoordinator {
 
         prepareAndCommitBothReferencesLocked(
                 buyer, seller, buyerReference, sellerReference);
+        // 新窗口完成双方全部确定性预检后才发布，拒绝路径不得遗留空窗口键。
+        if (publishBuyerWindow) {
+            tradeWindows.put(buyerWindowKey, buyerWindow);
+        }
+        if (publishSellerWindow) {
+            tradeWindows.put(sellerWindowKey, sellerWindow);
+        }
         ledger.commitTradeLocked(ledgerMutation);
         orderStateMachine.commitFillLocked(buyer, buyerMutation);
         orderStateMachine.commitFillLocked(seller, sellerMutation);
@@ -359,6 +376,7 @@ public final class TradeSettlementCoordinator {
      * @throws IllegalArgumentException 当任一引用身份不匹配时抛出
      * @throws IllegalStateException 当任一引用存在冲突或超过未来事件容量时抛出
      * @note 两个 prepare 均为只读校验；两个 commit 只消费预计算结果，不执行身份、序号、冲突或容量校验。
+     * @note 调用成功后已不存在可预见业务失败，调用方可安全发布尚未进入共享映射的新风险窗口并提交其变更。
      */
     private void prepareAndCommitBothReferencesLocked(
             OrderContext buyer,
