@@ -19,14 +19,22 @@ import org.junit.jupiter.api.Test;
  * <p>测试只通过 {@link OrderEngine} 强类型门面驱动真实协调器，不建立第二套撮合或结算逻辑。</p>
  */
 class CounterpartyOutOfOrderTest {
+    /** 测试基础资产。 */
     private static final AssetId BTC = new AssetId("BTC");
+    /** 测试报价资产。 */
     private static final AssetId USDT = new AssetId("USDT");
+    /** 测试使用的基础/报价交易对。 */
     private static final TradingPair BTC_USDT = new TradingPair(BTC, USDT);
+    /** 买方用户标识。 */
     private static final long BUYER_ID = 101L;
+    /** 卖方用户标识。 */
     private static final long SELLER_ID = 202L;
+    /** 买单标识。 */
     private static final long BUY_ORDER_ID = 1_001L;
+    /** 卖单标识。 */
     private static final long SELL_ORDER_ID = 2_002L;
 
+    /** 测试结束时需要关闭的引擎资源。 */
     private final List<OrderEngine> engines = new ArrayList<>();
 
     /** 关闭场景内引擎拥有的异步审批资源。 */
@@ -70,6 +78,8 @@ class CounterpartyOutOfOrderTest {
         assertEquals(TradeExecutionState.SETTLED, fixture.engine.trade(1L).state());
         assertEquals(TradeExecutionState.SETTLED, fixture.engine.trade(2L).state());
         assertEquals(0, fixture.engine.pendingTradeCount());
+        assertEquals(2L, fixture.engine.metrics().partialFillCount());
+        assertEquals(0, fixture.engine.metrics().pendingTradeCount());
     }
 
     /** 场景：买卖序号形成不同空洞时，任一单边下一事件都不得被独立提交。 */
@@ -137,7 +147,9 @@ class CounterpartyOutOfOrderTest {
 
     /** 保存双边乱序场景中的真实依赖和权威输入工厂。 */
     private static final class Fixture {
+        /** 场景使用的多资产账本。 */
         private final AccountLedger ledger;
+        /** 场景使用的强类型订单引擎。 */
         private final OrderEngine engine;
 
         private Fixture(AccountLedger ledger, OrderEngine engine) {

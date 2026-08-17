@@ -8,47 +8,30 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * 管理用户多资产余额及系统已结算资金的内存账本。
+ * 管理用户多资产余额与双边交割的内存账本。
  *
  * <p>能力：创建资产余额、在外部持锁条件下冻结、解冻和成交结算，并逐资产校验守恒。</p>
- * <p>线程安全：账户余额由用户条带锁串行化；余额创建额外持有账本监视器；系统结算余额使用 CAS 更新。</p>
+ * <p>线程安全：账户余额由用户条带锁串行化；余额创建额外持有账本监视器。</p>
  * <p>限制：锁定操作不会自行加锁，调用方必须先持有相关用户的所有条带锁。</p>
  */
 public final class AccountLedger {
-    /** 旧版单资产接口所使用的内部资产标识。 */
-    private static final AssetId LEGACY_ASSET = new AssetId("LEGACY");
     /** 为用户操作提供条带化互斥的锁管理器。 */
     private final StripedLockManager lockManager;
     /** 按用户标识索引的账户集合。 */
     private final Map<Long, Account> accounts = new ConcurrentHashMap<>();
-    /** 按资产累计的系统已结算资金。 */
-    private final Map<AssetId, AtomicLong> systemSettledByAsset = new ConcurrentHashMap<>();
     /** 各资产应保持守恒的初始总额，仅在账本监视器内更新。 */
     private final Map<AssetId, Long> initialTotalByAsset = new HashMap<>();
 
     /**
-     * 使用零初始已结算金额创建账本。
+     * 创建空的多资产账本。
      *
      * @param lockManager 用户条带锁管理器
      */
-    public AccountLedger(StripedLockManager lockManager) { this(lockManager, 0L); }
-
-    /**
-     * 使用指定旧版单资产初始已结算金额创建账本。
-     *
-     * @param lockManager 用户条带锁管理器
-     * @param initialSystemSettledAmount 初始系统已结算资产，必须非负
-     * @throws IllegalArgumentException 当初始已结算金额为负数时抛出
-     */
-    public AccountLedger(StripedLockManager lockManager, long initialSystemSettledAmount) {
+    public AccountLedger(StripedLockManager lockManager) {
         this.lockManager = Objects.requireNonNull(lockManager, "lockManager");
-        long seeded = MoneyMath.requireNonNegative(initialSystemSettledAmount);
-        systemSettledByAsset.put(LEGACY_ASSET, new AtomicLong(seeded));
-        initialTotalByAsset.put(LEGACY_ASSET, seeded);
     }
 
     /**
@@ -57,33 +40,6 @@ public final class AccountLedger {
      * @return 条带锁管理器
      */
     public StripedLockManager lockManager() { return lockManager; }
-
-    /**
-     * 使用零冻结余额创建旧版单资产账户。
-     *
-     * @param userId 用户标识，必须为正数
-     * @param available 初始可用资产，必须非负
-     * @return 新创建的账户
-     * @throws IllegalArgumentException 当用户标识、余额无效或账户已存在时抛出
-     */
-    public Account createAccount(long userId, long available) {
-        return createAccount(userId, available, 0L);
-    }
-
-    /**
-     * 创建同时包含可用与冻结旧版资产的账户。
-     *
-     * @param userId 用户标识，必须为正数
-     * @param available 初始可用资产，必须非负
-     * @param frozen 初始冻结资产，必须非负
-     * @return 新创建的账户
-     * @throws IllegalArgumentException 当参数无效或账户已存在时抛出
-     * @throws ArithmeticException 当初始资产总额溢出时抛出
-     * @note 兼容接口只委托到内部 LEGACY 资产，不与真实交易资产混用。
-     */
-    public Account createAccount(long userId, long available, long frozen) {
-        return createBalance(userId, LEGACY_ASSET, available, frozen, true);
-    }
 
     /**
      * 为用户创建零冻结的指定资产余额。
@@ -96,7 +52,7 @@ public final class AccountLedger {
      * @throws ArithmeticException 当初始资产总额溢出时抛出
      */
     public Account createBalance(long userId, AssetId asset, long available) {
-        return createBalance(userId, asset, available, 0L, false);
+        return createBalance(userId, asset, available, 0L);
     }
 
     /**
@@ -112,10 +68,6 @@ public final class AccountLedger {
      * @note 先完成逐资产总额精确加法，再发布账户和余额桶，失败时不留下部分状态。
      */
     public Account createBalance(long userId, AssetId asset, long available, long frozen) {
-        return createBalance(userId, asset, available, frozen, false);
-    }
-
-    private Account createBalance(long userId, AssetId asset, long available, long frozen, boolean requireNewAccount) {
         requirePositiveId(userId, "userId");
         Objects.requireNonNull(asset, "asset");
         long normalizedAvailable = MoneyMath.requireNonNegative(available);
@@ -125,9 +77,6 @@ public final class AccountLedger {
         try {
             synchronized (this) {
                 Account existing = accounts.get(userId);
-                if (requireNewAccount && existing != null) {
-                    throw new IllegalArgumentException("account already exists for userId=" + userId);
-                }
                 if (existing != null && existing.hasBalance(asset)) {
                     throw new IllegalArgumentException("balance already exists: userId=" + userId + ", asset=" + asset.value());
                 }
@@ -141,7 +90,6 @@ public final class AccountLedger {
                     accounts.put(userId, account);
                 }
                 initialTotalByAsset.put(asset, updatedInitial);
-                systemSettledByAsset.putIfAbsent(asset, new AtomicLong());
                 return account;
             }
         } finally {
@@ -180,33 +128,6 @@ public final class AccountLedger {
     }
 
     /**
-     * 获取旧版单资产已结算总额。
-     *
-     * @return 旧版资产的已结算数量
-     */
-    public long systemSettledAmount() { return systemSettledAmount(LEGACY_ASSET); }
-
-    /**
-     * 获取指定资产的系统已结算总额。
-     *
-     * @param asset 资产标识
-     * @return 已结算数量
-     */
-    public long systemSettledAmount(AssetId asset) {
-        Objects.requireNonNull(asset, "asset");
-        AtomicLong amount = systemSettledByAsset.get(asset);
-        return amount == null ? 0L : amount.get();
-    }
-
-    /**
-     * 获取旧版单资产应守恒的初始总额。
-     *
-     * @return 初始资产总额
-     * @note 初始总额本身由账本监视器保护；若要与当前余额组成一致快照，调用方必须持有全部条带锁，或调用 {@link InvariantChecker#check()}。
-     */
-    public synchronized long initialTotalAsset() { return initialTotalByAsset.getOrDefault(LEGACY_ASSET, 0L); }
-
-    /**
      * 获取各资产应守恒的初始总额快照。
      *
      * @return 资产到初始总额的不可修改映射
@@ -215,16 +136,7 @@ public final class AccountLedger {
     public synchronized Map<AssetId, Long> initialTotalAssets() { return Map.copyOf(initialTotalByAsset); }
 
     /**
-     * 汇总旧版单资产的账户与系统已结算数量。
-     *
-     * @return 当前旧版资产总额
-     * @throws ArithmeticException 当汇总结果溢出时抛出
-     * @note 要获得一致汇总，调用方必须持有全部条带锁；外部一致性检查应调用 {@link InvariantChecker#check()}。
-     */
-    public long currentTotalAsset() { return currentTotalAssets().getOrDefault(LEGACY_ASSET, 0L); }
-
-    /**
-     * 汇总各资产的账户可用、冻结及系统已结算数量。
+     * 汇总各资产的账户可用与冻结数量。
      *
      * @return 资产到当前总额的不可修改映射
      * @throws ArithmeticException 当任一资产汇总结果溢出时抛出
@@ -232,9 +144,6 @@ public final class AccountLedger {
      */
     public Map<AssetId, Long> currentTotalAssets() {
         Map<AssetId, Long> totals = new HashMap<>();
-        for (Map.Entry<AssetId, AtomicLong> entry : systemSettledByAsset.entrySet()) {
-            totals.put(entry.getKey(), entry.getValue().get());
-        }
         for (Account account : accounts.values()) {
             for (Map.Entry<AssetId, AssetBalance> entry : account.balancesSnapshot().entrySet()) {
                 AssetBalance balance = entry.getValue();
@@ -245,14 +154,6 @@ public final class AccountLedger {
         }
         return Map.copyOf(totals);
     }
-
-    /**
-     * 判断旧版单资产总额是否守恒。
-     *
-     * @return 旧版资产总额守恒时为 {@code true}
-     * @note 调用方必须持有全部条带锁，否则并发成交的中间赋值可能产生瞬时假失败；外部一致性检查应调用 {@link InvariantChecker#check()}。
-     */
-    public boolean invariantHolds() { return invariantHolds(LEGACY_ASSET); }
 
     /**
      * 判断指定资产总额是否守恒。
@@ -325,17 +226,6 @@ public final class AccountLedger {
     }
 
     /**
-     * 将用户旧版资产的可用资金转入冻结资金。
-     *
-     * @param userId 用户标识
-     * @param amount 要冻结的正数资产数量
-     * @throws IllegalArgumentException 当金额无效、账户不存在或可用余额不足时抛出
-     * @throws ArithmeticException 当余额计算溢出时抛出
-     * @note 兼容接口委托给内部 LEGACY 资产；调用前必须持有用户条带锁。
-     */
-    public void freezeLocked(long userId, long amount) { freezeLocked(userId, LEGACY_ASSET, amount); }
-
-    /**
      * 为指定资产准备从冻结资金回到可用资金的变更。
      *
      * @param userId 用户标识
@@ -384,17 +274,6 @@ public final class AccountLedger {
     public void unfreezeLocked(long userId, AssetId asset, long amount) {
         commitBalanceLocked(prepareUnfreezeLocked(userId, asset, amount));
     }
-
-    /**
-     * 将用户旧版资产的冻结资金转回可用资金。
-     *
-     * @param userId 用户标识
-     * @param amount 要解冻的正数资产数量
-     * @throws IllegalArgumentException 当金额无效、账户不存在或冻结余额不足时抛出
-     * @throws ArithmeticException 当余额计算溢出时抛出
-     * @note 兼容接口委托给内部 LEGACY 资产；调用前必须持有用户条带锁。
-     */
-    public void unfreezeLocked(long userId, long amount) { unfreezeLocked(userId, LEGACY_ASSET, amount); }
 
     /**
      * 准备买卖双方的基础资产与报价资产交割。
@@ -479,50 +358,12 @@ public final class AccountLedger {
     }
 
     /**
-     * 将用户指定资产的冻结资金结算至系统资金。
+     * 校验业务标识严格为正数。
      *
-     * @param userId 用户标识
-     * @param asset 资产标识
-     * @param amount 要结算的正数资产数量
-     * @throws IllegalArgumentException 当金额无效、账户或余额不存在时抛出
-     * @throws InsufficientBalanceException 当冻结余额不足时抛出
-     * @throws ArithmeticException 当已结算金额累计溢出时抛出
-     * @note 调用前必须持有用户条带锁；CAS 成功后再扣减同一资产冻结余额，保持该资产守恒。
+     * @param value 待校验标识值
+     * @param fieldName 异常消息使用的字段名
+     * @throws IllegalArgumentException 当标识不为正数时抛出
      */
-    public void settleLocked(long userId, AssetId asset, long amount) {
-        long normalized = MoneyMath.requirePositive(amount);
-        AssetId requiredAsset = Objects.requireNonNull(asset, "asset");
-        AssetBalance balance = getRequiredAccount(userId).requiredBalance(requiredAsset);
-        if (balance.frozen() < normalized) {
-            throw new InsufficientBalanceException("frozen balance is insufficient");
-        }
-        long frozenAfter = MoneyMath.checkedSubtract(balance.frozen(), normalized);
-        reserveSystemSettledAmount(requiredAsset, normalized);
-        balance.setFrozen(frozenAfter);
-    }
-
-    /**
-     * 将用户旧版资产的冻结资金结算至系统资金。
-     *
-     * @param userId 用户标识
-     * @param amount 要结算的正数资产数量
-     * @throws IllegalArgumentException 当金额无效、账户不存在或冻结余额不足时抛出
-     * @throws ArithmeticException 当已结算金额累计溢出时抛出
-     * @note 兼容接口委托给内部 LEGACY 资产；调用前必须持有用户条带锁。
-     */
-    public void settleLocked(long userId, long amount) { settleLocked(userId, LEGACY_ASSET, amount); }
-
-    private void reserveSystemSettledAmount(AssetId asset, long amount) {
-        AtomicLong settled = systemSettledByAsset.computeIfAbsent(asset, ignored -> new AtomicLong());
-        while (true) {
-            long current = settled.get();
-            long updated = MoneyMath.checkedAdd(current, amount);
-            if (settled.compareAndSet(current, updated)) {
-                return;
-            }
-        }
-    }
-
     private static void requirePositiveId(long value, String fieldName) {
         if (value <= 0L) {
             throw new IllegalArgumentException(fieldName + " must be positive");

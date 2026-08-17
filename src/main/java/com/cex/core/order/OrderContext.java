@@ -1,54 +1,54 @@
 package com.cex.core.order;
 
 import com.cex.core.risk.RiskDecision;
-import java.util.Collections;
 import java.util.NavigableMap;
 import java.util.Objects;
 import java.util.TreeMap;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * 单个订单的不可变元数据、权威序号、累计成交量与临时旧版事实上下文。
+ * 单个订单的不可变元数据、权威序号与累计成交量上下文。
  *
  * <p>核心能力：保存强类型订单状态并支持有界乱序事件、两阶段成交和撤单提交。</p>
- * <p>线程安全：状态对无锁读者可见；除旧版事实位外的可变字段必须由所属用户锁保护。</p>
- * <p>使用限制：上下文本身不修改资金；旧版事实与副作用适配器将在类型化迁移完成后删除。</p>
+ * <p>线程安全：状态对无锁读者可见；全部可变字段必须由所属用户锁保护。</p>
+ * <p>使用限制：上下文本身不修改资金，资金变更由账本在相同用户锁内提交。</p>
  */
 public final class OrderContext {
 
-    private static final AssetId LEGACY_BASE = new AssetId("LEGACY");
-    private static final AssetId LEGACY_QUOTE = new AssetId("LEGACYQ");
-    private static final TradingPair LEGACY_PAIR = new TradingPair(LEGACY_BASE, LEGACY_QUOTE);
-    private static final NavigableMap<Long, SequencedOrderEvent> LEGACY_PENDING_EVENTS =
-            Collections.emptyNavigableMap();
-
+    /** 订单唯一标识。 */
     private final long orderId;
+    /** 订单归属用户标识。 */
     private final long userId;
-    /** 创建本强类型上下文的完整不可变载荷；旧版适配上下文为 {@code null}。 */
+    /** 创建本上下文的完整不可变提交载荷。 */
     private final OrderSubmission originalSubmission;
+    /** 决定冻结资产的买卖方向。 */
     private final OrderSide side;
+    /** 基础资产与报价资产交易对。 */
     private final TradingPair pair;
+    /** 原始基础资产委托数量。 */
     private final long originalBaseQuantity;
+    /** 原始报价或基础资产冻结量。 */
     private final long originalReservedAmount;
+    /** 上游提供的报价资产风控名义金额。 */
     private final long riskQuoteAmount;
-    private final long amount;
-    private final AtomicInteger factBits = new AtomicInteger();
-
-    private int effectBits;
+    /** 当前可见订单状态。 */
     private volatile OrderStatus status;
+    /** 已成交基础资产累计量。 */
     private long cumulativeBaseFilled;
+    /** 已成交报价资产累计量。 */
     private long cumulativeQuoteFilled;
+    /** 尚未成交的基础资产数量。 */
     private long remainingBaseQuantity;
+    /** 活动订单尚在冻结的资产数量。 */
     private long remainingReservedAmount;
+    /** 最后成功提交的权威订单序号。 */
     private long lastAppliedSequence;
+    /** 按权威序号排列的待处理输入。 */
     private final NavigableMap<Long, SequencedOrderEvent> pendingEvents;
     /** 已登记的稳定撤单请求标识；尚未登记时为零。 */
     private long cancelRequestId;
     /** 撤单请求在本地登记与外部发送之间的用户锁内交付状态。 */
     private CancelRequestDeliveryState cancelRequestDeliveryState =
             CancelRequestDeliveryState.NOT_REGISTERED;
-    private boolean terminalConflictRecorded;
-    private boolean approvalConflictRecorded;
 
     /**
      * 创建强类型订单上下文。
@@ -64,35 +64,11 @@ public final class OrderContext {
         this.originalBaseQuantity = submission.baseQuantity();
         this.originalReservedAmount = submission.reservedAmount();
         this.riskQuoteAmount = submission.riskQuoteAmount();
-        this.amount = submission.reservedAmount();
         this.status = OrderStatus.NEW;
         this.remainingBaseQuantity = submission.baseQuantity();
         this.remainingReservedAmount = submission.reservedAmount();
         this.lastAppliedSequence = submission.orderSequence();
         this.pendingEvents = new TreeMap<>();
-    }
-
-    /**
-     * 创建旧版通用事件适配上下文。
-     *
-     * @param orderId 全局唯一订单ID
-     * @param userId 订单归属用户ID
-     * @param amount 旧版标量订单金额
-     */
-    private OrderContext(long orderId, long userId, long amount) {
-        this.orderId = orderId;
-        this.userId = userId;
-        this.originalSubmission = null;
-        this.side = OrderSide.BUY;
-        this.pair = LEGACY_PAIR;
-        this.originalBaseQuantity = amount;
-        this.originalReservedAmount = amount;
-        this.riskQuoteAmount = amount;
-        this.amount = amount;
-        this.status = OrderStatus.INIT;
-        this.remainingBaseQuantity = amount;
-        this.remainingReservedAmount = amount;
-        this.pendingEvents = LEGACY_PENDING_EVENTS;
     }
 
     /**
@@ -105,20 +81,6 @@ public final class OrderContext {
      */
     public static OrderContext fromSubmission(OrderSubmission submission) {
         return new OrderContext(Objects.requireNonNull(submission, "submission"));
-    }
-
-    /**
-     * 依据首个旧版事件建立订单上下文。
-     *
-     * @param firstEvent 首次到达的旧版订单事件，不能为空
-     * @return 持有该事件元数据的新订单上下文
-     * @throws NullPointerException 当事件为 {@code null} 时抛出
-     * @deprecated 仅供旧版 {@link OrderEngine} 迁移期使用；类型化入口完成后删除
-     */
-    @Deprecated(since = "typed-order-state", forRemoval = true)
-    public static OrderContext fromFirstEvent(OrderEvent firstEvent) {
-        Objects.requireNonNull(firstEvent, "firstEvent");
-        return new OrderContext(firstEvent.orderId(), firstEvent.userId(), firstEvent.amount());
     }
 
     /** @return 不可变订单唯一标识 */
@@ -178,13 +140,6 @@ public final class OrderContext {
      */
     public long cancelRequestId() { return cancelRequestId; }
 
-    /**
-     * @return 旧版事件携带的金额
-     * @deprecated 仅供旧版 {@link OrderEngine} 迁移期使用
-     */
-    @Deprecated(since = "typed-order-state", forRemoval = true)
-    public long amount() { return amount; }
-
     /** @return 当前可见订单状态 */
     public OrderStatus status() { return status; }
 
@@ -193,12 +148,12 @@ public final class OrderContext {
      *
      * @param submission 候选订单提交，不能为空
      * @throws NullPointerException 当提交为 {@code null} 时抛出
-     * @throws OrderMetadataMismatchException 当上下文来自旧版事件或任一提交组件不一致时抛出
+     * @throws OrderMetadataMismatchException 当任一提交组件不一致时抛出
      * @note 比较使用不可变原始提交，不依赖会随成交推进的剩余量、状态或最后序号。
      */
     void validateSubmission(OrderSubmission submission) {
         Objects.requireNonNull(submission, "submission");
-        if (originalSubmission == null || !originalSubmission.equals(submission)) {
+        if (!originalSubmission.equals(submission)) {
             throw new OrderMetadataMismatchException(
                     "order submission metadata mismatch for orderId=" + orderId);
         }
@@ -214,7 +169,7 @@ public final class OrderContext {
      */
     void classifyInitialRiskLocked(RiskDecision riskDecision) {
         Objects.requireNonNull(riskDecision, "riskDecision");
-        if (originalSubmission == null || status != OrderStatus.NEW) {
+        if (status != OrderStatus.NEW) {
             throw new IllegalStateException("initial risk classification requires a typed NEW order");
         }
         status = riskDecision == RiskDecision.HOLD
@@ -229,35 +184,11 @@ public final class OrderContext {
      * @note 调用方必须持有用户锁；拒绝审批的撤单请求生成由后续风险集成任务负责。
      */
     boolean approveRiskHoldLocked() {
-        if (originalSubmission != null && status == OrderStatus.RISK_HOLD) {
+        if (status == OrderStatus.RISK_HOLD) {
             status = OrderStatus.NEW;
             return true;
         }
         return false;
-    }
-
-    /**
-     * 为旧版订单适配器建立强类型审批输入，强类型订单直接返回原始提交。
-     *
-     * @param submittedAtMillis 旧版适配提交使用的非负毫秒时间戳
-     * @return 可交给强类型审批服务的不可变订单提交
-     * @deprecated 仅供旧版 {@link OrderEngine#process(OrderEvent)} 迁移期使用
-     */
-    @Deprecated(since = "typed-approval", forRemoval = true)
-    OrderSubmission approvalSubmission(long submittedAtMillis) {
-        if (originalSubmission != null) {
-            return originalSubmission;
-        }
-        return new OrderSubmission(
-                orderId,
-                userId,
-                side,
-                pair,
-                originalBaseQuantity,
-                originalReservedAmount,
-                riskQuoteAmount,
-                1L,
-                submittedAtMillis);
     }
 
     /**
@@ -266,7 +197,7 @@ public final class OrderContext {
      * @return 同一暂挂订单始终相等且请求 ID 相同的撤单请求
      * @throws IllegalStateException 当订单不是强类型风控暂挂单或由该请求进入的等待撤单状态时抛出
      * @note 调用方必须持有用户锁；请求 ID 由订单 ID 双射派生，请求时间固定取原始提交时间，发送失败后的重试因此复用完全相同的载荷。
-     * @note 不在每个订单上下文保存额外请求引用，避免 256MB 堆下旧版大规模兼容测试为从不触发的风险撤单支付常驻内存。
+     * @note 不在每个订单上下文保存额外请求引用，避免 256MB 堆下大规模性能测试为从不触发的风险撤单支付常驻内存。
      */
     CancelRequest riskCancelRequestLocked() {
         long derivedRequestId = derivedRiskCancelRequestId();
@@ -286,8 +217,7 @@ public final class OrderContext {
      * @note 调用方必须持有用户锁。
      */
     boolean hasRiskCancelRequestLocked() {
-        return originalSubmission != null
-                && cancelRequestId != 0L
+        return cancelRequestId != 0L
                 && cancelRequestId == derivedRiskCancelRequestId();
     }
 
@@ -295,37 +225,31 @@ public final class OrderContext {
      * 返回订单标识双射派生的正数风险撤单请求标识。
      *
      * @return 与订单一一对应的正数风险撤单请求 ID
-     * @throws IllegalStateException 当上下文不是强类型订单时抛出
      */
     private long derivedRiskCancelRequestId() {
-        if (originalSubmission == null) {
-            throw new IllegalStateException("risk cancellation requires a typed order");
-        }
         return Long.MAX_VALUE - orderId + 1L;
     }
 
     /**
-     * 在迁移期旧版引擎的用户锁内更新兼容状态。
+     * 查询指定权威序号尚未消费的输入。
      *
-     * @param status 目标旧版状态，不能为空
-     * @throws NullPointerException 当目标状态为 {@code null} 时抛出
-     * @throws IllegalStateException 当强类型上下文尝试绕过订单状态机时抛出
-     * @deprecated 仅供旧版 {@link OrderEngine} 迁移期使用；强类型上下文必须通过状态机变更
-     * @note 方法限制在订单包内；volatile 写只提供可见性，调用方仍须持有所属用户锁。
+     * @param sequence 权威订单序号
+     * @return 已登记输入；不存在时为 {@code null}
+     * @note 调用方必须持有订单所属用户锁。
      */
-    @Deprecated(since = "typed-order-state", forRemoval = true)
-    void setLegacyStatusLocked(OrderStatus status) {
-        if (pendingEvents != LEGACY_PENDING_EVENTS) {
-            throw new IllegalStateException("typed order status must use OrderStateMachine");
-        }
-        this.status = Objects.requireNonNull(status, "status");
-    }
-
     SequencedOrderEvent pendingEventLocked(long sequence) {
         return pendingEvents.get(sequence);
     }
 
-    int pendingEventCountLocked() { return pendingEvents.size(); }
+    /**
+     * 返回尚未消费的权威输入数量。
+     *
+     * @return 待处理输入数量
+     * @note 调用方必须持有订单所属用户锁。
+     */
+    int pendingEventCountLocked() {
+        return pendingEvents.size();
+    }
 
     /**
      * 提交已预计算的事件登记变更。
@@ -340,6 +264,12 @@ public final class OrderContext {
         }
     }
 
+    /**
+     * 提交已完成全部校验的成交状态变更。
+     *
+     * @param mutation 预计算成交变更
+     * @note 调用方必须持续持有用户锁；方法仅赋值并移除已消费序号，不执行算术或资金操作。
+     */
     void commitFillLocked(OrderFillMutation mutation) {
         cumulativeBaseFilled = mutation.cumulativeBaseFilled();
         cumulativeQuoteFilled = mutation.cumulativeQuoteFilled();
@@ -350,6 +280,12 @@ public final class OrderContext {
         status = mutation.status();
     }
 
+    /**
+     * 提交已完成资金解冻准备的撤单状态变更。
+     *
+     * @param mutation 预计算撤单变更
+     * @note 调用方必须持续持有用户锁，并先提交对应账本解冻变更。
+     */
     void commitCancelLocked(OrderCancelMutation mutation) {
         remainingReservedAmount = 0L;
         lastAppliedSequence = mutation.orderSequence();
@@ -357,11 +293,23 @@ public final class OrderContext {
         status = mutation.status();
     }
 
+    /**
+     * 提交已预检的权威序号消费。
+     *
+     * @param orderSequence 要提交并从缓存移除的序号
+     * @note 用于确定拒绝成交的双边同步推进，调用方必须持有用户锁。
+     */
     void commitPreparedSequenceLocked(long orderSequence) {
         lastAppliedSequence = orderSequence;
         pendingEvents.remove(orderSequence);
     }
 
+    /**
+     * 首次登记撤单请求并进入等待确认状态。
+     *
+     * @param requestId 稳定且严格为正的撤单请求标识
+     * @note 调用方必须持有用户锁；本方法不解冻资产。
+     */
     void startCancelLocked(long requestId) {
         cancelRequestId = requestId;
         cancelRequestDeliveryState = CancelRequestDeliveryState.REGISTERED;
@@ -440,119 +388,6 @@ public final class OrderContext {
     }
 
     /**
-     * 校验后续旧版事件未改变订单的身份和金额元数据。
-     *
-     * @param event 待校验事件，不能为空
-     * @throws NullPointerException 当事件为 {@code null} 时抛出
-     * @throws OrderMetadataMismatchException 当订单 ID、用户 ID 或金额不一致时抛出
-     * @deprecated 仅供旧版 {@link OrderEngine} 迁移期使用
-     */
-    @Deprecated(since = "typed-order-state", forRemoval = true)
-    public void validateMetadata(OrderEvent event) {
-        Objects.requireNonNull(event, "event");
-        if (orderId != event.orderId() || userId != event.userId() || amount != event.amount()) {
-            throw new OrderMetadataMismatchException(
-                    "order metadata mismatch for orderId=" + orderId);
-        }
-    }
-
-    /**
-     * 原子登记旧版事件对应的事实位。
-     *
-     * @param eventType 待登记的事件类型，不能为空
-     * @return 首次成功置位时为 {@link FactRegistrationResult#NEW}，否则为重复结果
-     * @throws NullPointerException 当事件类型为 {@code null} 时抛出
-     * @deprecated 仅供旧版 {@link OrderEngine} 迁移期使用
-     */
-    @Deprecated(since = "typed-order-state", forRemoval = true)
-    public FactRegistrationResult registerFact(OrderEventType eventType) {
-        int mask = OrderFact.fromEventType(Objects.requireNonNull(eventType, "eventType")).mask();
-        while (true) {
-            int current = factBits.get();
-            if ((current & mask) != 0) {
-                return FactRegistrationResult.DUPLICATE;
-            }
-            int updated = current | mask;
-            if (factBits.compareAndSet(current, updated)) {
-                return FactRegistrationResult.NEW;
-            }
-        }
-    }
-
-    /**
-     * 判断某类旧版事件事实是否已缓存。
-     *
-     * @param fact 待查询事实，不能为空
-     * @return 已登记该事实时为 {@code true}
-     * @throws NullPointerException 当事实为 {@code null} 时抛出
-     * @deprecated 仅供旧版 {@link OrderEngine} 迁移期使用
-     */
-    @Deprecated(since = "typed-order-state", forRemoval = true)
-    public boolean hasFact(OrderFact fact) {
-        return (factBits.get() & Objects.requireNonNull(fact, "fact").mask()) != 0;
-    }
-
-    /**
-     * 在用户锁内判断旧版副作用是否已提交。
-     *
-     * @param effect 待查询副作用，不能为空
-     * @return 副作用已成功提交时为 {@code true}
-     * @throws NullPointerException 当副作用为 {@code null} 时抛出
-     * @deprecated 仅供旧版 {@link OrderEngine} 迁移期使用
-     */
-    @Deprecated(since = "typed-order-state", forRemoval = true)
-    public boolean hasEffect(OrderEffect effect) {
-        return (effectBits & Objects.requireNonNull(effect, "effect").mask()) != 0;
-    }
-
-    /**
-     * 在用户锁内执行一次旧版副作用，并在成功后提交幂等标记。
-     *
-     * @param effect 待提交的副作用标记，不能为空
-     * @param operation 实际副作用操作，不能为空
-     * @return 本次执行并提交标记时为 {@code true}；已提交时为 {@code false}
-     * @throws NullPointerException 当副作用或操作为 {@code null} 时抛出
-     * @deprecated 仅供旧版 {@link OrderEngine} 迁移期使用
-     */
-    @Deprecated(since = "typed-order-state", forRemoval = true)
-    public boolean applyEffectLocked(OrderEffect effect, LockedEffectOperation operation) {
-        Objects.requireNonNull(effect, "effect");
-        Objects.requireNonNull(operation, "operation");
-        if (hasEffect(effect)) {
-            return false;
-        }
-        operation.run();
-        effectBits |= effect.mask();
-        return true;
-    }
-
-    /**
-     * @return 首次标记旧版终态冲突时为 {@code true}，否则为 {@code false}
-     * @deprecated 仅供旧版 {@link OrderEngine} 迁移期使用
-     */
-    @Deprecated(since = "typed-order-state", forRemoval = true)
-    public boolean markTerminalConflictLocked() {
-        if (terminalConflictRecorded) {
-            return false;
-        }
-        terminalConflictRecorded = true;
-        return true;
-    }
-
-    /**
-     * @return 首次标记旧版审批冲突时为 {@code true}，否则为 {@code false}
-     * @deprecated 仅供旧版 {@link OrderEngine} 迁移期使用
-     */
-    @Deprecated(since = "typed-order-state", forRemoval = true)
-    public boolean markApprovalConflictLocked() {
-        if (approvalConflictRecorded) {
-            return false;
-        }
-        approvalConflictRecorded = true;
-        return true;
-    }
-
-    /**
      * 单个撤单请求从本地登记到外部发送完成的互斥状态。
      *
      * <p>线程安全：字段只在订单所属用户锁内读取和迁移。</p>
@@ -569,18 +404,4 @@ public final class OrderContext {
         SENT
     }
 
-    /**
-     * 由调用方在持有用户锁时执行的旧版副作用操作。
-     *
-     * <p>线程安全：实现由调用方的同一用户锁保护。</p>
-     * <p>使用限制：异常时对应旧版副作用位不会提交。</p>
-     *
-     * @deprecated 仅供旧版 {@link OrderEngine} 迁移期使用
-     */
-    @Deprecated(since = "typed-order-state", forRemoval = true)
-    @FunctionalInterface
-    public interface LockedEffectOperation {
-        /** 执行一次副作用操作。 */
-        void run();
-    }
 }

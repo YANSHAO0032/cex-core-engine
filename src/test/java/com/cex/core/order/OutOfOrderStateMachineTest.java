@@ -1,176 +1,228 @@
 package com.cex.core.order;
 
-import com.cex.core.account.Account;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
+
 import com.cex.core.account.AccountLedger;
+import com.cex.core.account.BalanceSnapshot;
 import com.cex.core.concurrent.StripedLockManager;
-import com.cex.core.risk.ApprovalDecision;
-import com.cex.core.risk.ApprovalService;
-import com.cex.core.risk.RiskPipeline;
+import com.cex.core.trade.TradeExecutionState;
+import com.cex.core.trade.TradeResult;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
-import java.util.stream.IntStream;
 import org.junit.jupiter.api.Test;
 
-import static org.junit.jupiter.api.Assertions.*;
-
 /**
- * 验证订单状态机在乱序、重放、并发和元数据冲突下的收敛行为。
+ * 验证强类型订单状态机在创建前事件、重放、并发和序号冲突下的收敛行为。
  *
- * <p>核心能力：覆盖滞后事件登记、创建后置补偿、重复事件幂等和元数据冲突拦截。</p>
- * <p>线程安全：并发用例使用同步门闩协调重放，验证 CAS 事实登记与用户分片锁下的资金操作收敛。</p>
- * <p>使用限制：仅覆盖内存引擎的代表性乱序组合，不模拟跨节点网络分区或持久化恢复。</p>
+ * <p>核心能力：覆盖成交存储重试、创建前撤单确认转移、成交幂等和未来序号冲突拦截。</p>
+ * <p>线程安全：并发用例使用同步门闩协调重放，真实资金变更由固定顺序双用户锁保护。</p>
+ * <p>使用限制：仅覆盖内存引擎的代表性乱序组合，不模拟持久化恢复。</p>
  */
 class OutOfOrderStateMachineTest {
-    /** 场景：成交先于创建到达时，创建事实到达后应冻结并结算为成交态。 */
-    @Test
-    void filledBeforeCreateConvergesToFilled() {
-        Fixture fixture = new Fixture(event -> ApprovalDecision.PASS);
-        try {
-            fixture.engine.process(event(9L, 1L, 100L, OrderEventType.MATCH_FILLED));
-            fixture.engine.process(event(9L, 1L, 100L, OrderEventType.ORDER_CREATED));
+    /** 测试基础资产。 */
+    private static final AssetId BTC = new AssetId("BTC");
+    /** 测试报价资产。 */
+    private static final AssetId USDT = new AssetId("USDT");
+    /** 测试交易对。 */
+    private static final TradingPair BTC_USDT = new TradingPair(BTC, USDT);
+    /** 买方用户标识。 */
+    private static final long BUYER_ID = 1L;
+    /** 卖方用户标识。 */
+    private static final long SELLER_ID = 2L;
+    /** 买单标识。 */
+    private static final long BUY_ORDER_ID = 9L;
+    /** 卖单标识。 */
+    private static final long SELL_ORDER_ID = 10L;
 
-            assertEquals(OrderStatus.FILLED, fixture.engine.order(9L).status());
-            assertEquals(900L, fixture.account().available());
-            assertEquals(0L, fixture.account().frozen());
-            assertEquals(100L, fixture.ledger.systemSettledAmount());
-            assertEquals(1L, fixture.engine.metrics().freezeCount());
-            assertEquals(1L, fixture.engine.metrics().settleCount());
-        } finally {
-            fixture.close();
+    /** 场景：成交早于双方创建到达时，应在双方发布后自动结算。 */
+    @Test
+    void tradeBeforeCreateConvergesToFilled() {
+        try (Fixture fixture = new Fixture()) {
+            TradeExecution execution = fixture.fullExecution(1L, 2L, 2L);
+
+            assertEquals(TradeResult.PENDING, fixture.engine.onTrade(execution));
+            fixture.engine.submit(fixture.buySubmission());
+            assertEquals(TradeExecutionState.PENDING, fixture.engine.trade(1L).state());
+            fixture.engine.submit(fixture.sellSubmission());
+
+            assertEquals(OrderStatus.FILLED, fixture.buyOrder().status());
+            assertEquals(OrderStatus.FILLED, fixture.sellOrder().status());
+            assertEquals(new BalanceSnapshot(0L, 0L),
+                    fixture.ledger.balance(BUYER_ID, USDT));
+            assertEquals(1L, fixture.engine.metrics().settledTradeCount());
+            assertTrue(fixture.ledger.allAssetInvariantsHold());
         }
     }
 
-    /** 场景：取消先于创建到达时，创建事实到达后应冻结、解冻并收敛为取消态。 */
+    /** 场景：撤单确认先于创建到达时，应在同请求登记后解冻并取消。 */
     @Test
-    void cancelledBeforeCreateConvergesToCanceled() {
-        Fixture fixture = new Fixture(event -> ApprovalDecision.PASS);
-        try {
-            fixture.engine.process(event(10L, 1L, 100L, OrderEventType.ORDER_CANCELLED));
-            fixture.engine.process(event(10L, 1L, 100L, OrderEventType.ORDER_CREATED));
+    void cancelConfirmationBeforeCreateConvergesToCanceled() {
+        try (Fixture fixture = new Fixture()) {
+            fixture.engine.onCancelConfirmed(
+                    new CancelConfirmation(90L, BUY_ORDER_ID, 2L, 1L));
+            fixture.engine.submit(fixture.buySubmission());
 
-            assertEquals(OrderStatus.CANCELED, fixture.engine.order(10L).status());
-            assertEquals(1000L, fixture.account().available());
-            assertEquals(0L, fixture.account().frozen());
-            assertEquals(1L, fixture.engine.metrics().freezeCount());
-            assertEquals(1L, fixture.engine.metrics().unfreezeCount());
-        } finally {
-            fixture.close();
+            assertEquals(CancelRequestResult.SUBMITTED,
+                    fixture.engine.requestCancel(
+                            new CancelRequest(90L, BUY_ORDER_ID, 2L)));
+
+            assertEquals(OrderStatus.CANCELED, fixture.buyOrder().status());
+            assertEquals(new BalanceSnapshot(1_000L, 0L),
+                    fixture.ledger.balance(BUYER_ID, USDT));
+            assertTrue(fixture.ledger.allAssetInvariantsHold());
         }
     }
 
-    /** 场景：大量重复的创建和成交事件不得重复执行资金副作用。 */
+    /** 场景：大量重复成交和重复创建不得重复结算或冻结。 */
     @Test
-    void duplicateEventsStillReconcileExactlyOnce() {
-        Fixture fixture = new Fixture(event -> ApprovalDecision.PASS);
-        try {
-            IntStream.range(0, 20).forEach(i -> fixture.engine.process(
-                    event(11L, 1L, 100L, OrderEventType.MATCH_FILLED)));
-            IntStream.range(0, 10).forEach(i -> fixture.engine.process(
-                    event(11L, 1L, 100L, OrderEventType.ORDER_CREATED)));
+    void duplicateInputsStillReconcileExactlyOnce() {
+        try (Fixture fixture = new Fixture()) {
+            TradeExecution execution = fixture.fullExecution(1L, 2L, 2L);
+            for (int i = 0; i < 20; i++) {
+                fixture.engine.onTrade(execution);
+            }
+            for (int i = 0; i < 10; i++) {
+                fixture.engine.submit(fixture.buySubmission());
+                fixture.engine.submit(fixture.sellSubmission());
+            }
 
-            assertEquals(OrderStatus.FILLED, fixture.engine.order(11L).status());
-            assertEquals(1L, fixture.engine.metrics().freezeCount());
-            assertEquals(1L, fixture.engine.metrics().settleCount());
-            assertTrue(fixture.engine.metrics().duplicateEvents() >= 28L);
-        } finally {
-            fixture.close();
+            assertEquals(OrderStatus.FILLED, fixture.buyOrder().status());
+            assertEquals(1L, fixture.engine.metrics().settledTradeCount());
+            assertEquals(0, fixture.engine.pendingTradeCount());
+            assertTrue(fixture.engine.metrics().duplicateTradeCount() >= 19L);
+            assertEquals(0, fixture.engine.metrics().pendingTradeCount());
+            assertTrue(fixture.ledger.allAssetInvariantsHold());
         }
     }
 
     /**
-     * 场景：同订单的并发重放与线程中断不应妨碍最终收敛。
+     * 场景：相同成交的并发重放与调用线程中断不应妨碍最终收敛。
      *
-     * @throws Exception 并发线程等待或测试资源关闭失败时抛出
+     * @throws Exception 并发线程等待失败时抛出
      */
     @Test
-    void sameOrderConcurrentDuplicatesAndInterruptComplete() throws Exception {
-        Fixture fixture = new Fixture(event -> ApprovalDecision.PASS);
-        try {
+    void concurrentDuplicatesAndInterruptComplete() throws Exception {
+        try (Fixture fixture = new Fixture()) {
+            fixture.submitBoth();
             Thread.currentThread().interrupt();
-            fixture.engine.process(event(12L, 1L, 100L, OrderEventType.MATCH_FILLED));
-            fixture.engine.process(event(12L, 1L, 100L, OrderEventType.ORDER_CREATED));
+            TradeExecution execution = fixture.fullExecution(1L, 2L, 2L);
+            fixture.engine.onTrade(execution);
             assertTrue(Thread.interrupted());
+
             CountDownLatch start = new CountDownLatch(1);
             Thread[] threads = new Thread[32];
             for (int i = 0; i < threads.length; i++) {
                 threads[i] = new Thread(() -> {
                     try {
                         start.await();
-                        fixture.engine.process(event(12L, 1L, 100L, OrderEventType.MATCH_FILLED));
-                        fixture.engine.process(event(12L, 1L, 100L, OrderEventType.ORDER_CREATED));
-                    } catch (InterruptedException e) {
+                        fixture.engine.onTrade(execution);
+                    } catch (InterruptedException interrupted) {
                         Thread.currentThread().interrupt();
-                        fail(e);
+                        fail(interrupted);
                     }
                 });
                 threads[i].start();
             }
             start.countDown();
             for (Thread thread : threads) {
-                thread.join(5000L);
+                thread.join(5_000L);
                 assertFalse(thread.isAlive());
             }
-            assertEquals(OrderStatus.FILLED, fixture.engine.order(12L).status());
-            assertEquals(1L, fixture.engine.metrics().settleCount());
+
+            assertEquals(OrderStatus.FILLED, fixture.buyOrder().status());
+            assertEquals(1L, fixture.engine.metrics().settledTradeCount());
+            assertTrue(fixture.ledger.allAssetInvariantsHold());
         } finally {
             Thread.interrupted();
-            fixture.close();
         }
     }
 
-    /** 场景：相同订单 ID 的不一致用户元数据必须被拒绝并计数。 */
+    /** 场景：相同订单未来序号绑定不同权威载荷时必须拒绝。 */
     @Test
-    void metadataMismatchIsRejected() {
-        Fixture fixture = new Fixture(event -> ApprovalDecision.PASS);
-        try {
-            fixture.engine.process(event(13L, 1L, 100L, OrderEventType.ORDER_CREATED));
-            assertThrows(OrderMetadataMismatchException.class,
-                    () -> fixture.engine.process(event(13L, 2L, 100L, OrderEventType.MATCH_FILLED)));
-            assertEquals(1L, fixture.engine.metrics().metadataConflictEvents());
-        } finally {
-            fixture.close();
+    void sequencePayloadConflictIsRejected() {
+        try (Fixture fixture = new Fixture()) {
+            fixture.submitBoth();
+            assertEquals(TradeResult.PENDING,
+                    fixture.engine.onTrade(fixture.fullExecution(1L, 3L, 3L)));
+
+            assertThrows(TradeSequenceConflictException.class,
+                    () -> fixture.engine.onCancelConfirmed(
+                            new CancelConfirmation(90L, BUY_ORDER_ID, 3L, 3L)));
+            assertEquals(0L, fixture.buyOrder().cumulativeBaseFilled());
+            assertTrue(fixture.engine.metrics().sequenceGapCount() > 0L);
+            assertTrue(fixture.ledger.allAssetInvariantsHold());
         }
     }
 
-    /**
-     * 构造指定元数据的测试事件。
-     *
-     * @param orderId 订单 ID
-     * @param userId 用户 ID
-     * @param amount 订单金额
-     * @param type 事件类型
-     * @return 测试订单事件
-     */
-    private static OrderEvent event(long orderId, long userId, long amount, OrderEventType type) {
-        return new OrderEvent(orderId, userId, amount, 1L, type);
-    }
-
-    /** 乱序状态机测试的账户、审批服务和订单引擎夹具。 */
+    /** 保存乱序状态机测试使用的真实账本与引擎。 */
     private static final class Fixture implements AutoCloseable {
-        /** 使用的账户账本。 */
-        private final AccountLedger ledger = new AccountLedger(new StripedLockManager());
-        /** 使用的异步审批服务。 */
-        private final ApprovalService approvals = new ApprovalService(1, 16);
-        /** 被测订单引擎。 */
+        /** 多资产账户账本。 */
+        private final AccountLedger ledger =
+                new AccountLedger(new StripedLockManager(16));
+        /** 被测强类型订单引擎。 */
         private final OrderEngine engine;
 
-        /**
-         * 创建并初始化测试账户和引擎。
-         *
-         * @param policy 测试审批策略
-         */
-        private Fixture(com.cex.core.risk.ApprovalPolicy policy) {
-            ledger.createAccount(1L, 1000L);
-            engine = new OrderEngine(ledger, new RiskPipeline(), new com.cex.core.risk.ManualClock(1L), approvals, policy);
+        /** 创建买卖双方资产与引擎。 */
+        private Fixture() {
+            ledger.createBalance(BUYER_ID, BTC, 0L);
+            ledger.createBalance(BUYER_ID, USDT, 1_000L);
+            ledger.createBalance(SELLER_ID, BTC, 10L);
+            ledger.createBalance(SELLER_ID, USDT, 0L);
+            engine = new OrderEngine(ledger);
+        }
+
+        /** 提交固定买卖双方订单。 */
+        private void submitBoth() {
+            engine.submit(buySubmission());
+            engine.submit(sellSubmission());
+        }
+
+        /** @return 固定买单提交 */
+        private OrderSubmission buySubmission() {
+            return new OrderSubmission(
+                    BUY_ORDER_ID, BUYER_ID, OrderSide.BUY, BTC_USDT,
+                    10L, 1_000L, 1_000L, 1L, 1L);
+        }
+
+        /** @return 固定卖单提交 */
+        private OrderSubmission sellSubmission() {
+            return new OrderSubmission(
+                    SELL_ORDER_ID, SELLER_ID, OrderSide.SELL, BTC_USDT,
+                    10L, 10L, 1_000L, 1L, 1L);
         }
 
         /**
-         * 返回测试用户账户。
+         * 构造固定全量成交。
          *
-         * @return 用户 1 的账户
+         * @param tradeId 成交标识
+         * @param buySequence 买单权威序号
+         * @param sellSequence 卖单权威序号
+         * @return 全量成交输入
          */
-        private Account account() { return ledger.getRequiredAccount(1L); }
-        /** 关闭夹具创建的引擎资源。 */
-        @Override public void close() { engine.close(); }
+        private TradeExecution fullExecution(
+                long tradeId, long buySequence, long sellSequence) {
+            return new TradeExecution(
+                    tradeId, BUY_ORDER_ID, SELL_ORDER_ID, BTC_USDT,
+                    10L, 1_000L, buySequence, sellSequence, 2L);
+        }
+
+        /** @return 当前买单上下文 */
+        private OrderContext buyOrder() {
+            return engine.order(BUY_ORDER_ID);
+        }
+
+        /** @return 当前卖单上下文 */
+        private OrderContext sellOrder() {
+            return engine.order(SELL_ORDER_ID);
+        }
+
+        /** 关闭引擎持有的审批线程资源。 */
+        @Override
+        public void close() {
+            engine.close();
+        }
     }
 }

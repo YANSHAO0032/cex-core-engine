@@ -17,6 +17,7 @@ import com.cex.core.risk.TradeWindow;
 import com.cex.core.trade.TradeExecutionRecord;
 import com.cex.core.trade.TradeExecutionState;
 import com.cex.core.trade.TradeExecutionStore;
+import com.cex.core.trade.TradeMetadataMismatchException;
 import com.cex.core.trade.TradeResult;
 import com.cex.core.trade.TradeSettlementCoordinator;
 import java.util.ArrayDeque;
@@ -27,11 +28,11 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * 强类型订单、双边成交和兼容事实事件的并发入口门面。
+ * 强类型订单与双边成交的并发入口门面。
  *
  * <p>核心能力：冻结方向对应资产，按双方权威序号委托唯一成交协调器，并将撤单确认与剩余资金原子收敛。</p>
  * <p>线程安全：订单索引与事件存储并发发布；单订单变更由用户条带锁保护，双边成交由协调器按升序条带获取双方锁。</p>
- * <p>使用限制：不实现撮合、价格计算或持久化；旧版 {@link #process(OrderEvent)} 保留至类型化迁移任务完成。</p>
+ * <p>使用限制：不实现撮合、价格计算或持久化，只消费外部权威强类型输入。</p>
  *
  * @note BUY 冻结报价资产、SELL 冻结基础资产；所有成交数量均直接采用外部权威整数。
  * @note 任何可能获取双方锁的协调器调用都发生在单用户锁外，避免形成高条带到低条带的锁序反转。
@@ -103,11 +104,11 @@ public final class OrderEngine implements AutoCloseable {
      * @param ledger 账户账本，不能为空
      * @param riskPipeline 风控流水线，不能为空
      * @param clock 时间来源，不能为空
-     * @param approvalService 旧版异步审批服务，不能为空
-     * @param approvalPolicy 旧版审批决策策略，不能为空
+     * @param approvalService 异步审批服务，不能为空
+     * @param approvalPolicy 审批决策策略，不能为空
      * @param cancelRequestSink 强类型撤单请求发送边界，不能为空
      * @throws NullPointerException 当任一依赖为 {@code null} 时抛出
-     * @note 旧版审批依赖保留至兼容路径迁移完成；强类型订单不会构造通用 {@link OrderEvent} 审批任务。
+     * @note 审批服务仅接收 {@link OrderSubmission} 并回流强类型 {@link ApprovalResult}。
      */
     public OrderEngine(AccountLedger ledger, RiskPipeline riskPipeline, Clock clock,
                        ApprovalService approvalService, ApprovalPolicy approvalPolicy,
@@ -148,12 +149,7 @@ public final class OrderEngine implements AutoCloseable {
         try {
             context = orders.compute(submission.orderId(), (orderId, existing) -> {
                 if (existing != null) {
-                    try {
-                        existing.validateSubmission(submission);
-                    } catch (OrderMetadataMismatchException mismatch) {
-                        metrics.metadataConflict();
-                        throw mismatch;
-                    }
+                    existing.validateSubmission(submission);
                     return existing;
                 }
 
@@ -162,9 +158,7 @@ public final class OrderEngine implements AutoCloseable {
                 ledger.freezeLocked(
                         submission.userId(), reservedAsset(submission), submission.reservedAmount());
                 candidate.classifyInitialRiskLocked(decision);
-                metrics.freeze();
                 if (decision == RiskDecision.HOLD) {
-                    metrics.riskHold();
                     approvalRequired[0] = true;
                 }
                 created[0] = true;
@@ -178,7 +172,6 @@ public final class OrderEngine implements AutoCloseable {
         if (created[0] && approvalRequired[0]) {
             // 审批队列背压与回调均在用户资金锁外发生，避免外部逻辑延长冻结临界区。
             approvalService.submit(submission, approvalPolicy, this::onApproval);
-            metrics.approvalScheduled();
         }
         drainFromOrders(submission.orderId());
         return context;
@@ -197,16 +190,30 @@ public final class OrderEngine implements AutoCloseable {
      */
     public TradeResult onTrade(TradeExecution execution) {
         Objects.requireNonNull(execution, "execution");
-        TradeExecutionRecord record = tradeStore.register(execution);
-        if (record.state().isTerminal()) {
-            return TradeResult.DUPLICATE;
-        }
+        boolean knownTrade = tradeStore.record(execution.tradeId()) != null;
+        try {
+            TradeExecutionRecord record = tradeStore.register(execution);
+            if (knownTrade) {
+                metrics.duplicateTrade();
+            }
+            if (record.state().isTerminal()) {
+                return TradeResult.DUPLICATE;
+            }
 
-        TradeResult result = attemptStoredTrade(record);
-        if (isBilateralTerminalProgress(result)) {
-            drainFromOrders(execution.buyOrderId(), execution.sellOrderId());
+            TradeResult result = attemptStoredTrade(record);
+            if (result == TradeResult.PENDING && hasVisibleSequenceGap(execution)) {
+                metrics.sequenceGap();
+            }
+            if (isBilateralTerminalProgress(result)) {
+                drainFromOrders(execution.buyOrderId(), execution.sellOrderId());
+            }
+            return result;
+        } catch (TradeMetadataMismatchException conflict) {
+            metrics.tradeMetadataConflict();
+            throw conflict;
+        } finally {
+            metrics.pendingTradeCount(tradeStore.pendingCount());
         }
-        return result;
     }
 
     /**
@@ -282,7 +289,6 @@ public final class OrderEngine implements AutoCloseable {
                 userLock.unlock();
             }
             if (approved) {
-                metrics.approvalPass();
                 drainFromOrders(result.orderId());
             }
             return;
@@ -303,9 +309,6 @@ public final class OrderEngine implements AutoCloseable {
             attempt = prepareCancelRequestLocked(context, riskCancelRequest);
         } finally {
             userLock.unlock();
-        }
-        if (attempt.result == CancelRequestResult.SUBMITTED) {
-            metrics.approvalReject();
         }
         deliverCancelRequest(context, riskCancelRequest, attempt);
     }
@@ -336,6 +339,7 @@ public final class OrderEngine implements AutoCloseable {
         } else {
             orderStateMachine.requestCancelLocked(context, request);
             result = CancelRequestResult.SUBMITTED;
+            metrics.pendingCancel();
         }
         boolean deliveryClaimed = context.tryStartCancelRequestDeliveryLocked(
                 request.cancelRequestId());
@@ -416,28 +420,6 @@ public final class OrderEngine implements AutoCloseable {
     }
 
     /**
-     * 将强类型审批结果适配为旧版事实事件。
-     *
-     * @param submission 旧版上下文生成的强类型审批提交
-     * @param approval 强类型审批结果
-     * @return 保留旧入口用户和金额元数据的审批事实事件
-     * @deprecated 仅供 {@link #process(OrderEvent)} 迁移期兼容；任务 8 删除
-     */
-    @Deprecated(since = "typed-approval", forRemoval = true)
-    private static OrderEvent legacyApprovalEvent(
-            OrderSubmission submission, ApprovalResult approval) {
-        OrderEventType type = approval.decision() == ApprovalDecision.PASS
-                ? OrderEventType.APPROVAL_PASSED
-                : OrderEventType.APPROVAL_REJECTED;
-        return new OrderEvent(
-                submission.orderId(),
-                submission.userId(),
-                submission.reservedAmount(),
-                approval.decidedAtMillis(),
-                type);
-    }
-
-    /**
      * 返回订单提交声明的冻结资产。
      *
      * @param submission 强类型订单提交
@@ -485,7 +467,8 @@ public final class OrderEngine implements AutoCloseable {
     private void transferPreCreationConfirmationsLocked(OrderContext context) {
         for (CancelConfirmation confirmation
                 : preCreationEventBuffer.removeAll(context.orderId())) {
-            orderStateMachine.registerEventLocked(context, confirmation);
+            recordSequenceRegistration(
+                    orderStateMachine.registerEventLocked(context, confirmation));
         }
     }
 
@@ -500,7 +483,8 @@ public final class OrderEngine implements AutoCloseable {
         ReentrantLock userLock = locks.lockForUser(context.userId());
         userLock.lock();
         try {
-            orderStateMachine.registerEventLocked(context, confirmation);
+            recordSequenceRegistration(
+                    orderStateMachine.registerEventLocked(context, confirmation));
         } finally {
             userLock.unlock();
         }
@@ -525,6 +509,7 @@ public final class OrderEngine implements AutoCloseable {
                 orderIds.addLast(orderId);
             }
         }
+        metrics.pendingTradeCount(tradeStore.pendingCount());
     }
 
     /**
@@ -569,6 +554,47 @@ public final class OrderEngine implements AutoCloseable {
     }
 
     /**
+     * 判断双方订单已发布时，当前成交是否位于任一下一权威序号之后。
+     *
+     * @param execution 待诊断的权威成交
+     * @return 任一侧存在可见序号空洞时为 {@code true}
+     * @note 该方法只用于弱一致指标，不参与成交正确性裁决；实际序号校验仍在双方用户锁内完成。
+     */
+    private boolean hasVisibleSequenceGap(TradeExecution execution) {
+        OrderContext buyer = orders.get(execution.buyOrderId());
+        OrderContext seller = orders.get(execution.sellOrderId());
+        return buyer != null && seller != null
+                && (isFutureGap(
+                        execution.buyOrderSequence(), buyer.lastAppliedSequence())
+                || isFutureGap(
+                        execution.sellOrderSequence(), seller.lastAppliedSequence()));
+    }
+
+    /**
+     * 判断候选序号是否至少超前最后序号两个位置。
+     *
+     * @param candidate 候选权威序号
+     * @param lastApplied 最后已提交序号
+     * @return 两者之间至少缺少一个序号时为 {@code true}
+     */
+    private static boolean isFutureGap(long candidate, long lastApplied) {
+        return candidate > lastApplied && candidate - lastApplied > 1L;
+    }
+
+    /**
+     * 将撤单确认登记结果转换为序号与过期指标。
+     *
+     * @param result 状态机返回的登记结果
+     */
+    private void recordSequenceRegistration(SequenceRegistrationResult result) {
+        if (result == SequenceRegistrationResult.BUFFERED) {
+            metrics.sequenceGap();
+        } else if (result == SequenceRegistrationResult.STALE) {
+            metrics.staleCancelConfirmation();
+        }
+    }
+
+    /**
      * 判断一次协调结果是否推进了双方权威序号并需要继续排空。
      *
      * @param result 协调器处理结果
@@ -599,7 +625,7 @@ public final class OrderEngine implements AutoCloseable {
                 return false;
             }
 
-            OrderStatus oldStatus = context.status();
+            boolean staleAfterFill = context.status() == OrderStatus.FILLED;
             OrderCancelMutation orderMutation =
                     orderStateMachine.prepareCancelLocked(context, confirmation);
             BalanceMutation balanceMutation = orderMutation.releaseAmount() == 0L
@@ -611,11 +637,8 @@ public final class OrderEngine implements AutoCloseable {
                 ledger.commitBalanceLocked(balanceMutation);
             }
             orderStateMachine.commitCancelLocked(context, orderMutation);
-            if (balanceMutation != null) {
-                metrics.unfreeze();
-            }
-            if (oldStatus != context.status()) {
-                metrics.stateTransition();
+            if (staleAfterFill) {
+                metrics.staleCancelConfirmation();
             }
             return true;
         } finally {
@@ -636,246 +659,6 @@ public final class OrderEngine implements AutoCloseable {
             throw new IllegalArgumentException("order not found for orderId=" + orderId);
         }
         return context;
-    }
-
-    /**
-     * 接收一个订单事件并将订单收敛到当前可推导状态。
-     *
-     * @param event 待处理事件，不能为空，可重复或乱序到达
-     * @throws OrderMetadataMismatchException 当同一订单 ID 的用户或金额不一致时
-     * @note 先以原子位图缓存事实，再按用户锁执行状态机；因此乱序事件会滞后收敛，重复事件不会重复冻结、结算或解冻。
-     */
-    public void process(OrderEvent event) {
-        Objects.requireNonNull(event, "event");
-        metrics.processedEvent();
-        // 首事件可以是乱序终态；上下文先固化订单元数据，后续事件必须保持一致。
-        OrderContext context = orders.compute(event.orderId(), (id, existing) -> {
-            if (existing == null) {
-                return OrderContext.fromFirstEvent(event);
-            }
-            try {
-                existing.validateMetadata(event);
-            } catch (OrderMetadataMismatchException mismatch) {
-                metrics.metadataConflict();
-                throw mismatch;
-            }
-            return existing;
-        });
-
-        boolean createdBefore = context.hasFact(OrderFact.CREATED_SEEN);
-        // Fact Bit 使用 CAS 无锁登记，重复事件仍继续 reconcile 以补偿已登记但未执行完的副作用。
-        FactRegistrationResult registration = context.registerFact(event.type());
-        if (registration == FactRegistrationResult.DUPLICATE) {
-            metrics.duplicateEvent();
-        } else {
-            metrics.acceptedFact();
-            if (event.type() == OrderEventType.APPROVAL_PASSED) {
-                metrics.approvalPass();
-            } else if (event.type() == OrderEventType.APPROVAL_REJECTED) {
-                metrics.approvalReject();
-            }
-        }
-        if (event.type() != OrderEventType.ORDER_CREATED && !createdBefore) {
-            // 创建前到达的终态或审批事实仅计为乱序并保存在位图中，不在入口直接操作资金。
-            metrics.outOfOrderEvent();
-        }
-
-        ReconcileResult result;
-        ReentrantLock lock = locks.lockForUser(context.userId());
-        // 同一用户的订单状态、账户余额和风控窗口在同一条带锁内串行收敛。
-        lock.lock();
-        try {
-            result = reconcileLocked(context);
-        } finally {
-            lock.unlock();
-        }
-        if (result.approvalSubmission != null) {
-            // 审批投递移到资金锁外，避免队列背压或回调重入延长临界区。
-            approvalService.submit(
-                    result.approvalSubmission,
-                    approvalPolicy,
-                    approval -> process(legacyApprovalEvent(result.approvalSubmission, approval)));
-        }
-    }
-
-    /**
-     * 在用户锁内根据已缓存事实协调资金副作用和订单状态。
-     *
-     * @param context 待协调订单上下文
-     * @return 需要在锁外投递的审批结果
-     * @note 创建前只缓存乱序事实；终态冲突遵从先已提交的资金副作用，避免已结算订单被错误解冻，保障资产守恒。
-     */
-    private ReconcileResult reconcileLocked(OrderContext context) {
-        boolean filled = context.hasFact(OrderFact.FILLED_SEEN);
-        boolean cancelled = context.hasFact(OrderFact.CANCELLED_SEEN);
-        boolean approved = context.hasFact(OrderFact.APPROVED_SEEN);
-        boolean rejected = context.hasFact(OrderFact.REJECTED_SEEN);
-        // 冲突仅计数一次，实际终态由已提交的资金副作用决定。
-        if (filled && cancelled && context.markTerminalConflictLocked()) {
-            metrics.conflictingTerminalEvent();
-        }
-        if (approved && rejected && context.markApprovalConflictLocked()) {
-            metrics.approvalConflict();
-        }
-        if (!context.hasFact(OrderFact.CREATED_SEEN)) {
-            // 乱序事实继续滞留在 Fact Bit，等待 CREATE 后再次进入本方法执行后置补偿。
-            return ReconcileResult.NONE;
-        }
-        // CREATE 齐备后先幂等冻结，后续终态只能在这笔冻结资金上结算或解冻。
-        applyFreezeLocked(context);
-
-        if (rejected) {
-            // 审批拒绝优先于通过；若尚未结算，只允许解冻一次并收敛为取消。
-            if (!context.hasEffect(OrderEffect.SETTLE_APPLIED)) {
-                applyUnfreezeLocked(context);
-                transitionLocked(context, OrderStatus.CANCELED);
-            }
-            return ReconcileResult.NONE;
-        }
-        if (cancelled && !filled) {
-            // 单独撤单事实只能释放未结算冻结资金，不得覆盖已经发生的成交结算。
-            if (!context.hasEffect(OrderEffect.SETTLE_APPLIED)) {
-                applyUnfreezeLocked(context);
-                transitionLocked(context, OrderStatus.CANCELED);
-            }
-            return ReconcileResult.NONE;
-        }
-
-        if (context.status() == OrderStatus.INIT) {
-            // 初始风控只执行一次；重复事件不会让已接纳订单因窗口变化重新进入挂起。
-            if (approved) {
-                transitionLocked(context, OrderStatus.NEW);
-            } else {
-                ReconcileResult riskResult = evaluateInitialRiskLocked(context);
-                if (riskResult.approvalSubmission != null
-                        || context.status() == OrderStatus.RISK_HOLD) {
-                    return riskResult;
-                }
-            }
-        }
-
-        if (context.status() == OrderStatus.RISK_HOLD) {
-            if (!approved) {
-                // 挂起期间的成交事实保持缓存，禁止在审批通过前提前结算。
-                return ReconcileResult.NONE;
-            }
-            // 审批通过后恢复 NEW，并在同次 reconcile 中继续消费可能已缓存的成交事实。
-            transitionLocked(context, OrderStatus.NEW);
-        }
-
-        if (filled) {
-            // 成交与撤单冲突时以已提交的互斥资金 Effect 为准，严禁同时结算和解冻。
-            if (!context.hasEffect(OrderEffect.UNFREEZE_APPLIED)) {
-                applySettleLocked(context);
-            }
-            if (!context.hasEffect(OrderEffect.SETTLE_APPLIED)) {
-                return ReconcileResult.NONE;
-            }
-            recordRiskTradeLocked(context);
-            transitionLocked(context, OrderStatus.FILLED);
-            return ReconcileResult.NONE;
-        }
-        return ReconcileResult.NONE;
-    }
-
-    /**
-     * 在用户锁内执行初始风控，并在需要时仅投递一次审批任务。
-     *
-     * @param context 已冻结且尚未完成初始状态迁移的订单
-     * @return 需要异步处理的审批事件，或无审批结果
-     * @note 风控窗口和审批 Effect Bit 都在用户锁内更新，防止并发重复投递；审批回调以新事实形式重入状态机。
-     */
-    private ReconcileResult evaluateInitialRiskLocked(OrderContext context) {
-        TradeWindow window = tradeWindows.computeIfAbsent(
-                new RiskWindowKey(context.userId(), context.pair().quoteAsset()),
-                ignored -> new TradeWindow(RISK_WINDOW_MILLIS));
-        long now = clock.currentTimeMillis();
-        RiskContext riskContext = new RiskContext(
-                context.orderId(), context.userId(), context.pair().quoteAsset(),
-                context.riskQuoteAmount(), now, window.currentSum(now));
-        if (riskPipeline.evaluate(riskContext) == RiskDecision.HOLD) {
-            transitionLocked(context, OrderStatus.RISK_HOLD);
-            metrics.riskHold();
-            if (context.applyEffectLocked(OrderEffect.APPROVAL_SCHEDULED, () -> { })) {
-                metrics.approvalScheduled();
-                return new ReconcileResult(context.approvalSubmission(now));
-            }
-            return ReconcileResult.NONE;
-        }
-        transitionLocked(context, OrderStatus.NEW);
-        return ReconcileResult.NONE;
-    }
-
-    /**
-     * 在用户锁内为订单金额执行一次冻结。
-     *
-     * @param context 待冻结订单上下文
-     * @note Effect Bit 在账本成功冻结后才提交，失败时可安全重试；冻结、结算和解冻必须遵循同一用户锁以维持资产守恒。
-     */
-    private void applyFreezeLocked(OrderContext context) {
-        if (context.hasEffect(OrderEffect.FREEZE_APPLIED)) {
-            return;
-        }
-        context.applyEffectLocked(OrderEffect.FREEZE_APPLIED,
-                () -> ledger.freezeLocked(context.userId(), context.amount()));
-        metrics.freeze();
-    }
-
-    /**
-     * 在用户锁内将已冻结订单金额执行一次结算。
-     *
-     * @param context 待结算订单上下文
-     * @note 仅在未解冻时结算，幂等 Effect Bit 防止重放成交事件重复扣减资产。
-     */
-    private void applySettleLocked(OrderContext context) {
-        if (context.applyEffectLocked(OrderEffect.SETTLE_APPLIED,
-                () -> ledger.settleLocked(context.userId(), context.amount()))) {
-            metrics.settle();
-        }
-    }
-
-    /**
-     * 在用户锁内将未结算订单金额执行一次解冻。
-     *
-     * @param context 待解冻订单上下文
-     * @note 仅对未结算订单解冻；终态冲突分支依赖该前提以避免已结算资金被二次返还。
-     */
-    private void applyUnfreezeLocked(OrderContext context) {
-        if (context.applyEffectLocked(OrderEffect.UNFREEZE_APPLIED,
-                () -> ledger.unfreezeLocked(context.userId(), context.amount()))) {
-            metrics.unfreeze();
-        }
-    }
-
-    /**
-     * 在用户锁内将成交金额计入一次风控窗口。
-     *
-     * @param context 已结算订单上下文
-     * @note 幂等标记使重复成交事件不会放大风险敞口；记录失败前不得视为风控事实已提交。
-     */
-    private void recordRiskTradeLocked(OrderContext context) {
-        if (context.applyEffectLocked(OrderEffect.RISK_RECORDED, () -> {
-            TradeWindow window = tradeWindows.computeIfAbsent(
-                    new RiskWindowKey(context.userId(), context.pair().quoteAsset()),
-                    ignored -> new TradeWindow(RISK_WINDOW_MILLIS));
-            window.record(clock.currentTimeMillis(), context.amount());
-        })) {
-            metrics.riskRecorded();
-        }
-    }
-
-    /**
-     * 在用户锁内执行有变化才计数的状态迁移。
-     *
-     * @param context 待迁移订单上下文
-     * @param newStatus 目标订单状态
-     */
-    private void transitionLocked(OrderContext context, OrderStatus newStatus) {
-        OrderStatus oldStatus = context.status();
-        if (oldStatus != newStatus) {
-            context.setLegacyStatusLocked(newStatus);
-            metrics.stateTransition();
-        }
     }
 
     /**
@@ -935,27 +718,6 @@ public final class OrderEngine implements AutoCloseable {
     @Override
     public void close() {
         approvalService.close();
-    }
-
-    /**
-     * 用户锁内协调产生的锁外后续动作。
-     * 核心能力是将审批投递移出资金锁；实例不可变且线程安全。
-     * 限制：当前仅承载一个审批提交。
-     */
-    private static final class ReconcileResult {
-        /** 不需要锁外后续动作的共享结果。 */
-        private static final ReconcileResult NONE = new ReconcileResult(null);
-        /** 需要投递的强类型审批提交；无投递需求时为 {@code null}。 */
-        private final OrderSubmission approvalSubmission;
-
-        /**
-         * 创建用户锁外后续动作结果。
-         *
-         * @param approvalSubmission 待投递审批的强类型提交；无后续动作时为 {@code null}
-         */
-        private ReconcileResult(OrderSubmission approvalSubmission) {
-            this.approvalSubmission = approvalSubmission;
-        }
     }
 
     /**

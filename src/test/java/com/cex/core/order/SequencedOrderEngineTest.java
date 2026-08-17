@@ -35,12 +35,19 @@ import org.junit.jupiter.api.Test;
  * <p>每个场景使用真实多资产账本与订单引擎，防止测试替身掩盖资金或锁边界副作用。</p>
  */
 class SequencedOrderEngineTest {
+    /** 测试基础资产。 */
     private static final AssetId BTC = new AssetId("BTC");
+    /** 测试报价资产。 */
     private static final AssetId USDT = new AssetId("USDT");
+    /** 测试使用的基础/报价交易对。 */
     private static final TradingPair BTC_USDT = new TradingPair(BTC, USDT);
+    /** 买方用户标识。 */
     private static final long BUYER_ID = 101L;
+    /** 卖方用户标识。 */
     private static final long SELLER_ID = 202L;
+    /** 买单标识。 */
     private static final long BUY_ORDER_ID = 1_001L;
+    /** 卖单标识。 */
     private static final long SELL_ORDER_ID = 2_002L;
 
     /** 测试结束时需要关闭的引擎资源。 */
@@ -287,7 +294,9 @@ class SequencedOrderEngineTest {
 
     /** 保存单个测试场景的真实账本、引擎和不可变输入工厂。 */
     private static final class Fixture {
+        /** 场景使用的多资产账本。 */
         private final AccountLedger ledger;
+        /** 场景使用的强类型订单引擎。 */
         private final OrderEngine engine;
 
         private Fixture(AccountLedger ledger, OrderEngine engine) {

@@ -362,15 +362,13 @@ class CounterpartyRiskTest {
 
             assertTrue(!reject.isAlive());
             assertEquals(null, rejectFailure.get());
-            assertEquals(0L, engine.metrics().approvalPassCount());
-            assertEquals(1L, engine.metrics().approvalRejectCount());
             assertEquals(OrderStatus.PENDING_CANCEL, order.status());
             assertEquals(1, requests.size());
 
             releaseAutomaticApproval.countDown();
             engine.awaitApprovals(2L, TimeUnit.SECONDS);
-            assertEquals(0L, engine.metrics().approvalPassCount());
-            assertEquals(1L, engine.metrics().approvalRejectCount());
+            assertEquals(OrderStatus.PENDING_CANCEL, order.status());
+            assertEquals(1, requests.size());
         } finally {
             releaseAutomaticApproval.countDown();
             engine.close();

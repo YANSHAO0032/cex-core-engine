@@ -11,6 +11,7 @@ import com.cex.core.order.OrderFillMutation;
 import com.cex.core.order.OrderSequenceMutation;
 import com.cex.core.order.OrderSide;
 import com.cex.core.order.OrderStateMachine;
+import com.cex.core.order.OrderStatus;
 import com.cex.core.order.OrderTerminalStateException;
 import com.cex.core.order.SequencedOrderEvent;
 import com.cex.core.order.TradeExecution;
@@ -326,9 +327,11 @@ public final class TradeSettlementCoordinator {
         buyerWindow.commitRecord(buyerWindowMutation);
         sellerWindow.commitRecord(sellerWindowMutation);
         tradeStore.markSettled(execution.tradeId(), execution.executedAtMillis());
+        if (buyer.status() == OrderStatus.PARTIALLY_FILLED
+                || seller.status() == OrderStatus.PARTIALLY_FILLED) {
+            metrics.partialFill();
+        }
         metrics.settledTrade();
-        metrics.riskRecorded();
-        metrics.riskRecorded();
         return TradeResult.SETTLED;
     }
 
