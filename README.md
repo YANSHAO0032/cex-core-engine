@@ -46,7 +46,7 @@ TradeExecutionRecord trade(long tradeId);
 |---|---|
 | `OrderSubmission` | 用户、方向、交易对、基础数量、冻结数量、报价资产风控金额、创建序号和时间 |
 | `TradeExecution` | 外部撮合产生的 `tradeId`、买卖订单、基础/报价成交数量、双方订单序号和时间 |
-| `CancelRequest` | 本地幂等撤单意图；首次成功发送后订单进入 `PENDING_CANCEL` |
+| `CancelRequest` | 本地幂等撤单意图；首次本地登记即进入 `PENDING_CANCEL`，sink 失败仍保持该状态并复用同一 `cancelRequestId` 重试，确认前资金继续冻结 |
 | `CancelConfirmation` | 外部撮合确认的撤单结果及订单权威序号 |
 | `ApprovalResult` | 异步风控审批的 PASS 或 REJECT 回流 |
 
@@ -130,7 +130,7 @@ pendingEvents: sequence -> event
 
 ## 撤单确认与风控顺序
 
-用户撤单和风控拒绝都通过 `CancelRequestSink` 发送稳定 `cancelRequestId`。发送失败可使用同一 ID 重试；只有 `CancelConfirmation` 可以解冻剩余资产。
+用户撤单和风控拒绝在本地首次登记时即进入 `PENDING_CANCEL`，再通过 `CancelRequestSink` 发送稳定 `cancelRequestId`。sink 发送失败不会回滚订单状态或冻结资金，可使用同一 ID 重试；只有 `CancelConfirmation` 可以解冻剩余资产。
 
 收到序号 N 的撤单确认时：
 
