@@ -11,9 +11,9 @@ package com.cex.core.order;
 public interface CancelRequestSink {
 
     /**
-     * 接收并发送一个经过校验的撤单请求。
+     * 提交并发送一个经过校验的撤单请求。
      *
      * @param request 待发送的不可变撤单请求，不能为空
      */
-    void accept(CancelRequest request);
+    void submit(CancelRequest request);
 }

@@ -99,6 +99,18 @@ class OrderInputValidationTest {
         assertThrows(IllegalArgumentException.class, () -> new CancelConfirmation(41L, 11L, 3L, -1L));
     }
 
+    /** 场景：撤单网关应将提交的请求传递给外部接收方。 */
+    @Test
+    void cancelRequestSinkSubmitsRequestToReceiver() {
+        CancelRequest[] received = new CancelRequest[1];
+        CancelRequestSink sink = request -> received[0] = request;
+        CancelRequest request = new CancelRequest(41L, 11L, 10L);
+
+        sink.submit(request);
+
+        assertEquals(request, received[0]);
+    }
+
     /** 场景：审批结果的订单标识为正，结论非空，决定时间非负。 */
     @Test
     void approvalResultValidatesItsTypedCallbackPayload() {
