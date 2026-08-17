@@ -28,8 +28,8 @@ import org.junit.jupiter.api.Test;
 /**
  * CEX 强类型内存订单核心性能测试，分别测量成交重复热路径和代表性生命周期。
  *
- * <p>保留原有线程数、预热量、500,000 次热路径采样和 300,000 个生命周期主订单；
- * 共享卖方订单只负责将旧单边成交机械映射为权威双边成交。</p>
+ * <p>保留 16 线程、50,000 次预热和两个各至少 500,000 次的正式采样负载；
+ * 代表性生命周期执行两次部分成交后全成或确认撤单，重复热路径复用不可变成交。</p>
  *
  * @note 复用不可变成交数组与每 worker 卖方订单，减少 GC 并适配 {@code -Xmx256m}。
  * @note 撤单终态业务操作内部按规范依次发送请求和确认，延迟样本覆盖完整强类型撤单边界。
@@ -41,13 +41,21 @@ class PerformanceTest {
     private static final int WARMUP = 50_000;
     /** 重复热路径正式采样的成交处理次数。 */
     private static final int MEASUREMENTS = 500_000;
-    /** 代表性生命周期基准创建的独立主订单数量。 */
-    private static final int LIFECYCLE_ORDERS = 300_000;
-    /** 代表性生命周期复用的买方用户数量。 */
-    private static final int LIFECYCLE_USERS = 4_096;
-    /** 生命周期共享卖单标识起点。 */
+    /** 代表性生命周期基准创建的独立买卖订单对数量。 */
+    private static final int LIFECYCLE_PAIRS = 60_000;
+    /** 代表性生命周期必须完成的正式采样调用次数。 */
+    private static final long LIFECYCLE_MEASUREMENTS = 600_000L;
+    /** 每个生命周期买单的原始基础资产数量。 */
+    private static final long LIFECYCLE_BASE_QUANTITY = 3L;
+    /** 每个生命周期买单冻结的报价资产数量。 */
+    private static final long LIFECYCLE_QUOTE_RESERVE = 300L;
+    /** 每次部分或最终成交交割的报价资产数量。 */
+    private static final long LIFECYCLE_QUOTE_FILL = 90L;
+    /** 代表性生命周期每一侧复用的用户数量。 */
+    private static final int LIFECYCLE_USERS_PER_SIDE = 4_096;
+    /** 生命周期卖单标识起点。 */
     private static final long SELL_ORDER_BASE = 2_000_000L;
-    /** 生命周期共享卖方用户标识起点。 */
+    /** 生命周期卖方用户标识起点。 */
     private static final long SELLER_USER_BASE = 10_000L;
     /** 测试基础资产。 */
     private static final AssetId BTC = new AssetId("BTC");
@@ -143,13 +151,26 @@ class PerformanceTest {
             long maxMemory = Runtime.getRuntime().maxMemory();
             long usedMemory = Runtime.getRuntime().totalMemory()
                     - Runtime.getRuntime().freeMemory();
+            long oldGcCount = gcAfter.oldCollectorCount()
+                    - gcBefore.oldCollectorCount();
 
             assertEquals(MEASUREMENTS, count);
             assertEquals(THREADS, engine.metrics().settledTradeCount());
+            assertEquals(WARMUP + MEASUREMENTS,
+                    engine.metrics().duplicateTradeCount());
+            assertEquals(0L, ledger.balance(sellerUserId, BTC).frozen());
+            for (long buyerUserId = 1L; buyerUserId <= THREADS; buyerUserId++) {
+                assertEquals(0L, ledger.balance(buyerUserId, USDT).frozen());
+            }
             assertTrue(ledger.allAssetInvariantsHold());
+            assertTrue(ledger.allBalancesNonNegative());
             assertTrue(tps >= 10_000.0, () -> "TPS=" + tps);
             assertTrue(averageMillis < 1.0,
                     () -> "average latency ms=" + averageMillis);
+            assertTrue(maxMemory <= 256L * 1024L * 1024L,
+                    () -> "max heap bytes=" + maxMemory);
+            assertTrue(oldGcCount <= 1L,
+                    () -> "old/full GC count=" + oldGcCount);
             printReport(
                     "CEX DUPLICATE IDEMPOTENCY HOT-PATH REPORT",
                     count, tps, histogram, maxMemory, usedMemory,
@@ -169,8 +190,6 @@ class PerformanceTest {
             throws Exception {
         AccountLedger ledger = lifecycleLedger();
         OrderEngine engine = new OrderEngine(ledger);
-        long[] fillCounts = lifecycleFillCounts();
-        submitLifecycleSellers(engine, fillCounts);
         ExecutorService executor = Executors.newFixedThreadPool(THREADS);
         try {
             LatencyHistogram histogram = new LatencyHistogram();
@@ -202,19 +221,43 @@ class PerformanceTest {
 
             long filled = 0L;
             long canceled = 0L;
-            for (int index = 0; index < LIFECYCLE_ORDERS; index++) {
-                OrderStatus status = engine.order(1_000_000L + index).status();
+            for (int index = 0; index < LIFECYCLE_PAIRS; index++) {
+                com.cex.core.order.OrderContext order =
+                        engine.order(1_000_000L + index);
+                com.cex.core.order.OrderContext counterparty =
+                        engine.order(SELL_ORDER_BASE + index);
+                OrderStatus status = order.status();
                 if (status == OrderStatus.FILLED) {
                     filled++;
                 } else if (status == OrderStatus.CANCELED) {
                     canceled++;
                 }
+                assertEquals(0L, order.remainingReservedAmount(),
+                        "terminal order retains frozen reserve: " + order.orderId());
+                assertEquals(status, counterparty.status());
+                assertEquals(0L, counterparty.remainingReservedAmount(),
+                        "counterparty retains frozen reserve: " + counterparty.orderId());
             }
+            long stateChanges = LIFECYCLE_PAIRS * 2L
+                    + engine.metrics().settledTradeCount() * 2L
+                    + engine.metrics().pendingCancelCount() * 2L;
 
-            assertEquals(LIFECYCLE_ORDERS * 2L, operations);
-            assertEquals(LIFECYCLE_ORDERS / 2L, filled);
-            assertEquals(LIFECYCLE_ORDERS / 2L, canceled);
-            assertEquals(filled, engine.metrics().settledTradeCount());
+            assertEquals(LIFECYCLE_MEASUREMENTS, operations);
+            assertEquals(LIFECYCLE_PAIRS / 2L, filled);
+            assertEquals(LIFECYCLE_PAIRS / 2L, canceled);
+            assertEquals(3L,
+                    engine.order(1_000_000L).cumulativeBaseFilled(),
+                    "filled lifecycle must include two partials and a final fill");
+            assertEquals(2L,
+                    engine.order(1_000_001L).cumulativeBaseFilled(),
+                    "canceled lifecycle must retain two partial fills");
+            assertEquals(150_000L, engine.metrics().settledTradeCount());
+            assertEquals(210_000L, engine.metrics().duplicateTradeCount());
+            assertEquals(60_000L, engine.metrics().pendingCancelCount());
+            assertTrue(engine.metrics().partialFillCount() >= 120_000L,
+                    "representative lifecycle must execute two partial fills per order");
+            assertTrue(stateChanges >= 500_000L,
+                    () -> "state changes=" + stateChanges);
             assertEquals(0, engine.pendingTradeCount());
             assertTrue(tps >= 10_000.0, () -> "TPS=" + tps);
             assertTrue(averageMillis < 1.0,
@@ -225,6 +268,11 @@ class PerformanceTest {
                     () -> "old/full GC count=" + oldGcCount);
             assertTrue(ledger.allAssetInvariantsHold());
             assertTrue(ledger.allBalancesNonNegative());
+            for (long userId = 1L; userId <= LIFECYCLE_USERS_PER_SIDE; userId++) {
+                assertEquals(0L, ledger.balance(userId, USDT).frozen());
+                assertEquals(0L,
+                        ledger.balance(SELLER_USER_BASE + userId, BTC).frozen());
+            }
 
             printReport(
                     "CEX REPRESENTATIVE LIFECYCLE REPORT",
@@ -232,6 +280,15 @@ class PerformanceTest {
                     gcBefore, gcAfter);
             System.out.println("Filled orders:           " + filled);
             System.out.println("Canceled orders:         " + canceled);
+            System.out.println("State changes:           " + stateChanges);
+            System.out.println("Settled trades:          "
+                    + engine.metrics().settledTradeCount());
+            System.out.println("Duplicate trades:        "
+                    + engine.metrics().duplicateTradeCount());
+            System.out.println("Partial fills:           "
+                    + engine.metrics().partialFillCount());
+            System.out.println("Pending cancels:         "
+                    + engine.metrics().pendingCancelCount());
             System.out.println("Invariant result:        PASS");
         } finally {
             executor.shutdownNow();
@@ -254,34 +311,72 @@ class PerformanceTest {
             LatencyHistogram histogram) {
         try {
             start.await();
-            long sellerSequence = 2L;
             for (int index = workerIndex;
-                    index < LIFECYCLE_ORDERS; index += THREADS) {
+                    index < LIFECYCLE_PAIRS; index += THREADS) {
                 long orderId = 1_000_000L + index;
+                long counterpartyOrderId = SELL_ORDER_BASE + index;
                 OrderSubmission submission = lifecycleSubmission(orderId, index);
+                OrderSubmission counterpartySubmission =
+                        lifecycleSellSubmission(counterpartyOrderId, index);
                 boolean filled = (index & 1) == 0;
-                boolean inOrder = (index & 2) == 0;
-                Runnable terminal;
-                if (filled) {
-                    TradeExecution execution = lifecycleExecution(
-                            orderId, workerIndex, sellerSequence++);
-                    terminal = () -> engine.onTrade(execution);
-                } else {
-                    terminal = () -> cancelLifecycle(engine, orderId);
-                }
-                Runnable create = () -> engine.submit(submission);
-                Runnable first = inOrder ? create : terminal;
-                Runnable second = inOrder ? terminal : create;
+                long firstTradeId = index * 3L + 1L;
+                TradeExecution first = lifecycleExecution(
+                        firstTradeId, orderId, counterpartyOrderId, 2L);
+                TradeExecution second = lifecycleExecution(
+                        firstTradeId + 1L, orderId, counterpartyOrderId, 3L);
 
-                long firstStarted = System.nanoTime();
-                first.run();
-                histogram.record(System.nanoTime() - firstStarted);
-                long secondStarted = System.nanoTime();
-                second.run();
-                if (!filled && !inOrder) {
+                long operationStarted = System.nanoTime();
+                engine.submit(submission);
+                histogram.record(System.nanoTime() - operationStarted);
+
+                operationStarted = System.nanoTime();
+                engine.submit(counterpartySubmission);
+                histogram.record(System.nanoTime() - operationStarted);
+
+                operationStarted = System.nanoTime();
+                engine.onTrade(first);
+                histogram.record(System.nanoTime() - operationStarted);
+
+                operationStarted = System.nanoTime();
+                engine.onTrade(second);
+                histogram.record(System.nanoTime() - operationStarted);
+
+                if (filled) {
+                    TradeExecution terminal = lifecycleExecution(
+                            firstTradeId + 2L, orderId, counterpartyOrderId, 4L);
+                    operationStarted = System.nanoTime();
+                    engine.onTrade(terminal);
+                    histogram.record(System.nanoTime() - operationStarted);
+                    // 重复样本复用同一不可变终态成交，避免分配替代执行对象。
+                    operationStarted = System.nanoTime();
+                    engine.onTrade(terminal);
+                    histogram.record(System.nanoTime() - operationStarted);
+                    operationStarted = System.nanoTime();
+                    engine.onTrade(terminal);
+                    histogram.record(System.nanoTime() - operationStarted);
+                    operationStarted = System.nanoTime();
+                    engine.onTrade(terminal);
+                    histogram.record(System.nanoTime() - operationStarted);
+                } else {
+                    operationStarted = System.nanoTime();
                     engine.requestCancel(cancelRequest(orderId));
+                    histogram.record(System.nanoTime() - operationStarted);
+                    operationStarted = System.nanoTime();
+                    engine.onCancelConfirmed(cancelConfirmation(orderId));
+                    histogram.record(System.nanoTime() - operationStarted);
+                    operationStarted = System.nanoTime();
+                    engine.requestCancel(cancelRequest(counterpartyOrderId));
+                    histogram.record(System.nanoTime() - operationStarted);
+                    operationStarted = System.nanoTime();
+                    engine.onCancelConfirmed(cancelConfirmation(counterpartyOrderId));
+                    histogram.record(System.nanoTime() - operationStarted);
+                    // 已结算部分成交的重复热投递复用 second，不产生临时成交对象。
+                    for (int duplicate = 0; duplicate < 4; duplicate++) {
+                        operationStarted = System.nanoTime();
+                        engine.onTrade(second);
+                        histogram.record(System.nanoTime() - operationStarted);
+                    }
                 }
-                histogram.record(System.nanoTime() - secondStarted);
             }
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
@@ -290,54 +385,61 @@ class PerformanceTest {
     }
 
     /**
-     * 执行一个强类型撤单终态业务操作。
-     *
-     * @param engine 强类型订单引擎
-     * @param orderId 待撤买单标识
-     */
-    private static void cancelLifecycle(OrderEngine engine, long orderId) {
-        if (engine.order(orderId) == null) {
-            engine.onCancelConfirmed(cancelConfirmation(orderId));
-            return;
-        }
-        engine.requestCancel(cancelRequest(orderId));
-        engine.onCancelConfirmed(cancelConfirmation(orderId));
-    }
-
-    /**
      * 创建代表性生命周期买单。
      *
      * @param orderId 主订单标识
      * @param index 从零开始的订单索引
-     * @return 一个资金单位的买单提交
+     * @return 可接受两次部分成交并最终全成或撤单的买单提交
      */
     private static OrderSubmission lifecycleSubmission(long orderId, int index) {
-        long userId = (index & (LIFECYCLE_USERS - 1)) + 1L;
+        long userId = (index & (LIFECYCLE_USERS_PER_SIDE - 1)) + 1L;
         return new OrderSubmission(
                 orderId, userId, OrderSide.BUY, BTC_USDT,
-                1L, 1L, 1L, 1L, 1L);
+                LIFECYCLE_BASE_QUANTITY, LIFECYCLE_QUOTE_RESERVE,
+                LIFECYCLE_QUOTE_RESERVE, 1L, 1L);
     }
 
     /**
-     * 创建代表性生命周期全量成交。
+     * 创建代表性生命周期卖单。
      *
-     * @param orderId 主买单标识并作为成交标识
-     * @param workerIndex 共享卖单 worker 索引
-     * @param sellerSequence 卖单下一权威序号
+     * @param orderId 卖单标识
+     * @param index 从零开始的订单对索引
+     * @return 与买单逐对创建并冻结基础资产的卖单提交
+     */
+    private static OrderSubmission lifecycleSellSubmission(
+            long orderId, int index) {
+        long userId = SELLER_USER_BASE
+                + (index & (LIFECYCLE_USERS_PER_SIDE - 1)) + 1L;
+        return new OrderSubmission(
+                orderId, userId, OrderSide.SELL, BTC_USDT,
+                LIFECYCLE_BASE_QUANTITY, LIFECYCLE_BASE_QUANTITY,
+                LIFECYCLE_QUOTE_RESERVE, 1L, 1L);
+    }
+
+    /**
+     * 创建代表性生命周期的一单位部分或最终成交。
+     *
+     * @param tradeId 成交幂等标识
+     * @param orderId 主买单标识
+     * @param counterpartyOrderId 对手卖单标识
+     * @param orderSequence 买卖双方相同的权威序号
      * @return 权威双边成交
      */
     private static TradeExecution lifecycleExecution(
-            long orderId, int workerIndex, long sellerSequence) {
+            long tradeId,
+            long orderId,
+            long counterpartyOrderId,
+            long orderSequence) {
         return new TradeExecution(
+                tradeId,
                 orderId,
-                orderId,
-                sellerOrderId(workerIndex),
+                counterpartyOrderId,
                 BTC_USDT,
                 1L,
-                1L,
-                2L,
-                sellerSequence,
-                2L);
+                LIFECYCLE_QUOTE_FILL,
+                orderSequence,
+                orderSequence,
+                tradeId);
     }
 
     /**
@@ -354,94 +456,27 @@ class PerformanceTest {
      * 创建下一权威序号的撤单确认。
      *
      * @param orderId 待撤订单标识
-     * @return 序号二的撤单确认
+     * @return 两次部分成交后的序号四撤单确认
      */
     private static CancelConfirmation cancelConfirmation(long orderId) {
-        return new CancelConfirmation(orderId, orderId, 2L, 3L);
+        return new CancelConfirmation(orderId, orderId, 4L, 3L);
     }
 
     /**
-     * 创建生命周期复用用户和共享卖方的账本。
+     * 创建生命周期复用的买方和卖方用户余额。
      *
      * @return 初始化完成的多资产账本
      */
     private static AccountLedger lifecycleLedger() {
         AccountLedger ledger = new AccountLedger(new StripedLockManager());
-        for (long userId = 1L; userId <= LIFECYCLE_USERS; userId++) {
+        for (long userId = 1L; userId <= LIFECYCLE_USERS_PER_SIDE; userId++) {
             ledger.createBalance(userId, BTC, 0L);
-            ledger.createBalance(userId, USDT, 1_000L);
-        }
-        long[] fillCounts = lifecycleFillCounts();
-        for (int worker = 0; worker < THREADS; worker++) {
-            long sellerUserId = sellerUserId(worker);
-            ledger.createBalance(sellerUserId, BTC, fillCounts[worker]);
+            ledger.createBalance(userId, USDT, 10_000L);
+            long sellerUserId = SELLER_USER_BASE + userId;
+            ledger.createBalance(sellerUserId, BTC, 100L);
             ledger.createBalance(sellerUserId, USDT, 0L);
         }
         return ledger;
-    }
-
-    /**
-     * 提交每个 worker 的共享卖单。
-     *
-     * @param engine 强类型订单引擎
-     * @param fillCounts 每个 worker 的成交订单数量
-     */
-    private static void submitLifecycleSellers(
-            OrderEngine engine, long[] fillCounts) {
-        for (int worker = 0; worker < THREADS; worker++) {
-            long quantity = fillCounts[worker];
-            if (quantity == 0L) {
-                continue;
-            }
-            engine.submit(new OrderSubmission(
-                    sellerOrderId(worker),
-                    sellerUserId(worker),
-                    OrderSide.SELL,
-                    BTC_USDT,
-                    quantity,
-                    quantity,
-                    quantity,
-                    1L,
-                    1L));
-        }
-    }
-
-    /**
-     * 统计每个 worker 的成交型主订单数量。
-     *
-     * @return 共享卖单分别需要的基础资产数量
-     */
-    private static long[] lifecycleFillCounts() {
-        long[] counts = new long[THREADS];
-        for (int worker = 0; worker < THREADS; worker++) {
-            for (int index = worker;
-                    index < LIFECYCLE_ORDERS; index += THREADS) {
-                if ((index & 1) == 0) {
-                    counts[worker]++;
-                }
-            }
-        }
-        return counts;
-    }
-
-    /**
-     * 返回 worker 共享卖单标识。
-     *
-     * @param workerIndex worker 索引
-     * @return 不与主订单重叠的卖单标识
-     */
-    private static long sellerOrderId(int workerIndex) {
-        return SELL_ORDER_BASE + workerIndex;
-    }
-
-    /**
-     * 返回 worker 共享卖方用户标识。
-     *
-     * @param workerIndex worker 索引
-     * @return 不与买方用户重叠的卖方用户标识
-     */
-    private static long sellerUserId(int workerIndex) {
-        return SELLER_USER_BASE + workerIndex;
     }
 
     /**
