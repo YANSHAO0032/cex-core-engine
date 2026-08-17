@@ -202,8 +202,17 @@ public final class OrderContext {
 
     int pendingEventCountLocked() { return pendingEvents.size(); }
 
-    void putPendingEventLocked(SequencedOrderEvent event) {
-        pendingEvents.put(event.orderSequence(), event);
+    /**
+     * 提交已预计算的事件登记变更。
+     *
+     * @param mutation 与本上下文绑定且已完成全部校验的登记变更
+     * @note 方法只执行预计算插入或无操作，不重新校验身份、序号、冲突和容量。
+     */
+    void commitEventRegistrationLocked(OrderEventRegistrationMutation mutation) {
+        if (mutation.insertsEvent()) {
+            SequencedOrderEvent event = mutation.event();
+            pendingEvents.put(event.orderSequence(), event);
+        }
     }
 
     void commitFillLocked(OrderFillMutation mutation) {

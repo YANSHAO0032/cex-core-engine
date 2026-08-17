@@ -39,18 +39,40 @@ public final class OrderStateMachine {
      */
     public SequenceRegistrationResult registerEventLocked(
             OrderContext order, SequencedOrderEvent event) {
+        OrderEventRegistrationMutation mutation =
+                prepareEventRegistrationLocked(order, event);
+        commitEventRegistrationLocked(mutation);
+        return mutation.result();
+    }
+
+    /**
+     * 准备一个单订单权威事件登记变更而不修改订单待处理映射。
+     *
+     * @param order 目标订单上下文，不能为空
+     * @param event 待登记的不可变事件，不能为空且订单标识必须匹配
+     * @return 绑定目标订单、事件和预计算登记结果的不透明变更
+     * @throws NullPointerException 当订单或事件为 {@code null} 时抛出
+     * @throws IllegalArgumentException 当事件属于其他订单时抛出
+     * @throws IllegalStateException 当未来事件缓存已满时抛出
+     * @throws TradeSequenceConflictException 当相同未消费序号已有不同载荷时抛出
+     * @note 调用方须持有订单所属用户锁；本方法只读取并校验身份、序号、冲突和容量，不写入任何订单字段。
+     */
+    public OrderEventRegistrationMutation prepareEventRegistrationLocked(
+            OrderContext order, SequencedOrderEvent event) {
         Objects.requireNonNull(order, "order");
         Objects.requireNonNull(event, "event");
         requireOrderId(order, event.orderId());
 
         long sequence = event.orderSequence();
         if (sequence <= order.lastAppliedSequence()) {
-            return SequenceRegistrationResult.STALE;
+            return new OrderEventRegistrationMutation(
+                    order, event, SequenceRegistrationResult.STALE, false);
         }
         SequencedOrderEvent existing = order.pendingEventLocked(sequence);
         if (existing != null) {
             if (existing.equals(event)) {
-                return SequenceRegistrationResult.DUPLICATE;
+                return new OrderEventRegistrationMutation(
+                        order, event, SequenceRegistrationResult.DUPLICATE, false);
             }
             throw new TradeSequenceConflictException(
                     "different payload for orderId=" + order.orderId()
@@ -66,10 +88,21 @@ public final class OrderStateMachine {
             throw new IllegalStateException(
                     "pending event capacity exceeded for orderId=" + order.orderId());
         }
-        order.putPendingEventLocked(event);
-        return sequence == nextSequence
+        SequenceRegistrationResult result = sequence == nextSequence
                 ? SequenceRegistrationResult.READY
                 : SequenceRegistrationResult.BUFFERED;
+        return new OrderEventRegistrationMutation(order, event, result, true);
+    }
+
+    /**
+     * 提交一个准备好的事件登记变更。
+     *
+     * @param mutation 已通过 {@link #prepareEventRegistrationLocked(OrderContext, SequencedOrderEvent)}
+     *                 完成全部校验的变更
+     * @note 调用方须持续持有 mutation 所属订单的用户锁；提交只执行预计算插入或无操作，不进行业务校验和容量计算。
+     */
+    public void commitEventRegistrationLocked(OrderEventRegistrationMutation mutation) {
+        mutation.order().commitEventRegistrationLocked(mutation);
     }
 
     /**

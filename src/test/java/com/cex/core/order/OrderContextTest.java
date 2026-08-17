@@ -124,6 +124,51 @@ class OrderContextTest {
                         new TradeOrderReference(40L, 11L, 4L)));
     }
 
+    /** 场景：准备事件登记只校验并绑定变更，提交前不得修改订单待处理映射。 */
+    @Test
+    void preparedEventRegistrationMutatesOnlyWhenCommitted() {
+        TradingPair pair = new TradingPair(new AssetId("BTC"), new AssetId("USDT"));
+        OrderContext context = OrderContext.fromSubmission(new OrderSubmission(
+                11L, 21L, OrderSide.BUY, pair,
+                10L, 1_000L, 900L, 1L, 100L));
+        OrderStateMachine machine = new OrderStateMachine(1);
+        TradeOrderReference future = new TradeOrderReference(30L, 11L, 3L);
+
+        OrderEventRegistrationMutation mutation =
+                machine.prepareEventRegistrationLocked(context, future);
+
+        assertEquals(0, machine.pendingEventCountLocked(context));
+        assertEquals(1L, context.lastAppliedSequence());
+        machine.commitEventRegistrationLocked(mutation);
+        assertEquals(1, machine.pendingEventCountLocked(context));
+        assertEquals(SequenceRegistrationResult.DUPLICATE,
+                machine.registerEventLocked(context, future));
+    }
+
+    /** 场景：冲突或容量不足的登记准备不得修改既有事件、序号或订单累计字段。 */
+    @Test
+    void failedEventRegistrationPreparationLeavesOrderUnchanged() {
+        TradingPair pair = new TradingPair(new AssetId("BTC"), new AssetId("USDT"));
+        OrderContext context = OrderContext.fromSubmission(new OrderSubmission(
+                11L, 21L, OrderSide.BUY, pair,
+                10L, 1_000L, 900L, 1L, 100L));
+        OrderStateMachine machine = new OrderStateMachine(1);
+        TradeOrderReference existing = new TradeOrderReference(30L, 11L, 3L);
+        machine.registerEventLocked(context, existing);
+
+        assertThrows(TradeSequenceConflictException.class,
+                () -> machine.prepareEventRegistrationLocked(context,
+                        new TradeOrderReference(31L, 11L, 3L)));
+        assertThrows(IllegalStateException.class,
+                () -> machine.prepareEventRegistrationLocked(context,
+                        new TradeOrderReference(40L, 11L, 4L)));
+
+        assertEquals(1, machine.pendingEventCountLocked(context));
+        assertEquals(1L, context.lastAppliedSequence());
+        assertEquals(0L, context.cumulativeBaseFilled());
+        assertEquals(OrderStatus.NEW, context.status());
+    }
+
     /** 场景：消费序号不得绕过尚未到达的较低权威序号。 */
     @Test
     void sequenceConsumptionCannotSkipGap() {

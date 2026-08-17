@@ -6,6 +6,7 @@ import com.cex.core.concurrent.StripedLockManager;
 import com.cex.core.order.InvalidTradeExecutionException;
 import com.cex.core.order.OrderContext;
 import com.cex.core.order.OrderEngineMetrics;
+import com.cex.core.order.OrderEventRegistrationMutation;
 import com.cex.core.order.OrderFillMutation;
 import com.cex.core.order.OrderSequenceMutation;
 import com.cex.core.order.OrderSide;
@@ -199,8 +200,8 @@ public final class TradeSettlementCoordinator {
         TradeOrderReference sellerReference = new TradeOrderReference(
                 execution.tradeId(), execution.sellOrderId(), execution.sellOrderSequence());
         if (!isNextForBothOrders(execution, buyer, seller)) {
-            orderStateMachine.registerEventLocked(buyer, buyerReference);
-            orderStateMachine.registerEventLocked(seller, sellerReference);
+            prepareAndCommitBothReferencesLocked(
+                    buyer, seller, buyerReference, sellerReference);
             return TradeResult.PENDING;
         }
         validateReferenceSlot(buyer, buyerReference);
@@ -226,12 +227,14 @@ public final class TradeSettlementCoordinator {
         } catch (IllegalArgumentException
                  | OrderTerminalStateException
                  | ArithmeticException deterministicFailure) {
-            registerReadyReferences(buyer, seller, buyerReference, sellerReference);
+            prepareAndCommitBothReferencesLocked(
+                    buyer, seller, buyerReference, sellerReference);
             return consumeBothReferencesAndRejectLocked(
                     record, buyer, seller, buyerReference, sellerReference, deterministicFailure);
         }
 
-        registerReadyReferences(buyer, seller, buyerReference, sellerReference);
+        prepareAndCommitBothReferencesLocked(
+                buyer, seller, buyerReference, sellerReference);
         ledger.commitTradeLocked(ledgerMutation);
         orderStateMachine.commitFillLocked(buyer, buyerMutation);
         orderStateMachine.commitFillLocked(seller, sellerMutation);
@@ -275,25 +278,27 @@ public final class TradeSettlementCoordinator {
     }
 
     /**
-     * 在全部订单与账本准备完成后登记双方下一成交引用。
+     * 先准备双方成交引用登记，在两侧都不可能失败后统一提交。
      *
      * @param buyer 买方订单
      * @param seller 卖方订单
      * @param buyerReference 买方下一权威引用
      * @param sellerReference 卖方下一权威引用
-     * @throws IllegalStateException 当引用未成为双方缓存头时抛出
+     * @throws IllegalArgumentException 当任一引用身份不匹配时抛出
+     * @throws IllegalStateException 当任一引用存在冲突或超过未来事件容量时抛出
+     * @note 两个 prepare 均为只读校验；两个 commit 只消费预计算结果，不执行身份、序号、冲突或容量校验。
      */
-    private void registerReadyReferences(
+    private void prepareAndCommitBothReferencesLocked(
             OrderContext buyer,
             OrderContext seller,
             TradeOrderReference buyerReference,
             TradeOrderReference sellerReference) {
-        orderStateMachine.registerEventLocked(buyer, buyerReference);
-        orderStateMachine.registerEventLocked(seller, sellerReference);
-        if (!buyerReference.equals(orderStateMachine.nextEventLocked(buyer))
-                || !sellerReference.equals(orderStateMachine.nextEventLocked(seller))) {
-            throw new IllegalStateException("ready trade references did not become both order heads");
-        }
+        OrderEventRegistrationMutation buyerRegistration =
+                orderStateMachine.prepareEventRegistrationLocked(buyer, buyerReference);
+        OrderEventRegistrationMutation sellerRegistration =
+                orderStateMachine.prepareEventRegistrationLocked(seller, sellerReference);
+        orderStateMachine.commitEventRegistrationLocked(buyerRegistration);
+        orderStateMachine.commitEventRegistrationLocked(sellerRegistration);
     }
 
     /**

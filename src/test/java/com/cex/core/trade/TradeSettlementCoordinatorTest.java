@@ -1,6 +1,7 @@
 package com.cex.core.trade;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.cex.core.account.AccountLedger;
@@ -13,12 +14,16 @@ import com.cex.core.order.OrderSide;
 import com.cex.core.order.OrderStateMachine;
 import com.cex.core.order.OrderStatus;
 import com.cex.core.order.OrderSubmission;
+import com.cex.core.order.SequenceRegistrationResult;
 import com.cex.core.order.TradeExecution;
+import com.cex.core.order.TradeOrderReference;
+import com.cex.core.order.TradeSequenceConflictException;
 import com.cex.core.order.TradingPair;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Supplier;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -165,6 +170,79 @@ class TradeSettlementCoordinatorTest {
         assertEquals(1L, fixture.metrics.settledTradeCount());
     }
 
+    /** 场景：第二侧未来序号冲突不得在第一侧遗留孤儿成交引用。 */
+    @Test
+    void secondSideSequenceConflictLeavesBothPendingMapsAndOrdersUnchanged() {
+        Fixture fixture = readyBuyerAndSeller(10L, 400L, 10L, 4L);
+        TradeOrderReference sellerHead = new TradeOrderReference(
+                90L, fixture.seller.orderId(), 3L);
+        assertEquals(SequenceRegistrationResult.BUFFERED,
+                withUserLockResult(fixture.locks, fixture.sellerId,
+                        () -> fixture.machine.registerEventLocked(fixture.seller, sellerHead)));
+        BalanceSnapshot buyerQuoteBefore = fixture.ledger.balance(fixture.buyerId, USDT);
+        BalanceSnapshot sellerBaseBefore = fixture.ledger.balance(fixture.sellerId, BTC);
+
+        assertThrows(TradeSequenceConflictException.class,
+                () -> fixture.coordinator.accept(
+                        fixture.execution(1L, 2L, 200L, 3L, 3L)));
+
+        assertEquals(0, pendingEventCount(fixture, fixture.buyer));
+        assertEquals(1, pendingEventCount(fixture, fixture.seller));
+        assertEquals(1L, fixture.buyer.lastAppliedSequence());
+        assertEquals(1L, fixture.seller.lastAppliedSequence());
+        assertEquals(0L, fixture.buyer.cumulativeBaseFilled());
+        assertEquals(0L, fixture.seller.cumulativeBaseFilled());
+        assertEquals(OrderStatus.NEW, fixture.buyer.status());
+        assertEquals(OrderStatus.NEW, fixture.seller.status());
+        assertEquals(buyerQuoteBefore, fixture.ledger.balance(fixture.buyerId, USDT));
+        assertEquals(sellerBaseBefore, fixture.ledger.balance(fixture.sellerId, BTC));
+
+        TradeOrderReference legitimateBuyerEvent = new TradeOrderReference(
+                91L, fixture.buyer.orderId(), 3L);
+        assertEquals(SequenceRegistrationResult.BUFFERED,
+                withUserLockResult(fixture.locks, fixture.buyerId,
+                        () -> fixture.machine.registerEventLocked(
+                                fixture.buyer, legitimateBuyerEvent)));
+    }
+
+    /** 场景：第二侧未来缓存满时不得在第一侧遗留孤儿成交引用。 */
+    @Test
+    void secondSideCapacityFailureLeavesBothPendingMapsAndOrdersUnchanged() {
+        Fixture fixture = readyBuyerAndSellerWithPendingCapacity(
+                10L, 400L, 10L, 4L, 1);
+        TradeOrderReference sellerExistingFuture = new TradeOrderReference(
+                90L, fixture.seller.orderId(), 3L);
+        assertEquals(SequenceRegistrationResult.BUFFERED,
+                withUserLockResult(fixture.locks, fixture.sellerId,
+                        () -> fixture.machine.registerEventLocked(
+                                fixture.seller, sellerExistingFuture)));
+        BalanceSnapshot buyerQuoteBefore = fixture.ledger.balance(fixture.buyerId, USDT);
+        BalanceSnapshot sellerBaseBefore = fixture.ledger.balance(fixture.sellerId, BTC);
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> fixture.coordinator.accept(
+                        fixture.execution(1L, 2L, 200L, 4L, 4L)));
+        assertTrue(failure.getMessage().contains("capacity"));
+
+        assertEquals(0, pendingEventCount(fixture, fixture.buyer));
+        assertEquals(1, pendingEventCount(fixture, fixture.seller));
+        assertEquals(1L, fixture.buyer.lastAppliedSequence());
+        assertEquals(1L, fixture.seller.lastAppliedSequence());
+        assertEquals(0L, fixture.buyer.cumulativeBaseFilled());
+        assertEquals(0L, fixture.seller.cumulativeBaseFilled());
+        assertEquals(OrderStatus.NEW, fixture.buyer.status());
+        assertEquals(OrderStatus.NEW, fixture.seller.status());
+        assertEquals(buyerQuoteBefore, fixture.ledger.balance(fixture.buyerId, USDT));
+        assertEquals(sellerBaseBefore, fixture.ledger.balance(fixture.sellerId, BTC));
+
+        TradeOrderReference legitimateBuyerEvent = new TradeOrderReference(
+                91L, fixture.buyer.orderId(), 4L);
+        assertEquals(SequenceRegistrationResult.BUFFERED,
+                withUserLockResult(fixture.locks, fixture.buyerId,
+                        () -> fixture.machine.registerEventLocked(
+                                fixture.buyer, legitimateBuyerEvent)));
+    }
+
     /**
      * 创建双方订单、余额和冻结额均已准备完毕的协调器夹具。
      *
@@ -179,6 +257,30 @@ class TradeSettlementCoordinatorTest {
             long buyerQuoteReserve,
             long sellerBaseQuantity,
             long sellerBaseReserve) {
+        return readyBuyerAndSellerWithPendingCapacity(
+                buyerBaseQuantity,
+                buyerQuoteReserve,
+                sellerBaseQuantity,
+                sellerBaseReserve,
+                32);
+    }
+
+    /**
+     * 创建使用指定单订单未来事件容量的双方结算夹具。
+     *
+     * @param buyerBaseQuantity 买单原始基础数量
+     * @param buyerQuoteReserve 买单报价资产预留
+     * @param sellerBaseQuantity 卖单原始基础数量
+     * @param sellerBaseReserve 卖单基础资产预留
+     * @param maxPendingEvents 每个订单允许缓存的未来事件数
+     * @return 可直接接受成交的独立夹具
+     */
+    private static Fixture readyBuyerAndSellerWithPendingCapacity(
+            long buyerBaseQuantity,
+            long buyerQuoteReserve,
+            long sellerBaseQuantity,
+            long sellerBaseReserve,
+            int maxPendingEvents) {
         StripedLockManager locks = new StripedLockManager(16);
         AccountLedger ledger = new AccountLedger(locks);
         long buyerId = 1L;
@@ -203,15 +305,26 @@ class TradeSettlementCoordinatorTest {
         orders.put(seller.orderId(), seller);
         OrderEngineMetrics metrics = new OrderEngineMetrics();
         TradeExecutionStore store = new TradeExecutionStore(32, 64);
+        OrderStateMachine machine = new OrderStateMachine(maxPendingEvents);
         TradeSettlementCoordinator coordinator = new TradeSettlementCoordinator(
                 ledger,
-                new OrderStateMachine(32),
+                machine,
                 store,
                 locks,
                 metrics,
                 orders::get);
         return new Fixture(
-                buyerId, sellerId, locks, ledger, buyer, seller, orders, metrics, store, coordinator);
+                buyerId,
+                sellerId,
+                locks,
+                ledger,
+                buyer,
+                seller,
+                orders,
+                machine,
+                metrics,
+                store,
+                coordinator);
     }
 
     /**
@@ -222,13 +335,44 @@ class TradeSettlementCoordinatorTest {
      * @param action 准备动作
      */
     private static void withUserLock(StripedLockManager locks, long userId, Runnable action) {
+        withUserLockResult(locks, userId, () -> {
+            action.run();
+            return null;
+        });
+    }
+
+    /**
+     * 在一个用户的条带锁内执行带返回值的测试动作。
+     *
+     * @param locks 条带锁管理器
+     * @param userId 用户标识
+     * @param action 带返回值的测试动作
+     * @param <T> 动作返回类型
+     * @return 测试动作返回值
+     */
+    private static <T> T withUserLockResult(
+            StripedLockManager locks, long userId, Supplier<T> action) {
         ReentrantLock lock = locks.lockForUser(userId);
         lock.lock();
         try {
-            action.run();
+            return action.get();
         } finally {
             lock.unlock();
         }
+    }
+
+    /**
+     * 在订单所属用户锁内读取待处理事件数量。
+     *
+     * @param fixture 测试夹具
+     * @param order 目标订单
+     * @return 当前待处理事件数量
+     */
+    private static int pendingEventCount(Fixture fixture, OrderContext order) {
+        return withUserLockResult(
+                fixture.locks,
+                order.userId(),
+                () -> fixture.machine.pendingEventCountLocked(order));
     }
 
     /**
@@ -244,6 +388,7 @@ class TradeSettlementCoordinatorTest {
      * @param buyer 买单上下文
      * @param seller 卖单上下文
      * @param orders 订单索引
+     * @param machine 单订单状态机
      * @param metrics 指标
      * @param store 成交存储
      * @param coordinator 成交协调器
@@ -256,6 +401,7 @@ class TradeSettlementCoordinatorTest {
             OrderContext buyer,
             OrderContext seller,
             ConcurrentMap<Long, OrderContext> orders,
+            OrderStateMachine machine,
             OrderEngineMetrics metrics,
             TradeExecutionStore store,
             TradeSettlementCoordinator coordinator) {
