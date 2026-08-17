@@ -36,6 +36,93 @@ class OrderContextTest {
         assertTrue(Modifier.isVolatile(modifiers));
     }
 
+    /** 场景：强类型提交应初始化订单元数据、剩余量和起始权威序号。 */
+    @Test
+    void submissionInitializesTypedOrderState() {
+        TradingPair pair = new TradingPair(new AssetId("BTC"), new AssetId("USDT"));
+
+        OrderContext context = OrderContext.fromSubmission(new OrderSubmission(
+                11L, 21L, OrderSide.BUY, pair,
+                10L, 1_000L, 900L, 7L, 100L));
+
+        assertEquals(11L, context.orderId());
+        assertEquals(21L, context.userId());
+        assertEquals(OrderSide.BUY, context.side());
+        assertEquals(pair, context.pair());
+        assertEquals(10L, context.originalBaseQuantity());
+        assertEquals(1_000L, context.originalReservedAmount());
+        assertEquals(900L, context.riskQuoteAmount());
+        assertEquals(0L, context.cumulativeBaseFilled());
+        assertEquals(0L, context.cumulativeQuoteFilled());
+        assertEquals(10L, context.remainingBaseQuantity());
+        assertEquals(1_000L, context.remainingReservedAmount());
+        assertEquals(7L, context.lastAppliedSequence());
+        assertEquals(OrderStatus.NEW, context.status());
+    }
+
+    /** 场景：未来事件按序缓存，相同载荷幂等，不同载荷形成确定性协议冲突。 */
+    @Test
+    void sequencedEventRegistrationBuffersDuplicatesAndRejectsConflicts() {
+        TradingPair pair = new TradingPair(new AssetId("BTC"), new AssetId("USDT"));
+        OrderContext context = OrderContext.fromSubmission(new OrderSubmission(
+                11L, 21L, OrderSide.BUY, pair,
+                10L, 1_000L, 900L, 1L, 100L));
+        OrderStateMachine machine = new OrderStateMachine(2);
+        TradeOrderReference future = new TradeOrderReference(30L, 11L, 3L);
+        TradeOrderReference next = new TradeOrderReference(20L, 11L, 2L);
+
+        assertEquals(SequenceRegistrationResult.BUFFERED,
+                machine.registerEventLocked(context, future));
+        assertEquals(SequenceRegistrationResult.DUPLICATE,
+                machine.registerEventLocked(context, future));
+        assertEquals(SequenceRegistrationResult.READY,
+                machine.registerEventLocked(context, next));
+        assertEquals(next, machine.nextEventLocked(context));
+        assertThrows(TradeSequenceConflictException.class,
+                () -> machine.registerEventLocked(context,
+                        new TradeOrderReference(21L, 11L, 2L)));
+    }
+
+    /** 场景：已消费序号属于过期事件，缓存达到边界后不得接受新的未来事件。 */
+    @Test
+    void sequenceRegistrationIsStaleAndBoundedDeterministically() {
+        TradingPair pair = new TradingPair(new AssetId("BTC"), new AssetId("USDT"));
+        OrderContext context = OrderContext.fromSubmission(new OrderSubmission(
+                11L, 21L, OrderSide.BUY, pair,
+                10L, 1_000L, 900L, 1L, 100L));
+        OrderStateMachine machine = new OrderStateMachine(1);
+
+        assertEquals(SequenceRegistrationResult.STALE,
+                machine.registerEventLocked(context,
+                        new TradeOrderReference(10L, 11L, 1L)));
+        assertEquals(SequenceRegistrationResult.BUFFERED,
+                machine.registerEventLocked(context,
+                        new TradeOrderReference(30L, 11L, 3L)));
+        assertThrows(IllegalStateException.class,
+                () -> machine.registerEventLocked(context,
+                        new TradeOrderReference(40L, 11L, 4L)));
+    }
+
+    /** 场景：容量只限制未来事件，已就绪的下一事件不得占用未来缓存配额。 */
+    @Test
+    void readyEventDoesNotConsumeFutureEventCapacity() {
+        TradingPair pair = new TradingPair(new AssetId("BTC"), new AssetId("USDT"));
+        OrderContext context = OrderContext.fromSubmission(new OrderSubmission(
+                11L, 21L, OrderSide.BUY, pair,
+                10L, 1_000L, 900L, 1L, 100L));
+        OrderStateMachine machine = new OrderStateMachine(1);
+
+        assertEquals(SequenceRegistrationResult.READY,
+                machine.registerEventLocked(context,
+                        new TradeOrderReference(20L, 11L, 2L)));
+        assertEquals(SequenceRegistrationResult.BUFFERED,
+                machine.registerEventLocked(context,
+                        new TradeOrderReference(30L, 11L, 3L)));
+        assertThrows(IllegalStateException.class,
+                () -> machine.registerEventLocked(context,
+                        new TradeOrderReference(40L, 11L, 4L)));
+    }
+
     /** 场景：重复登记同一事实应保留事实位并返回重复结果。 */
     @Test
     void duplicateFactRegistrationIsExposedWithoutClearingTheFact() {

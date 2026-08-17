@@ -1,0 +1,393 @@
+package com.cex.core.order;
+
+import java.util.Objects;
+
+/**
+ * 管理单订单权威序号、部分成交和等待撤单状态的无资金状态机。
+ *
+ * <p>核心能力：登记有界乱序事件，并以准备—提交两阶段生成可原子协调的订单变更。</p>
+ * <p>线程安全：实例无可变业务状态；每次调用必须由订单所属用户锁保护。</p>
+ * <p>使用限制：不读取或修改账户余额，也不协调成交对手方订单。</p>
+ */
+public final class OrderStateMachine {
+    private final int maxPendingEvents;
+
+    /**
+     * 创建具有单订单未来事件上限的状态机。
+     *
+     * @param maxPendingEvents 每个订单允许缓存的未来事件数，必须严格为正
+     * @throws IllegalArgumentException 当容量不为正数时抛出
+     */
+    public OrderStateMachine(int maxPendingEvents) {
+        if (maxPendingEvents <= 0) {
+            throw new IllegalArgumentException("maxPendingEvents must be positive");
+        }
+        this.maxPendingEvents = maxPendingEvents;
+    }
+
+    /**
+     * 按订单权威序号登记一个单订单事件。
+     *
+     * @param order 目标订单上下文，不能为空
+     * @param event 待登记的不可变事件，不能为空且订单标识必须匹配
+     * @return 可立即处理、已缓存、幂等重复或已经过期的登记结果
+     * @throws NullPointerException 当订单或事件为 {@code null} 时抛出
+     * @throws IllegalArgumentException 当事件属于其他订单时抛出
+     * @throws IllegalStateException 当未来事件缓存已满时抛出
+     * @throws TradeSequenceConflictException 当相同未消费序号已有不同载荷时抛出
+     * @note 调用方须持有订单所属用户锁；缓存满时新事件不会被接受或替换旧事件。
+     */
+    public SequenceRegistrationResult registerEventLocked(
+            OrderContext order, SequencedOrderEvent event) {
+        Objects.requireNonNull(order, "order");
+        Objects.requireNonNull(event, "event");
+        requireOrderId(order, event.orderId());
+
+        long sequence = event.orderSequence();
+        if (sequence <= order.lastAppliedSequence()) {
+            return SequenceRegistrationResult.STALE;
+        }
+        SequencedOrderEvent existing = order.pendingEventLocked(sequence);
+        if (existing != null) {
+            if (existing.equals(event)) {
+                return SequenceRegistrationResult.DUPLICATE;
+            }
+            throw new TradeSequenceConflictException(
+                    "different payload for orderId=" + order.orderId()
+                            + ", sequence=" + sequence);
+        }
+
+        long nextSequence = nextSequence(order.lastAppliedSequence());
+        int futureEventCount = order.pendingEventCountLocked();
+        if (order.pendingEventLocked(nextSequence) != null) {
+            futureEventCount--;
+        }
+        if (sequence > nextSequence && futureEventCount >= maxPendingEvents) {
+            throw new IllegalStateException(
+                    "pending event capacity exceeded for orderId=" + order.orderId());
+        }
+        order.putPendingEventLocked(event);
+        return sequence == nextSequence
+                ? SequenceRegistrationResult.READY
+                : SequenceRegistrationResult.BUFFERED;
+    }
+
+    /**
+     * 返回当前恰好占用下一权威序号的已登记事件。
+     *
+     * @param order 目标订单上下文，不能为空
+     * @return 下一事件；序号仍有空洞或未登记时为 {@code null}
+     * @throws NullPointerException 当订单为 {@code null} 时抛出
+     * @throws TradeSequenceConflictException 当最后序号已达到 {@link Long#MAX_VALUE} 时抛出
+     * @note 调用方须持有订单所属用户锁，返回值只在该临界区内保持一致。
+     */
+    public SequencedOrderEvent nextEventLocked(OrderContext order) {
+        Objects.requireNonNull(order, "order");
+        return order.pendingEventLocked(nextSequence(order.lastAppliedSequence()));
+    }
+
+    /**
+     * 返回订单当前已登记但未消费的事件数量。
+     *
+     * @param order 目标订单上下文，不能为空
+     * @return 包含下一事件和未来事件的缓存数量
+     * @throws NullPointerException 当订单为 {@code null} 时抛出
+     * @note 调用方须持有订单所属用户锁。
+     */
+    public int pendingEventCountLocked(OrderContext order) {
+        return Objects.requireNonNull(order, "order").pendingEventCountLocked();
+    }
+
+    /**
+     * 提交一个已由协调器确认是下一事件的序号消费。
+     *
+     * @param order 目标订单上下文；必须是准备阶段校验过的同一实例
+     * @param orderSequence 已预检为下一序号的值
+     * @note 本方法仅赋值并移除对应缓存，不执行算术或校验；调用方须持续持有用户锁。
+     */
+    public void commitSequenceLocked(OrderContext order, long orderSequence) {
+        order.commitSequenceLocked(orderSequence);
+    }
+
+    /**
+     * 准备一笔权威成交对单订单的全部状态变更。
+     *
+     * @param order 目标订单上下文，不能为空
+     * @param execution 外部撮合提供的权威成交，不能为空
+     * @return 已完成元数据、序号和数量校验的不可变成交变更
+     * @throws NullPointerException 当订单或成交为 {@code null} 时抛出
+     * @throws OrderTerminalStateException 当订单已经成交或取消终结时抛出
+     * @throws TradeSequenceConflictException 当成交不是订单下一序号或与缓存事件冲突时抛出
+     * @throws InvalidTradeExecutionException 当方向、交易对、数量、冻结额或活动状态不合法时抛出
+     * @note 本方法只读订单并计算结果，不修改订单或资金；调用方须持有用户锁。
+     */
+    public OrderFillMutation prepareFillLocked(OrderContext order, TradeExecution execution) {
+        Objects.requireNonNull(order, "order");
+        Objects.requireNonNull(execution, "execution");
+        rejectTerminalFill(order);
+        requireFillableState(order);
+        validateExecutionMetadata(order, execution);
+
+        long sequence = executionSequence(order, execution);
+        requireNextSequence(order, sequence);
+        validateRegisteredTrade(order, execution, sequence);
+
+        try {
+            if (execution.baseQuantity() > order.remainingBaseQuantity()) {
+                throw new InvalidTradeExecutionException(
+                        "base quantity exceeds remaining order quantity");
+            }
+            long reserveDebit = order.side() == OrderSide.BUY
+                    ? execution.quoteQuantity()
+                    : execution.baseQuantity();
+            if (reserveDebit > order.remainingReservedAmount()) {
+                throw new InvalidTradeExecutionException(
+                        "execution exceeds remaining reserved amount");
+            }
+
+            long cumulativeBase = Math.addExact(
+                    order.cumulativeBaseFilled(), execution.baseQuantity());
+            long cumulativeQuote = Math.addExact(
+                    order.cumulativeQuoteFilled(), execution.quoteQuantity());
+            long remainingBase = Math.subtractExact(
+                    order.remainingBaseQuantity(), execution.baseQuantity());
+            long reserveAfterDebit = Math.subtractExact(
+                    order.remainingReservedAmount(), reserveDebit);
+            boolean completelyFilled = remainingBase == 0L;
+            if (completelyFilled
+                    && order.side() == OrderSide.SELL
+                    && reserveAfterDebit != 0L) {
+                throw new InvalidTradeExecutionException(
+                        "filled sell order would leave reserved base amount");
+            }
+
+            long buyerRelease = completelyFilled && order.side() == OrderSide.BUY
+                    ? reserveAfterDebit
+                    : 0L;
+            long remainingReserve = completelyFilled ? 0L : reserveAfterDebit;
+            OrderStatus targetStatus = targetFillStatus(order.status(), completelyFilled);
+            return new OrderFillMutation(
+                    cumulativeBase,
+                    cumulativeQuote,
+                    remainingBase,
+                    remainingReserve,
+                    buyerRelease,
+                    sequence,
+                    targetStatus);
+        } catch (ArithmeticException exception) {
+            throw new InvalidTradeExecutionException(
+                    "trade execution arithmetic overflow", exception);
+        }
+    }
+
+    /**
+     * 提交准备好的单订单成交变更。
+     *
+     * @param order 准备该变更的订单上下文
+     * @param mutation 已通过 {@link #prepareFillLocked(OrderContext, TradeExecution)} 校验的变更
+     * @note 本方法只执行预计算赋值和缓存移除，不再计算、校验或修改资金；调用方须持有用户锁。
+     */
+    public void commitFillLocked(OrderContext order, OrderFillMutation mutation) {
+        order.commitFillLocked(mutation);
+    }
+
+    /**
+     * 准备并立即提交一笔单订单成交变更。
+     *
+     * @param order 目标订单上下文，不能为空
+     * @param execution 外部撮合提供的权威成交，不能为空
+     * @throws NullPointerException 当订单或成交为 {@code null} 时抛出
+     * @throws OrderTerminalStateException 当订单已经进入终态时抛出
+     * @throws TradeSequenceConflictException 当成交不是下一权威序号时抛出
+     * @throws InvalidTradeExecutionException 当成交元数据、数量、冻结额或活动状态不合法时抛出
+     * @note 只适用于无需双边账本协调的调用；生产结算应分别准备双方后再统一提交。
+     */
+    public void applyFillLocked(OrderContext order, TradeExecution execution) {
+        OrderFillMutation mutation = prepareFillLocked(order, execution);
+        commitFillLocked(order, mutation);
+    }
+
+    /**
+     * 幂等登记本地撤单请求并进入等待确认状态。
+     *
+     * @param order 目标订单上下文，不能为空
+     * @param request 撤单请求，不能为空且订单标识必须匹配
+     * @return 首次登记并进入等待状态时为 {@code true}；重复请求或终态订单为 {@code false}
+     * @throws NullPointerException 当订单或请求为 {@code null} 时抛出
+     * @throws IllegalArgumentException 当请求属于其他订单时抛出
+     * @note 本方法不解冻资产；调用方须持有用户锁并对首次返回结果发送外部撤单请求。
+     */
+    public boolean requestCancelLocked(OrderContext order, CancelRequest request) {
+        Objects.requireNonNull(order, "order");
+        Objects.requireNonNull(request, "request");
+        requireOrderId(order, request.orderId());
+        if (order.status() == OrderStatus.FILLED || order.status() == OrderStatus.CANCELED) {
+            return false;
+        }
+        if (order.cancelRequestId() != 0L) {
+            return false;
+        }
+        order.startCancelLocked(request.cancelRequestId());
+        return true;
+    }
+
+    /**
+     * 准备权威撤单确认对应的剩余冻结额释放和订单状态变更。
+     *
+     * @param order 目标订单上下文，不能为空
+     * @param confirmation 外部撮合撤单确认，不能为空
+     * @return 已预计算释放额、确认序号和目标状态的不可变变更
+     * @throws NullPointerException 当订单或确认为 {@code null} 时抛出
+     * @throws IllegalArgumentException 当订单或撤单请求标识不匹配时抛出
+     * @throws OrderTerminalStateException 当订单已经取消终结时抛出
+     * @throws TradeSequenceConflictException 当确认不是下一序号或与缓存事件冲突时抛出
+     * @note 已完全成交订单的确认作为零释放过期确认准备，提交后仍保持 {@code FILLED}。
+     */
+    public OrderCancelMutation prepareCancelLocked(
+            OrderContext order, CancelConfirmation confirmation) {
+        Objects.requireNonNull(order, "order");
+        Objects.requireNonNull(confirmation, "confirmation");
+        requireOrderId(order, confirmation.orderId());
+        if (order.cancelRequestId() == 0L
+                || order.cancelRequestId() != confirmation.cancelRequestId()) {
+            throw new IllegalArgumentException(
+                    "cancel request ID mismatch for orderId=" + order.orderId());
+        }
+        if (order.status() == OrderStatus.CANCELED) {
+            throw new OrderTerminalStateException(
+                    "order is already canceled: orderId=" + order.orderId());
+        }
+
+        long sequence = confirmation.orderSequence();
+        requireNextSequence(order, sequence);
+        validateRegisteredEvent(order, confirmation, sequence);
+        if (order.status() == OrderStatus.FILLED) {
+            return new OrderCancelMutation(0L, sequence, OrderStatus.FILLED);
+        }
+        if (order.status() != OrderStatus.PENDING_CANCEL) {
+            throw new IllegalArgumentException(
+                    "order is not pending cancel: orderId=" + order.orderId());
+        }
+
+        long releaseAmount;
+        try {
+            releaseAmount = order.side() == OrderSide.BUY
+                    ? Math.subtractExact(
+                            order.originalReservedAmount(), order.cumulativeQuoteFilled())
+                    : Math.subtractExact(
+                            order.originalReservedAmount(), order.cumulativeBaseFilled());
+        } catch (ArithmeticException exception) {
+            throw new IllegalStateException("invalid reserved amount invariant", exception);
+        }
+        if (releaseAmount < 0L || releaseAmount != order.remainingReservedAmount()) {
+            throw new IllegalStateException(
+                    "remaining reserved amount invariant violated for orderId=" + order.orderId());
+        }
+        return new OrderCancelMutation(releaseAmount, sequence, OrderStatus.CANCELED);
+    }
+
+    /**
+     * 提交准备好的撤单确认变更。
+     *
+     * @param order 准备该变更的订单上下文
+     * @param mutation 已通过 {@link #prepareCancelLocked(OrderContext, CancelConfirmation)} 校验的变更
+     * @note 本方法只归零剩余冻结额、推进序号并赋值状态；调用方须先提交解冻且持续持有用户锁。
+     */
+    public void commitCancelLocked(OrderContext order, OrderCancelMutation mutation) {
+        order.commitCancelLocked(mutation);
+    }
+
+    private static void requireFillableState(OrderContext order) {
+        if (order.status() != OrderStatus.NEW
+                && order.status() != OrderStatus.PARTIALLY_FILLED
+                && order.status() != OrderStatus.PENDING_CANCEL) {
+            throw new InvalidTradeExecutionException(
+                    "order state cannot apply fill: " + order.status());
+        }
+    }
+
+    private static void rejectTerminalFill(OrderContext order) {
+        if (order.status() == OrderStatus.FILLED || order.status() == OrderStatus.CANCELED) {
+            throw new OrderTerminalStateException(
+                    "order is terminal: orderId=" + order.orderId()
+                            + ", status=" + order.status());
+        }
+    }
+
+    private static void validateExecutionMetadata(
+            OrderContext order, TradeExecution execution) {
+        long executionOrderId = order.side() == OrderSide.BUY
+                ? execution.buyOrderId()
+                : execution.sellOrderId();
+        if (executionOrderId != order.orderId() || !execution.pair().equals(order.pair())) {
+            throw new InvalidTradeExecutionException(
+                    "trade metadata mismatch for orderId=" + order.orderId());
+        }
+    }
+
+    private static long executionSequence(OrderContext order, TradeExecution execution) {
+        return order.side() == OrderSide.BUY
+                ? execution.buyOrderSequence()
+                : execution.sellOrderSequence();
+    }
+
+    private static void validateRegisteredTrade(
+            OrderContext order, TradeExecution execution, long sequence) {
+        SequencedOrderEvent registered = order.pendingEventLocked(sequence);
+        if (registered == null) {
+            return;
+        }
+        TradeOrderReference expected = new TradeOrderReference(
+                execution.tradeId(), order.orderId(), sequence);
+        if (!registered.equals(expected)) {
+            throw new TradeSequenceConflictException(
+                    "registered event does not match trade for orderId=" + order.orderId()
+                            + ", sequence=" + sequence);
+        }
+    }
+
+    private static void validateRegisteredEvent(
+            OrderContext order, SequencedOrderEvent event, long sequence) {
+        SequencedOrderEvent registered = order.pendingEventLocked(sequence);
+        if (registered != null && !registered.equals(event)) {
+            throw new TradeSequenceConflictException(
+                    "registered event payload conflict for orderId=" + order.orderId()
+                            + ", sequence=" + sequence);
+        }
+    }
+
+    private static void requireOrderId(OrderContext order, long eventOrderId) {
+        if (order.orderId() != eventOrderId) {
+            throw new IllegalArgumentException(
+                    "event order ID mismatch: expected=" + order.orderId()
+                            + ", actual=" + eventOrderId);
+        }
+    }
+
+    private static void requireNextSequence(OrderContext order, long sequence) {
+        long expected = nextSequence(order.lastAppliedSequence());
+        if (sequence != expected) {
+            throw new TradeSequenceConflictException(
+                    "expected sequence=" + expected + ", actual=" + sequence
+                            + ", orderId=" + order.orderId());
+        }
+    }
+
+    private static long nextSequence(long lastAppliedSequence) {
+        try {
+            return Math.addExact(lastAppliedSequence, 1L);
+        } catch (ArithmeticException exception) {
+            throw new TradeSequenceConflictException("order sequence exhausted");
+        }
+    }
+
+    private static OrderStatus targetFillStatus(
+            OrderStatus currentStatus, boolean completelyFilled) {
+        if (completelyFilled) {
+            return OrderStatus.FILLED;
+        }
+        return currentStatus == OrderStatus.PENDING_CANCEL
+                ? OrderStatus.PENDING_CANCEL
+                : OrderStatus.PARTIALLY_FILLED;
+    }
+}
