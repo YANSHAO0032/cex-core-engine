@@ -2,6 +2,7 @@ package com.cex.core.risk;
 
 import com.cex.core.account.AccountLedger;
 import com.cex.core.concurrent.StripedLockManager;
+import com.cex.core.order.AssetId;
 import com.cex.core.order.OrderEngine;
 import com.cex.core.order.OrderEvent;
 import com.cex.core.order.OrderEventType;
@@ -17,6 +18,8 @@ import static org.junit.jupiter.api.Assertions.*;
  * 核心能力：验证 10 秒窗口过期、copy-on-write 规则更新及短路行为；线程安全：使用闭锁协调异步审批；使用限制：仅验证内存实现的确定性行为。
  */
 class RiskEngineTest {
+    /** 风控上下文测试报价资产。 */
+    private static final AssetId USDT = new AssetId("USDT");
     /**
      * 场景：已结算金额超过阈值触发审批，并可通过推进时钟跨越 10 秒窗口而过期。
      *
@@ -31,7 +34,7 @@ class RiskEngineTest {
         ManualClock clock = new ManualClock(100L);
         ApprovalService approvals = new ApprovalService(1, 8);
         OrderEngine engine = new OrderEngine(ledger,
-                new RiskPipeline(new SlidingWindowAmountRule(100L)), clock, approvals, event -> {
+                new RiskPipeline(new SlidingWindowAmountRule(120L)), clock, approvals, event -> {
                     approvalEntered.countDown();
                     try {
                         releaseApproval.await();
@@ -68,7 +71,7 @@ class RiskEngineTest {
         RiskRule hold = context -> RiskDecision.HOLD;
         RiskRule countingPass = context -> { second.incrementAndGet(); return RiskDecision.PASS; };
         RiskPipeline pipeline = new RiskPipeline(hold, countingPass);
-        RiskContext context = new RiskContext(1L, 1L, 1L, 1L, 1L);
+        RiskContext context = new RiskContext(1L, 1L, USDT, 1L, 1L, 1L);
         assertEquals(RiskDecision.HOLD, pipeline.evaluate(context));
         assertEquals(0, second.get());
         pipeline.replaceRules(countingPass);
@@ -86,6 +89,18 @@ class RiskEngineTest {
         window.record(1000L, 50L);
         assertEquals(90L, window.currentSum(10_000L));
         assertEquals(50L, window.currentSum(10_101L));
+    }
+
+    /** 场景：窗口准备阶段无副作用，提交后才发布新金额。 */
+    @Test
+    void tradeWindowPreparationDoesNotMutateUntilCommit() {
+        TradeWindow window = new TradeWindow(10_000L);
+
+        TradeWindowMutation mutation = window.prepareRecord(100L, 40L);
+
+        assertEquals(0L, window.currentSum(100L));
+        window.commitRecord(mutation);
+        assertEquals(40L, window.currentSum(100L));
     }
 
     /**

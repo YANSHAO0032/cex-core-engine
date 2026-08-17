@@ -237,6 +237,74 @@ public final class OrderContext {
     }
 
     /**
+     * 为旧版订单适配器建立强类型审批输入，强类型订单直接返回原始提交。
+     *
+     * @param submittedAtMillis 旧版适配提交使用的非负毫秒时间戳
+     * @return 可交给强类型审批服务的不可变订单提交
+     * @deprecated 仅供旧版 {@link OrderEngine#process(OrderEvent)} 迁移期使用
+     */
+    @Deprecated(since = "typed-approval", forRemoval = true)
+    OrderSubmission approvalSubmission(long submittedAtMillis) {
+        if (originalSubmission != null) {
+            return originalSubmission;
+        }
+        return new OrderSubmission(
+                orderId,
+                userId,
+                side,
+                pair,
+                originalBaseQuantity,
+                originalReservedAmount,
+                riskQuoteAmount,
+                1L,
+                submittedAtMillis);
+    }
+
+    /**
+     * 为风控拒绝派生稳定撤单请求。
+     *
+     * @return 同一暂挂订单始终相等且请求 ID 相同的撤单请求
+     * @throws IllegalStateException 当订单不是强类型风控暂挂单或由该请求进入的等待撤单状态时抛出
+     * @note 调用方必须持有用户锁；请求 ID 由订单 ID 双射派生，请求时间固定取原始提交时间，发送失败后的重试因此复用完全相同的载荷。
+     * @note 不在每个订单上下文保存额外请求引用，避免 256MB 堆下旧版大规模兼容测试为从不触发的风险撤单支付常驻内存。
+     */
+    CancelRequest riskCancelRequestLocked() {
+        long derivedRequestId = derivedRiskCancelRequestId();
+        if (status != OrderStatus.RISK_HOLD
+                && (status != OrderStatus.PENDING_CANCEL
+                || cancelRequestId != derivedRequestId)) {
+            throw new IllegalStateException("risk cancellation requires a held typed order");
+        }
+        return new CancelRequest(
+                derivedRequestId, orderId, originalSubmission.submittedAtMillis());
+    }
+
+    /**
+     * 判断当前等待撤单状态是否由稳定风险请求建立。
+     *
+     * @return 当前请求标识等于该订单派生风险请求标识时为 {@code true}
+     * @note 调用方必须持有用户锁。
+     */
+    boolean hasRiskCancelRequestLocked() {
+        return originalSubmission != null
+                && cancelRequestId != 0L
+                && cancelRequestId == derivedRiskCancelRequestId();
+    }
+
+    /**
+     * 返回订单标识双射派生的正数风险撤单请求标识。
+     *
+     * @return 与订单一一对应的正数风险撤单请求 ID
+     * @throws IllegalStateException 当上下文不是强类型订单时抛出
+     */
+    private long derivedRiskCancelRequestId() {
+        if (originalSubmission == null) {
+            throw new IllegalStateException("risk cancellation requires a typed order");
+        }
+        return Long.MAX_VALUE - orderId + 1L;
+    }
+
+    /**
      * 在迁移期旧版引擎的用户锁内更新兼容状态。
      *
      * @param status 目标旧版状态，不能为空

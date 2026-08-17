@@ -2,12 +2,17 @@ package com.cex.core.risk;
 
 import com.cex.core.account.AccountLedger;
 import com.cex.core.concurrent.StripedLockManager;
+import com.cex.core.order.AssetId;
 import com.cex.core.order.OrderEngine;
 import com.cex.core.order.OrderEvent;
 import com.cex.core.order.OrderEventType;
+import com.cex.core.order.OrderSide;
 import com.cex.core.order.OrderStatus;
+import com.cex.core.order.OrderSubmission;
+import com.cex.core.order.TradingPair;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -23,15 +28,24 @@ class ApprovalTest {
      * @throws Exception 审批任务等待或服务关闭失败时抛出
      */
     @Test
-    void approvalServiceOnlyEmitsAnEvent() throws Exception {
+    void approvalServiceEmitsStrongResultWithoutChangingOrderState() throws Exception {
         ApprovalService service = new ApprovalService(1, 1);
         try {
-            java.util.concurrent.atomic.AtomicReference<OrderEvent> received = new java.util.concurrent.atomic.AtomicReference<>();
-            service.submit(new OrderEvent(1L, 1L, 10L, 1L, OrderEventType.ORDER_CREATED),
-                    event -> ApprovalDecision.REJECT, received::set);
+            AssetId btc = new AssetId("BTC");
+            AssetId usdt = new AssetId("USDT");
+            OrderSubmission submission = new OrderSubmission(
+                    1L, 1L, OrderSide.BUY, new TradingPair(btc, usdt),
+                    1L, 10L, 10L, 1L, 1L);
+            AtomicReference<ApprovalResult> received = new AtomicReference<>();
+
+            service.submit(submission,
+                    source -> ApprovalDecision.REJECT, received::set);
             service.awaitQuiescence(2, TimeUnit.SECONDS);
+
             assertNotNull(received.get());
-            assertEquals(OrderEventType.APPROVAL_REJECTED, received.get().type());
+            assertEquals(1L, received.get().orderId());
+            assertEquals(ApprovalDecision.REJECT, received.get().decision());
+            assertTrue(received.get().decidedAtMillis() >= 0L);
             assertEquals(1L, service.submittedCount());
         } finally { service.close(); }
     }
@@ -47,7 +61,7 @@ class ApprovalTest {
         ledger.createAccount(1L, 1000L);
         ApprovalService approvals = new ApprovalService(1, 4);
         OrderEngine engine = new OrderEngine(ledger,
-                new RiskPipeline(new SlidingWindowAmountRule(0L)), new ManualClock(1L), approvals,
+                new RiskPipeline(new SlidingWindowAmountRule(100L)), new ManualClock(1L), approvals,
             event -> ApprovalDecision.REJECT);
         try {
             engine.process(new OrderEvent(1L, 1L, 100L, 1L, OrderEventType.ORDER_CREATED));
@@ -172,7 +186,7 @@ class ApprovalTest {
             ledger.createAccount(1L, 1_000L);
             engine = new OrderEngine(
                     ledger,
-                    new RiskPipeline(new SlidingWindowAmountRule(0L)),
+                    new RiskPipeline(new SlidingWindowAmountRule(100L)),
                     new ManualClock(1L),
                     approvals,
                     event -> {

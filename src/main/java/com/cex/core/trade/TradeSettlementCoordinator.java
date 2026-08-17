@@ -16,8 +16,15 @@ import com.cex.core.order.SequencedOrderEvent;
 import com.cex.core.order.TradeExecution;
 import com.cex.core.order.TradeOrderReference;
 import com.cex.core.order.TradeSequenceConflictException;
+import com.cex.core.risk.Clock;
+import com.cex.core.risk.RiskWindowKey;
+import com.cex.core.risk.SystemClock;
+import com.cex.core.risk.TradeWindow;
+import com.cex.core.risk.TradeWindowMutation;
 import java.util.Collection;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.LongFunction;
 import java.util.function.Supplier;
@@ -34,6 +41,8 @@ import java.util.function.Supplier;
  * @note 终态成交通过保留记录实现幂等，精确重复不会再次修改余额、订单、序号或结算指标。
  */
 public final class TradeSettlementCoordinator {
+    /** 风控成交窗口长度，固定为 10 秒。 */
+    private static final long RISK_WINDOW_MILLIS = 10_000L;
     /** 多资产账户账本。 */
     private final AccountLedger ledger;
     /** 单订单状态和权威序号状态机。 */
@@ -46,6 +55,10 @@ public final class TradeSettlementCoordinator {
     private final OrderEngineMetrics metrics;
     /** 由订单标识解析当前上下文的只读入口。 */
     private final LongFunction<OrderContext> orderLookup;
+    /** 按用户和报价资产隔离的成交风险窗口。 */
+    private final ConcurrentMap<RiskWindowKey, TradeWindow> tradeWindows;
+    /** 生成风险窗口成交记录时间的时钟。 */
+    private final Clock clock;
 
     /**
      * 创建一个双边成交协调器。
@@ -67,12 +80,42 @@ public final class TradeSettlementCoordinator {
             StripedLockManager locks,
             OrderEngineMetrics metrics,
             LongFunction<OrderContext> orderLookup) {
+        this(ledger, orderStateMachine, tradeStore, locks, metrics, orderLookup,
+                new ConcurrentHashMap<>(), new SystemClock());
+    }
+
+    /**
+     * 创建共享报价资产风险窗口的双边成交协调器。
+     *
+     * @param ledger 多资产账本，不能为空
+     * @param orderStateMachine 单订单状态机，不能为空
+     * @param tradeStore 有界成交存储，不能为空
+     * @param locks 账本共用的条带锁管理器，不能为空
+     * @param metrics 订单引擎累计指标，不能为空
+     * @param orderLookup 按订单标识返回上下文的查询函数，不能为空
+     * @param tradeWindows 按用户和报价资产隔离的并发风险窗口映射，不能为空
+     * @param clock 风控窗口成交时间来源，不能为空
+     * @throws NullPointerException 当任一依赖为 {@code null} 时抛出
+     * @throws IllegalArgumentException 当账本与协调器使用不同条带锁管理器时抛出
+     * @note 映射与订单引擎共享，使成交提交和后续创建风控读取同一窗口；窗口变更持续受对应用户条带锁保护。
+     */
+    public TradeSettlementCoordinator(
+            AccountLedger ledger,
+            OrderStateMachine orderStateMachine,
+            TradeExecutionStore tradeStore,
+            StripedLockManager locks,
+            OrderEngineMetrics metrics,
+            LongFunction<OrderContext> orderLookup,
+            ConcurrentMap<RiskWindowKey, TradeWindow> tradeWindows,
+            Clock clock) {
         this.ledger = Objects.requireNonNull(ledger, "ledger");
         this.orderStateMachine = Objects.requireNonNull(orderStateMachine, "orderStateMachine");
         this.tradeStore = Objects.requireNonNull(tradeStore, "tradeStore");
         this.locks = Objects.requireNonNull(locks, "locks");
         this.metrics = Objects.requireNonNull(metrics, "metrics");
         this.orderLookup = Objects.requireNonNull(orderLookup, "orderLookup");
+        this.tradeWindows = Objects.requireNonNull(tradeWindows, "tradeWindows");
+        this.clock = Objects.requireNonNull(clock, "clock");
         if (ledger.lockManager() != locks) {
             throw new IllegalArgumentException("ledger and coordinator must share the same lock manager");
         }
@@ -141,10 +184,12 @@ public final class TradeSettlementCoordinator {
         if (initialBuyer.userId() == initialSeller.userId()) {
             return rejectWithoutUserLocks(record, "buyer and seller users must differ");
         }
+        long riskRecordedAtMillis = clock.currentTimeMillis();
         return withBothUserLocks(
                 initialBuyer.userId(),
                 initialSeller.userId(),
-                () -> processWithBothUserLocks(record, initialBuyer, initialSeller));
+                () -> processWithBothUserLocks(
+                        record, initialBuyer, initialSeller, riskRecordedAtMillis));
     }
 
     /**
@@ -153,12 +198,14 @@ public final class TradeSettlementCoordinator {
      * @param expectedRecord 锁外解析的记录
      * @param initialBuyer 锁外解析的买方上下文
      * @param initialSeller 锁外解析的卖方上下文
+     * @param riskRecordedAtMillis 获取双方用户锁前读取的风险窗口记录时间
      * @return 本次处理结果
      */
     private TradeResult processWithBothUserLocks(
             TradeExecutionRecord expectedRecord,
             OrderContext initialBuyer,
-            OrderContext initialSeller) {
+            OrderContext initialSeller,
+            long riskRecordedAtMillis) {
         TradeExecution execution = expectedRecord.execution();
         TradeExecutionRecord record = tradeStore.record(execution.tradeId());
         if (record == null || record != expectedRecord) {
@@ -176,7 +223,8 @@ public final class TradeSettlementCoordinator {
             if (buyer != initialBuyer || seller != initialSeller) {
                 throw new IllegalStateException("order context changed while awaiting user locks");
             }
-            return prepareThenCommitLocked(record, buyer, seller);
+            return prepareThenCommitLocked(
+                    record, buyer, seller, riskRecordedAtMillis);
         }
     }
 
@@ -186,10 +234,14 @@ public final class TradeSettlementCoordinator {
      * @param record 当前仍挂起且记录监视器已持有的成交记录
      * @param buyer 已持所属用户锁的买单上下文
      * @param seller 已持所属用户锁的卖单上下文
+     * @param riskRecordedAtMillis 获取双方锁前读取的风险窗口记录时间
      * @return 挂起、结算或确定拒绝结果
      */
     private TradeResult prepareThenCommitLocked(
-            TradeExecutionRecord record, OrderContext buyer, OrderContext seller) {
+            TradeExecutionRecord record,
+            OrderContext buyer,
+            OrderContext seller,
+            long riskRecordedAtMillis) {
         TradeExecution execution = record.execution();
         if (isStaleForEitherOrder(execution, buyer, seller)) {
             return rejectLocked(record, "trade sequence is already consumed");
@@ -210,6 +262,10 @@ public final class TradeSettlementCoordinator {
         OrderFillMutation buyerMutation;
         OrderFillMutation sellerMutation;
         TradeLedgerMutation ledgerMutation;
+        TradeWindow buyerWindow;
+        TradeWindow sellerWindow;
+        TradeWindowMutation buyerWindowMutation;
+        TradeWindowMutation sellerWindowMutation;
         try {
             validateCounterpartyMetadata(execution, buyer, seller);
             buyerMutation = orderStateMachine.prepareFillLocked(buyer, execution);
@@ -222,6 +278,18 @@ public final class TradeSettlementCoordinator {
                     execution.baseQuantity(),
                     execution.quoteQuantity(),
                     buyerMutation.buyerQuoteReleaseAmount());
+            RiskWindowKey buyerWindowKey = new RiskWindowKey(
+                    buyer.userId(), execution.pair().quoteAsset());
+            RiskWindowKey sellerWindowKey = new RiskWindowKey(
+                    seller.userId(), execution.pair().quoteAsset());
+            buyerWindow = tradeWindows.computeIfAbsent(
+                    buyerWindowKey, ignored -> new TradeWindow(RISK_WINDOW_MILLIS));
+            sellerWindow = tradeWindows.computeIfAbsent(
+                    sellerWindowKey, ignored -> new TradeWindow(RISK_WINDOW_MILLIS));
+            buyerWindowMutation = buyerWindow.prepareRecord(
+                    riskRecordedAtMillis, execution.quoteQuantity());
+            sellerWindowMutation = sellerWindow.prepareRecord(
+                    riskRecordedAtMillis, execution.quoteQuantity());
         } catch (TradeSequenceConflictException protocolConflict) {
             throw protocolConflict;
         } catch (IllegalArgumentException
@@ -238,8 +306,12 @@ public final class TradeSettlementCoordinator {
         ledger.commitTradeLocked(ledgerMutation);
         orderStateMachine.commitFillLocked(buyer, buyerMutation);
         orderStateMachine.commitFillLocked(seller, sellerMutation);
+        buyerWindow.commitRecord(buyerWindowMutation);
+        sellerWindow.commitRecord(sellerWindowMutation);
         tradeStore.markSettled(execution.tradeId(), execution.executedAtMillis());
         metrics.settledTrade();
+        metrics.riskRecorded();
+        metrics.riskRecorded();
         return TradeResult.SETTLED;
     }
 

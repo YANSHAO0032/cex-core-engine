@@ -1,6 +1,7 @@
 package com.cex.core.trade;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -19,10 +20,15 @@ import com.cex.core.order.TradeExecution;
 import com.cex.core.order.TradeOrderReference;
 import com.cex.core.order.TradeSequenceConflictException;
 import com.cex.core.order.TradingPair;
+import com.cex.core.risk.ManualClock;
+import com.cex.core.risk.Clock;
+import com.cex.core.risk.RiskWindowKey;
+import com.cex.core.risk.TradeWindow;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 import org.junit.jupiter.api.Test;
 
@@ -129,6 +135,59 @@ class TradeSettlementCoordinatorTest {
         assertEquals(OrderStatus.FILLED, fixture.seller.status());
         assertEquals(0L, fixture.buyer.remainingReservedAmount());
         assertTrue(fixture.ledger.allAssetInvariantsHold());
+    }
+
+    /** 场景：第二侧窗口溢出时，第一侧窗口、账本和双方累计成交都不得半提交。 */
+    @Test
+    void sellerRiskWindowOverflowLeavesBuyerWindowAndSettlementUnchanged() {
+        Fixture fixture = readyBuyerAndSeller(10L, 200L, 10L, 2L);
+        TradeWindow buyerWindow = new TradeWindow(10_000L);
+        TradeWindow sellerWindow = new TradeWindow(10_000L);
+        buyerWindow.record(0L, 40L);
+        sellerWindow.record(0L, Long.MAX_VALUE);
+        fixture.tradeWindows.put(
+                new RiskWindowKey(fixture.buyerId, USDT), buyerWindow);
+        fixture.tradeWindows.put(
+                new RiskWindowKey(fixture.sellerId, USDT), sellerWindow);
+        BalanceSnapshot buyerQuoteBefore =
+                fixture.ledger.balance(fixture.buyerId, USDT);
+        BalanceSnapshot sellerBaseBefore =
+                fixture.ledger.balance(fixture.sellerId, BTC);
+
+        assertEquals(TradeResult.REJECTED,
+                fixture.coordinator.accept(
+                        fixture.execution(1L, 1L, 1L, 2L, 2L)));
+
+        assertEquals(40L, buyerWindow.currentSum(0L));
+        assertEquals(Long.MAX_VALUE, sellerWindow.currentSum(0L));
+        assertEquals(buyerQuoteBefore,
+                fixture.ledger.balance(fixture.buyerId, USDT));
+        assertEquals(sellerBaseBefore,
+                fixture.ledger.balance(fixture.sellerId, BTC));
+        assertEquals(0L, fixture.buyer.cumulativeBaseFilled());
+        assertEquals(0L, fixture.seller.cumulativeBaseFilled());
+    }
+
+    /** 场景：可注入时钟属于锁外依赖，读取时间时不得持有任一用户资金锁。 */
+    @Test
+    void riskClockIsReadBeforeAcquiringEitherUserLock() {
+        Fixture[] holder = new Fixture[1];
+        AtomicInteger clockReads = new AtomicInteger();
+        Clock assertingClock = () -> {
+            Fixture fixture = holder[0];
+            assertFalse(fixture.locks.lockForUser(fixture.buyerId).isHeldByCurrentThread());
+            assertFalse(fixture.locks.lockForUser(fixture.sellerId).isHeldByCurrentThread());
+            clockReads.incrementAndGet();
+            return 0L;
+        };
+        Fixture fixture = readyBuyerAndSellerWithPendingCapacity(
+                10L, 200L, 10L, 2L, 32, assertingClock);
+        holder[0] = fixture;
+
+        assertEquals(TradeResult.SETTLED,
+                fixture.coordinator.accept(
+                        fixture.execution(1L, 1L, 1L, 2L, 2L)));
+        assertEquals(1, clockReads.get());
     }
 
     /** 场景：确定拒绝应同时消费双方下一序号，使后一权威成交可以继续结算。 */
@@ -281,6 +340,33 @@ class TradeSettlementCoordinatorTest {
             long sellerBaseQuantity,
             long sellerBaseReserve,
             int maxPendingEvents) {
+        return readyBuyerAndSellerWithPendingCapacity(
+                buyerBaseQuantity,
+                buyerQuoteReserve,
+                sellerBaseQuantity,
+                sellerBaseReserve,
+                maxPendingEvents,
+                new ManualClock(0L));
+    }
+
+    /**
+     * 创建使用指定未来事件容量和风险时钟的双方结算夹具。
+     *
+     * @param buyerBaseQuantity 买单原始基础数量
+     * @param buyerQuoteReserve 买单报价资产预留
+     * @param sellerBaseQuantity 卖单原始基础数量
+     * @param sellerBaseReserve 卖单基础资产预留
+     * @param maxPendingEvents 每个订单允许缓存的未来事件数
+     * @param clock 风险窗口成交时间来源
+     * @return 可直接接受成交的独立夹具
+     */
+    private static Fixture readyBuyerAndSellerWithPendingCapacity(
+            long buyerBaseQuantity,
+            long buyerQuoteReserve,
+            long sellerBaseQuantity,
+            long sellerBaseReserve,
+            int maxPendingEvents,
+            Clock clock) {
         StripedLockManager locks = new StripedLockManager(16);
         AccountLedger ledger = new AccountLedger(locks);
         long buyerId = 1L;
@@ -306,13 +392,17 @@ class TradeSettlementCoordinatorTest {
         OrderEngineMetrics metrics = new OrderEngineMetrics();
         TradeExecutionStore store = new TradeExecutionStore(32, 64);
         OrderStateMachine machine = new OrderStateMachine(maxPendingEvents);
+        ConcurrentMap<RiskWindowKey, TradeWindow> tradeWindows =
+                new ConcurrentHashMap<>();
         TradeSettlementCoordinator coordinator = new TradeSettlementCoordinator(
                 ledger,
                 machine,
                 store,
                 locks,
                 metrics,
-                orders::get);
+                orders::get,
+                tradeWindows,
+                clock);
         return new Fixture(
                 buyerId,
                 sellerId,
@@ -324,6 +414,7 @@ class TradeSettlementCoordinatorTest {
                 machine,
                 metrics,
                 store,
+                tradeWindows,
                 coordinator);
     }
 
@@ -391,6 +482,7 @@ class TradeSettlementCoordinatorTest {
      * @param machine 单订单状态机
      * @param metrics 指标
      * @param store 成交存储
+     * @param tradeWindows 按用户和报价资产隔离的风险窗口
      * @param coordinator 成交协调器
      */
     private record Fixture(
@@ -404,6 +496,7 @@ class TradeSettlementCoordinatorTest {
             OrderStateMachine machine,
             OrderEngineMetrics metrics,
             TradeExecutionStore store,
+            ConcurrentMap<RiskWindowKey, TradeWindow> tradeWindows,
             TradeSettlementCoordinator coordinator) {
 
         /**

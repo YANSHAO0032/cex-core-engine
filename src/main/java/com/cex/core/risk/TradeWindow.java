@@ -37,20 +37,87 @@ public final class TradeWindow {
 
     /**
      * 记录一笔成交金额并先回收此时刻已过期的记录。
-     * @param timestampMillis 成交发生的毫秒时间戳
+     * @param timestampMillis 成交发生的非负毫秒时间戳
      * @param amount 正的成交金额
-     * @throws IllegalArgumentException 当金额不为正数时抛出
+     * @throws IllegalArgumentException 当时间为负数或金额不为正数时抛出
      * @note 使用 primitive 环形缓冲避免对象分配；调用方需提供时间有序事件以维持过期回收正确性。
      */
     public void record(long timestampMillis, long amount) {
-        MoneyMath.requirePositive(amount);
-        evict(timestampMillis);
-        ensureCapacity(size + 1);
-        int tail = (head + size) % timestamps.length;
-        timestamps[tail] = timestampMillis;
-        amounts[tail] = amount;
-        size++;
-        rollingSum = MoneyMath.checkedAdd(rollingSum, amount);
+        commitRecord(prepareRecord(timestampMillis, amount));
+    }
+
+    /**
+     * 无副作用地准备一笔成交记录及逻辑过期回收。
+     *
+     * @param timestampMillis 成交发生的非负毫秒时间戳
+     * @param amount 正的报价资产成交金额
+     * @return 已完成过期回收、精确加法和可选扩容的窗口变更
+     * @throws IllegalArgumentException 当时间为负数或金额不为正数时抛出
+     * @throws ArithmeticException 当累计金额或扩容计算溢出时抛出
+     * @note 准备阶段不修改 live 数组、头索引、记录数或累计值；调用方可先准备双方窗口再统一提交。
+     */
+    public TradeWindowMutation prepareRecord(long timestampMillis, long amount) {
+        long normalizedTimestamp = MoneyMath.requireNonNegative(timestampMillis);
+        long normalizedAmount = MoneyMath.requirePositive(amount);
+        long cutoff = normalizedTimestamp - windowMillis;
+        int evicted = 0;
+        long logicalSum = rollingSum;
+        while (evicted < size) {
+            int index = (head + evicted) % timestamps.length;
+            if (timestamps[index] >= cutoff) {
+                break;
+            }
+            logicalSum = Math.subtractExact(logicalSum, amounts[index]);
+            evicted++;
+        }
+        int logicalHead = (head + evicted) % timestamps.length;
+        int logicalSize = size - evicted;
+        long sumAfter = MoneyMath.checkedAdd(logicalSum, normalizedAmount);
+        int sizeAfter = Math.addExact(logicalSize, 1);
+        if (sizeAfter <= timestamps.length) {
+            int tail = (logicalHead + logicalSize) % timestamps.length;
+            return new TradeWindowMutation(
+                    null, null, tail, normalizedTimestamp, normalizedAmount,
+                    logicalHead, sizeAfter, sumAfter);
+        }
+
+        int nextCapacity = Math.multiplyExact(timestamps.length, 2);
+        while (nextCapacity < sizeAfter) {
+            nextCapacity = Math.multiplyExact(nextCapacity, 2);
+        }
+        long[] newTimestamps = new long[nextCapacity];
+        long[] newAmounts = new long[nextCapacity];
+        for (int i = 0; i < logicalSize; i++) {
+            int source = (logicalHead + i) % timestamps.length;
+            newTimestamps[i] = timestamps[source];
+            newAmounts[i] = amounts[source];
+        }
+        newTimestamps[logicalSize] = normalizedTimestamp;
+        newAmounts[logicalSize] = normalizedAmount;
+        return new TradeWindowMutation(
+                newTimestamps, newAmounts, -1, normalizedTimestamp, normalizedAmount,
+                0, sizeAfter, sumAfter);
+    }
+
+    /**
+     * 提交一份由本窗口当前状态准备的成交变更。
+     *
+     * @param mutation 尚未提交且由本窗口最新状态准备的变更
+     * @throws NullPointerException 当变更为 {@code null} 时抛出
+     * @note 提交阶段仅执行有界 primitive 数组或字段赋值，不进行算术、扩容和业务校验；调用方须持续持有对应用户锁。
+     */
+    public void commitRecord(TradeWindowMutation mutation) {
+        long[] replacementTimestamps = mutation.replacementTimestamps();
+        if (replacementTimestamps == null) {
+            timestamps[mutation.tailIndex()] = mutation.timestampMillis();
+            amounts[mutation.tailIndex()] = mutation.amount();
+        } else {
+            timestamps = replacementTimestamps;
+            amounts = mutation.replacementAmounts();
+        }
+        head = mutation.headAfter();
+        size = mutation.sizeAfter();
+        rollingSum = mutation.rollingSumAfter();
     }
 
     /**
@@ -89,29 +156,4 @@ public final class TradeWindow {
         }
     }
 
-    /**
-     * 在容量不足时扩展环形缓冲并保持记录的时间顺序。
-     *
-     * @param required 所需最小容量
-     * @note 扩容仅在写入路径发生；复制后重置 head，保留 primitive 数组的低开销特性。
-     */
-    private void ensureCapacity(int required) {
-        if (required <= timestamps.length) {
-            return;
-        }
-        int next = timestamps.length << 1;
-        while (next < required) {
-            next <<= 1;
-        }
-        long[] newTimestamps = new long[next];
-        long[] newAmounts = new long[next];
-        for (int i = 0; i < size; i++) {
-            int index = (head + i) % timestamps.length;
-            newTimestamps[i] = timestamps[index];
-            newAmounts[i] = amounts[index];
-        }
-        timestamps = newTimestamps;
-        amounts = newAmounts;
-        head = 0;
-    }
 }

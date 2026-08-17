@@ -11,6 +11,7 @@ import com.cex.core.risk.Clock;
 import com.cex.core.risk.RiskContext;
 import com.cex.core.risk.RiskDecision;
 import com.cex.core.risk.RiskPipeline;
+import com.cex.core.risk.RiskWindowKey;
 import com.cex.core.risk.SystemClock;
 import com.cex.core.risk.TradeWindow;
 import com.cex.core.trade.TradeExecutionRecord;
@@ -64,8 +65,9 @@ public final class OrderEngine implements AutoCloseable {
     private final CancelRequestSink cancelRequestSink;
     /** 以订单 ID 索引的并发订单上下文。 */
     private final ConcurrentMap<Long, OrderContext> orders = new ConcurrentHashMap<>();
-    /** 以用户 ID 索引的并发风控成交窗口。 */
-    private final ConcurrentMap<Long, TradeWindow> tradeWindows = new ConcurrentHashMap<>();
+    /** 以用户和报价资产共同索引的并发风控成交窗口。 */
+    private final ConcurrentMap<RiskWindowKey, TradeWindow> tradeWindows =
+            new ConcurrentHashMap<>();
     /** 对处理路径进行无锁聚合的运行指标。 */
     private final OrderEngineMetrics metrics = new OrderEngineMetrics();
 
@@ -121,7 +123,8 @@ public final class OrderEngine implements AutoCloseable {
         this.tradeStore = new TradeExecutionStore();
         this.preCreationEventBuffer = new PreCreationEventBuffer();
         this.tradeCoordinator = new TradeSettlementCoordinator(
-                ledger, orderStateMachine, tradeStore, locks, metrics, orders::get);
+                ledger, orderStateMachine, tradeStore, locks, metrics, orders::get,
+                tradeWindows, clock);
     }
 
     /**
@@ -139,6 +142,8 @@ public final class OrderEngine implements AutoCloseable {
         Objects.requireNonNull(submission, "submission");
         ReentrantLock userLock = locks.lockForUser(submission.userId());
         OrderContext context;
+        boolean[] created = new boolean[1];
+        boolean[] approvalRequired = new boolean[1];
         userLock.lock();
         try {
             context = orders.compute(submission.orderId(), (orderId, existing) -> {
@@ -160,7 +165,9 @@ public final class OrderEngine implements AutoCloseable {
                 metrics.freeze();
                 if (decision == RiskDecision.HOLD) {
                     metrics.riskHold();
+                    approvalRequired[0] = true;
                 }
+                created[0] = true;
                 return candidate;
             });
             transferPreCreationConfirmationsLocked(context);
@@ -168,6 +175,11 @@ public final class OrderEngine implements AutoCloseable {
             userLock.unlock();
         }
 
+        if (created[0] && approvalRequired[0]) {
+            // 审批队列背压与回调均在用户资金锁外发生，避免外部逻辑延长冻结临界区。
+            approvalService.submit(submission, approvalPolicy, this::onApproval);
+            metrics.approvalScheduled();
+        }
         drainFromOrders(submission.orderId());
         return context;
     }
@@ -286,29 +298,54 @@ public final class OrderEngine implements AutoCloseable {
     }
 
     /**
-     * 接收强类型审批结果并恢复已通过的暂挂订单。
+     * 接收强类型审批结果并恢复暂挂订单或发起幂等风险撤单。
      *
      * @param result 不可变审批结果，不能为空
      * @throws NullPointerException 当结果为 {@code null} 时抛出
-     * @note 本任务只实现 PASS 的最小恢复与锁外成交排空；REJECT 的稳定撤单请求标识和异步强类型回调由后续风险集成完成。
+     * @note PASS 在用户锁内恢复订单后于锁外排空缓存成交；REJECT 只进入 {@link OrderStatus#PENDING_CANCEL} 并发送稳定请求，绝不直接解冻。
+     * @note 风险撤单发送失败后，重复的 REJECT 回调复用同一请求对象并保留 Task 6 的同 ID 单飞重试语义。
      */
     public void onApproval(ApprovalResult result) {
         Objects.requireNonNull(result, "result");
         OrderContext context = orders.get(result.orderId());
-        if (context == null || result.decision() != ApprovalDecision.PASS) {
+        if (context == null) {
             return;
         }
-        boolean approved;
         ReentrantLock userLock = locks.lockForUser(context.userId());
+        if (result.decision() == ApprovalDecision.PASS) {
+            boolean approved;
+            userLock.lock();
+            try {
+                approved = context.approveRiskHoldLocked();
+            } finally {
+                userLock.unlock();
+            }
+            if (approved) {
+                metrics.approvalPass();
+                drainFromOrders(result.orderId());
+            }
+            return;
+        }
+
+        CancelRequest riskCancelRequest;
         userLock.lock();
         try {
-            approved = context.approveRiskHoldLocked();
+            if (context.status() == OrderStatus.RISK_HOLD) {
+                riskCancelRequest = context.riskCancelRequestLocked();
+            } else if (context.status() == OrderStatus.PENDING_CANCEL
+                    && context.hasRiskCancelRequestLocked()) {
+                riskCancelRequest = context.riskCancelRequestLocked();
+            } else {
+                return;
+            }
         } finally {
             userLock.unlock();
         }
-        if (approved) {
-            metrics.approvalPass();
-            drainFromOrders(result.orderId());
+        if (riskCancelRequest != null) {
+            CancelRequestResult cancelResult = requestCancel(riskCancelRequest);
+            if (cancelResult == CancelRequestResult.SUBMITTED) {
+                metrics.approvalReject();
+            }
         }
     }
 
@@ -336,15 +373,39 @@ public final class OrderEngine implements AutoCloseable {
      *
      * @param submission 当前尚未发布的订单提交
      * @return 风控通过或暂挂结论
-     * @note Task 7 将把窗口键扩展为用户与报价资产组合；本方法暂时保留旧版按用户窗口以完成状态分类。
+     * @note 窗口按用户与报价资产组合隔离；创建风险使用上游提供的正数名义金额，不根据基础资产冻结量反推。
      */
     private RiskDecision evaluateTypedInitialRiskLocked(OrderSubmission submission) {
+        RiskWindowKey key = new RiskWindowKey(
+                submission.userId(), submission.pair().quoteAsset());
         TradeWindow window = tradeWindows.computeIfAbsent(
-                submission.userId(), id -> new TradeWindow(RISK_WINDOW_MILLIS));
+                key, ignored -> new TradeWindow(RISK_WINDOW_MILLIS));
         long now = clock.currentTimeMillis();
         return riskPipeline.evaluate(new RiskContext(
-                submission.orderId(), submission.userId(), submission.riskQuoteAmount(),
-                now, window.currentSum(now)));
+                submission.orderId(), submission.userId(), submission.pair().quoteAsset(),
+                submission.riskQuoteAmount(), now, window.currentSum(now)));
+    }
+
+    /**
+     * 将强类型审批结果适配为旧版事实事件。
+     *
+     * @param submission 旧版上下文生成的强类型审批提交
+     * @param approval 强类型审批结果
+     * @return 保留旧入口用户和金额元数据的审批事实事件
+     * @deprecated 仅供 {@link #process(OrderEvent)} 迁移期兼容；任务 8 删除
+     */
+    @Deprecated(since = "typed-approval", forRemoval = true)
+    private static OrderEvent legacyApprovalEvent(
+            OrderSubmission submission, ApprovalResult approval) {
+        OrderEventType type = approval.decision() == ApprovalDecision.PASS
+                ? OrderEventType.APPROVAL_PASSED
+                : OrderEventType.APPROVAL_REJECTED;
+        return new OrderEvent(
+                submission.orderId(),
+                submission.userId(),
+                submission.reservedAmount(),
+                approval.decidedAtMillis(),
+                type);
     }
 
     /**
@@ -599,9 +660,12 @@ public final class OrderEngine implements AutoCloseable {
         } finally {
             lock.unlock();
         }
-        if (result.approvalEvent != null) {
+        if (result.approvalSubmission != null) {
             // 审批投递移到资金锁外，避免队列背压或回调重入延长临界区。
-            approvalService.submit(result.approvalEvent, approvalPolicy, this::process);
+            approvalService.submit(
+                    result.approvalSubmission,
+                    approvalPolicy,
+                    approval -> process(legacyApprovalEvent(result.approvalSubmission, approval)));
         }
     }
 
@@ -654,7 +718,8 @@ public final class OrderEngine implements AutoCloseable {
                 transitionLocked(context, OrderStatus.NEW);
             } else {
                 ReconcileResult riskResult = evaluateInitialRiskLocked(context);
-                if (riskResult.approvalEvent != null || context.status() == OrderStatus.RISK_HOLD) {
+                if (riskResult.approvalSubmission != null
+                        || context.status() == OrderStatus.RISK_HOLD) {
                     return riskResult;
                 }
             }
@@ -693,18 +758,18 @@ public final class OrderEngine implements AutoCloseable {
      */
     private ReconcileResult evaluateInitialRiskLocked(OrderContext context) {
         TradeWindow window = tradeWindows.computeIfAbsent(
-                context.userId(), id -> new TradeWindow(RISK_WINDOW_MILLIS));
+                new RiskWindowKey(context.userId(), context.pair().quoteAsset()),
+                ignored -> new TradeWindow(RISK_WINDOW_MILLIS));
         long now = clock.currentTimeMillis();
         RiskContext riskContext = new RiskContext(
-                context.orderId(), context.userId(), context.amount(), now, window.currentSum(now));
+                context.orderId(), context.userId(), context.pair().quoteAsset(),
+                context.riskQuoteAmount(), now, window.currentSum(now));
         if (riskPipeline.evaluate(riskContext) == RiskDecision.HOLD) {
             transitionLocked(context, OrderStatus.RISK_HOLD);
             metrics.riskHold();
             if (context.applyEffectLocked(OrderEffect.APPROVAL_SCHEDULED, () -> { })) {
                 metrics.approvalScheduled();
-                return new ReconcileResult(new OrderEvent(
-                        context.orderId(), context.userId(), context.amount(), now,
-                        OrderEventType.ORDER_CREATED));
+                return new ReconcileResult(context.approvalSubmission(now));
             }
             return ReconcileResult.NONE;
         }
@@ -761,7 +826,9 @@ public final class OrderEngine implements AutoCloseable {
      */
     private void recordRiskTradeLocked(OrderContext context) {
         if (context.applyEffectLocked(OrderEffect.RISK_RECORDED, () -> {
-            TradeWindow window = tradeWindows.computeIfAbsent(context.userId(), id -> new TradeWindow(RISK_WINDOW_MILLIS));
+            TradeWindow window = tradeWindows.computeIfAbsent(
+                    new RiskWindowKey(context.userId(), context.pair().quoteAsset()),
+                    ignored -> new TradeWindow(RISK_WINDOW_MILLIS));
             window.record(clock.currentTimeMillis(), context.amount());
         })) {
             metrics.riskRecorded();
@@ -811,13 +878,15 @@ public final class OrderEngine implements AutoCloseable {
     }
 
     /**
-     * 查询用户的成交风控窗口。
+     * 查询用户在指定报价资产下的成交风控窗口。
      *
      * @param userId 用户 ID
+     * @param quoteAsset 报价资产标识
      * @return 已建立的风控窗口；尚无成交记录时为 {@code null}
+     * @throws NullPointerException 当报价资产为 {@code null} 时抛出
      */
-    public TradeWindow tradeWindow(long userId) {
-        return tradeWindows.get(userId);
+    public TradeWindow tradeWindow(long userId, AssetId quoteAsset) {
+        return tradeWindows.get(new RiskWindowKey(userId, quoteAsset));
     }
 
     /**
@@ -842,21 +911,21 @@ public final class OrderEngine implements AutoCloseable {
     /**
      * 用户锁内协调产生的锁外后续动作。
      * 核心能力是将审批投递移出资金锁；实例不可变且线程安全。
-     * 限制：当前仅承载一个审批事件。
+     * 限制：当前仅承载一个审批提交。
      */
     private static final class ReconcileResult {
         /** 不需要锁外后续动作的共享结果。 */
         private static final ReconcileResult NONE = new ReconcileResult(null);
-        /** 需要投递的审批事件；无投递需求时为 {@code null}。 */
-        private final OrderEvent approvalEvent;
+        /** 需要投递的强类型审批提交；无投递需求时为 {@code null}。 */
+        private final OrderSubmission approvalSubmission;
 
         /**
          * 创建用户锁外后续动作结果。
          *
-         * @param approvalEvent 待投递审批的源事件；无后续动作时为 {@code null}
+         * @param approvalSubmission 待投递审批的强类型提交；无后续动作时为 {@code null}
          */
-        private ReconcileResult(OrderEvent approvalEvent) {
-            this.approvalEvent = approvalEvent;
+        private ReconcileResult(OrderSubmission approvalSubmission) {
+            this.approvalSubmission = approvalSubmission;
         }
     }
 }

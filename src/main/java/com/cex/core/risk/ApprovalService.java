@@ -1,6 +1,6 @@
 package com.cex.core.risk;
 
-import com.cex.core.order.OrderEvent;
+import com.cex.core.order.OrderSubmission;
 import java.util.Objects;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -37,24 +37,29 @@ public final class ApprovalService implements AutoCloseable {
     }
 
     /**
-     * 异步提交一项审批，并将审批结果事件回流到统一订单入口。
+     * 异步提交一项审批，并将强类型审批结果回流到订单入口。
      *
-     * @param source 触发审批的原始订单事件
+     * @param submission 触发审批的强类型订单提交
      * @param policy 审批决策策略
-     * @param sink 接收审批结果事件的回流端
+     * @param sink 接收强类型审批结果的回流端
      * @throws NullPointerException 当任一必需参数为 {@code null} 时抛出
      * @throws IllegalStateException 当服务已关闭时抛出
      * @note 任务计数在提交前递增、在 finally 中完成，支持并发静止判定与审批结果回流。
      */
-    public void submit(OrderEvent source, ApprovalPolicy policy, Consumer<OrderEvent> sink) {
-        Objects.requireNonNull(source, "source");
+    public void submit(
+            OrderSubmission submission,
+            ApprovalPolicy policy,
+            Consumer<ApprovalResult> sink) {
+        Objects.requireNonNull(submission, "submission");
+        Objects.requireNonNull(policy, "policy");
+        Objects.requireNonNull(sink, "sink");
         if (executor.isShutdown()) {
             throw new IllegalStateException("approval service is shut down");
         }
         submitted.incrementAndGet();
         executor.execute(() -> {
             try {
-                new ApprovalTask(source, policy, sink).run();
+                new ApprovalTask(submission, policy, sink).run();
             } finally {
                 completed.incrementAndGet();
             }
