@@ -202,6 +202,7 @@ public final class AccountLedger {
      * 获取旧版单资产应守恒的初始总额。
      *
      * @return 初始资产总额
+     * @note 初始总额本身由账本监视器保护；若要与当前余额组成一致快照，调用方必须持有全部条带锁，或调用 {@link InvariantChecker#check()}。
      */
     public synchronized long initialTotalAsset() { return initialTotalByAsset.getOrDefault(LEGACY_ASSET, 0L); }
 
@@ -209,6 +210,7 @@ public final class AccountLedger {
      * 获取各资产应守恒的初始总额快照。
      *
      * @return 资产到初始总额的不可修改映射
+     * @note 初始总额本身由账本监视器保护；若要与当前余额组成一致快照，调用方必须持有全部条带锁，或调用 {@link InvariantChecker#check()}。
      */
     public synchronized Map<AssetId, Long> initialTotalAssets() { return Map.copyOf(initialTotalByAsset); }
 
@@ -217,6 +219,7 @@ public final class AccountLedger {
      *
      * @return 当前旧版资产总额
      * @throws ArithmeticException 当汇总结果溢出时抛出
+     * @note 要获得一致汇总，调用方必须持有全部条带锁；外部一致性检查应调用 {@link InvariantChecker#check()}。
      */
     public long currentTotalAsset() { return currentTotalAssets().getOrDefault(LEGACY_ASSET, 0L); }
 
@@ -225,6 +228,7 @@ public final class AccountLedger {
      *
      * @return 资产到当前总额的不可修改映射
      * @throws ArithmeticException 当任一资产汇总结果溢出时抛出
+     * @note 要获得一致汇总，调用方必须持有全部条带锁；外部一致性检查应调用 {@link InvariantChecker#check()}。
      */
     public Map<AssetId, Long> currentTotalAssets() {
         Map<AssetId, Long> totals = new HashMap<>();
@@ -246,6 +250,7 @@ public final class AccountLedger {
      * 判断旧版单资产总额是否守恒。
      *
      * @return 旧版资产总额守恒时为 {@code true}
+     * @note 调用方必须持有全部条带锁，否则并发成交的中间赋值可能产生瞬时假失败；外部一致性检查应调用 {@link InvariantChecker#check()}。
      */
     public boolean invariantHolds() { return invariantHolds(LEGACY_ASSET); }
 
@@ -254,6 +259,7 @@ public final class AccountLedger {
      *
      * @param asset 资产标识
      * @return 指定资产总额守恒时为 {@code true}
+     * @note 调用方必须持有全部条带锁，否则并发成交的中间赋值可能产生瞬时假失败；外部一致性检查应调用 {@link InvariantChecker#check()}。
      */
     public boolean invariantHolds(AssetId asset) {
         Objects.requireNonNull(asset, "asset");
@@ -265,6 +271,7 @@ public final class AccountLedger {
      * 判断所有资产总额均守恒且所有余额桶均非负。
      *
      * @return 全部资产不变量成立时为 {@code true}
+     * @note 调用方必须持有全部条带锁，否则并发成交的中间赋值可能产生瞬时假失败；外部一致性检查应调用 {@link InvariantChecker#check()}。
      */
     public boolean allAssetInvariantsHold() {
         return allBalancesNonNegative() && currentTotalAssets().equals(initialTotalAssets());
@@ -274,6 +281,7 @@ public final class AccountLedger {
      * 判断所有账户资产余额桶是否均为非负数。
      *
      * @return 所有可用与冻结余额非负时为 {@code true}
+     * @note 调用方必须持有全部条带锁，否则并发成交的中间赋值可能产生瞬时假失败；外部一致性检查应调用 {@link InvariantChecker#check()}。
      */
     public boolean allBalancesNonNegative() {
         for (Account account : accounts.values()) {
