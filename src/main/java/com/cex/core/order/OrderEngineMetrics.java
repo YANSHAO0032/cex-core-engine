@@ -26,6 +26,10 @@ public final class OrderEngineMetrics {
     private final LongAdder settleCount = new LongAdder();
     /** 成功解冻资金的次数。 */
     private final LongAdder unfreezeCount = new LongAdder();
+    /** 成功完成双边原子结算的成交次数。 */
+    private final LongAdder settledTradeCount = new LongAdder();
+    /** 双方下一权威序号已消费的确定拒绝成交次数。 */
+    private final LongAdder tradeRejectedCount = new LongAdder();
     /** 成交被成功计入风控窗口的次数。 */
     private final LongAdder riskRecordedCount = new LongAdder();
     /** 被风控暂挂的订单次数。 */
@@ -59,6 +63,10 @@ public final class OrderEngineMetrics {
     public void settle() { settleCount.increment(); }
     /** 累加资金解冻。 */
     public void unfreeze() { unfreezeCount.increment(); }
+    /** 累加成功完成的双边成交。 */
+    public void settledTrade() { settledTradeCount.increment(); }
+    /** 累加已消费双方权威序号的确定拒绝成交。 */
+    public void tradeRejected() { tradeRejectedCount.increment(); }
     /** 累加风控成交记账。 */
     public void riskRecorded() { riskRecordedCount.increment(); }
     /** 累加风控暂挂。 */
@@ -124,6 +132,18 @@ public final class OrderEngineMetrics {
      * @return 资金解冻总数
      */
     public long unfreezeCount() { return unfreezeCount.sum(); }
+    /**
+     * 获取成功完成双边原子结算的成交总数。
+     *
+     * @return 已结算成交总数
+     */
+    public long settledTradeCount() { return settledTradeCount.sum(); }
+    /**
+     * 获取已确定拒绝的成交总数。
+     *
+     * @return 已拒绝成交总数
+     */
+    public long tradeRejectedCount() { return tradeRejectedCount.sum(); }
     /**
      * 获取风控成交记账总数。
      *
