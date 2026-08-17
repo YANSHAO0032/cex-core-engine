@@ -24,6 +24,26 @@ import org.junit.jupiter.api.Test;
  */
 class LedgerInvariantTest {
 
+    /** 场景：指定资产的冻结与解冻只迁移该资产，并保持所有资产不变量。 */
+    @Test
+    void assetAwareFreezeAndUnfreezePreserveAllAssetInvariants() {
+        StripedLockManager lockManager = new StripedLockManager();
+        AccountLedger ledger = new AccountLedger(lockManager);
+        com.cex.core.order.AssetId btc = new com.cex.core.order.AssetId("BTC");
+        com.cex.core.order.AssetId usdt = new com.cex.core.order.AssetId("USDT");
+        ledger.createBalance(1L, btc, 100L);
+        ledger.createBalance(1L, usdt, 200L);
+
+        withUserLock(lockManager, 1L, () -> ledger.freezeLocked(1L, btc, 30L));
+        withUserLock(lockManager, 1L, () -> ledger.unfreezeLocked(1L, btc, 10L));
+
+        assertEquals(new BalanceSnapshot(80L, 20L), ledger.balance(1L, btc));
+        assertEquals(new BalanceSnapshot(200L, 0L), ledger.balance(1L, usdt));
+        assertTrue(ledger.invariantHolds(btc));
+        assertTrue(ledger.invariantHolds(usdt));
+        assertTrue(ledger.allBalancesNonNegative());
+    }
+
     /** 场景：冻结、解冻和结算后，可用、冻结与系统资金之和保持不变。 */
     @Test
     void freezeUnfreezeAndSettlePreserveInvariant() {
