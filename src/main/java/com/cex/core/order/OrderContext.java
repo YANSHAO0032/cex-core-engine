@@ -180,13 +180,19 @@ public final class OrderContext {
     public OrderStatus status() { return status; }
 
     /**
-     * 在外部用户锁持有期间更新订单状态。
+     * 在迁移期旧版引擎的用户锁内更新兼容状态。
      *
-     * @param status 目标状态，不能为空
+     * @param status 目标旧版状态，不能为空
      * @throws NullPointerException 当目标状态为 {@code null} 时抛出
-     * @note volatile 写让未持锁读取者获得最新状态，但迁移决策必须仍在同一用户锁内完成。
+     * @throws IllegalStateException 当强类型上下文尝试绕过订单状态机时抛出
+     * @deprecated 仅供旧版 {@link OrderEngine} 迁移期使用；强类型上下文必须通过状态机变更
+     * @note 方法限制在订单包内；volatile 写只提供可见性，调用方仍须持有所属用户锁。
      */
-    public void setStatusLocked(OrderStatus status) {
+    @Deprecated(since = "typed-order-state", forRemoval = true)
+    void setLegacyStatusLocked(OrderStatus status) {
+        if (pendingEvents != LEGACY_PENDING_EVENTS) {
+            throw new IllegalStateException("typed order status must use OrderStateMachine");
+        }
         this.status = Objects.requireNonNull(status, "status");
     }
 
@@ -217,7 +223,7 @@ public final class OrderContext {
         status = mutation.status();
     }
 
-    void commitSequenceLocked(long orderSequence) {
+    void commitPreparedSequenceLocked(long orderSequence) {
         lastAppliedSequence = orderSequence;
         pendingEvents.remove(orderSequence);
     }

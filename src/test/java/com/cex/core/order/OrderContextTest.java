@@ -2,6 +2,7 @@ package com.cex.core.order;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -121,6 +122,74 @@ class OrderContextTest {
         assertThrows(IllegalStateException.class,
                 () -> machine.registerEventLocked(context,
                         new TradeOrderReference(40L, 11L, 4L)));
+    }
+
+    /** 场景：消费序号不得绕过尚未到达的较低权威序号。 */
+    @Test
+    void sequenceConsumptionCannotSkipGap() {
+        TradingPair pair = new TradingPair(new AssetId("BTC"), new AssetId("USDT"));
+        OrderContext context = OrderContext.fromSubmission(new OrderSubmission(
+                11L, 21L, OrderSide.BUY, pair,
+                10L, 1_000L, 900L, 1L, 100L));
+        OrderStateMachine machine = new OrderStateMachine(4);
+        TradeOrderReference sequenceFour = new TradeOrderReference(40L, 11L, 4L);
+        machine.registerEventLocked(context, sequenceFour);
+
+        assertThrows(TradeSequenceConflictException.class,
+                () -> machine.prepareSequenceLocked(context, sequenceFour));
+
+        assertEquals(1L, context.lastAppliedSequence());
+        assertEquals(1, machine.pendingEventCountLocked(context));
+
+        TradeOrderReference sequenceTwo = new TradeOrderReference(20L, 11L, 2L);
+        machine.registerEventLocked(context, sequenceTwo);
+        OrderSequenceMutation mutation = machine.prepareSequenceLocked(context, sequenceTwo);
+        machine.commitSequenceLocked(mutation);
+
+        assertEquals(2L, context.lastAppliedSequence());
+        assertEquals(1, machine.pendingEventCountLocked(context));
+        assertNull(machine.nextEventLocked(context));
+    }
+
+    /** 场景：强类型订单不得通过旧版状态写入口绕过冻结额和状态机不变量。 */
+    @Test
+    void typedContextCannotUseLegacyStatusMutation() {
+        TradingPair pair = new TradingPair(new AssetId("BTC"), new AssetId("USDT"));
+        OrderContext context = OrderContext.fromSubmission(new OrderSubmission(
+                11L, 21L, OrderSide.BUY, pair,
+                10L, 1_000L, 900L, 1L, 100L));
+
+        assertThrows(IllegalStateException.class,
+                () -> context.setLegacyStatusLocked(OrderStatus.FILLED));
+
+        assertEquals(OrderStatus.NEW, context.status());
+        assertEquals(1_000L, context.remainingReservedAmount());
+    }
+
+    /** 场景：旧版上下文仍可由包内适配器推进状态，供迁移期引擎兼容。 */
+    @Test
+    void legacyContextRetainsPackagePrivateStatusAdapter() {
+        OrderContext context = OrderContext.fromFirstEvent(
+                new OrderEvent(1L, 2L, 3L, 1_000L, OrderEventType.ORDER_CREATED));
+
+        context.setLegacyStatusLocked(OrderStatus.NEW);
+
+        assertEquals(OrderStatus.NEW, context.status());
+    }
+
+    /**
+     * 场景：旧版状态适配器必须限制在包内并明确标记为待删除。
+     *
+     * @throws Exception 反射读取适配器方法失败时抛出
+     */
+    @Test
+    void legacyStatusAdapterIsPackagePrivateAndForRemoval() throws Exception {
+        var method = OrderContext.class.getDeclaredMethod(
+                "setLegacyStatusLocked", OrderStatus.class);
+        Deprecated deprecated = method.getAnnotation(Deprecated.class);
+
+        assertFalse(Modifier.isPublic(method.getModifiers()));
+        assertTrue(deprecated != null && deprecated.forRemoval());
     }
 
     /** 场景：重复登记同一事实应保留事实位并返回重复结果。 */

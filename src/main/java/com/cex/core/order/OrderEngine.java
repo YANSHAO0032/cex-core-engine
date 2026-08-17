@@ -301,7 +301,7 @@ public final class OrderEngine implements AutoCloseable {
     private void transitionLocked(OrderContext context, OrderStatus newStatus) {
         OrderStatus oldStatus = context.status();
         if (oldStatus != newStatus) {
-            context.setStatusLocked(newStatus);
+            context.setLegacyStatusLocked(newStatus);
             metrics.stateTransition();
         }
     }

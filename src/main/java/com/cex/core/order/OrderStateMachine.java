@@ -99,14 +99,39 @@ public final class OrderStateMachine {
     }
 
     /**
-     * 提交一个已由协调器确认是下一事件的序号消费。
+     * 准备消费一个已登记且恰好位于下一权威序号的事件。
      *
-     * @param order 目标订单上下文；必须是准备阶段校验过的同一实例
-     * @param orderSequence 已预检为下一序号的值
-     * @note 本方法仅赋值并移除对应缓存，不执行算术或校验；调用方须持续持有用户锁。
+     * @param order 目标订单上下文，不能为空
+     * @param event 必须与缓存头完全相等的已登记事件，不能为空
+     * @return 与目标订单绑定的不可变序号变更
+     * @throws NullPointerException 当订单或事件为 {@code null} 时抛出
+     * @throws IllegalArgumentException 当事件属于其他订单时抛出
+     * @throws TradeSequenceConflictException 当事件不是下一序号、缓存头缺失或载荷不一致时抛出
+     * @note 本方法只校验并创建变更，不推进序号；调用方须持有目标订单所属用户锁。
      */
-    public void commitSequenceLocked(OrderContext order, long orderSequence) {
-        order.commitSequenceLocked(orderSequence);
+    public OrderSequenceMutation prepareSequenceLocked(
+            OrderContext order, SequencedOrderEvent event) {
+        Objects.requireNonNull(order, "order");
+        Objects.requireNonNull(event, "event");
+        requireOrderId(order, event.orderId());
+        requireNextSequence(order, event.orderSequence());
+        SequencedOrderEvent head = order.pendingEventLocked(event.orderSequence());
+        if (head == null || !head.equals(event)) {
+            throw new TradeSequenceConflictException(
+                    "event does not match registered sequence head for orderId="
+                            + order.orderId() + ", sequence=" + event.orderSequence());
+        }
+        return new OrderSequenceMutation(order, event.orderSequence());
+    }
+
+    /**
+     * 提交准备好的权威序号消费。
+     *
+     * @param mutation 已通过 {@link #prepareSequenceLocked(OrderContext, SequencedOrderEvent)} 校验的变更
+     * @note 本方法只对变更绑定的订单赋值并移除缓存头，不执行算术或校验；调用方须持续持有用户锁。
+     */
+    public void commitSequenceLocked(OrderSequenceMutation mutation) {
+        mutation.order().commitPreparedSequenceLocked(mutation.orderSequence());
     }
 
     /**
