@@ -14,8 +14,8 @@ import java.util.Objects;
  * @param buyOrderId 严格为正的买方订单标识
  * @param sellOrderId 严格为正的卖方订单标识，且不同于买方订单标识
  * @param pair 成交所属交易对
- * @param baseQuantity 严格为正的权威基础资产成交数量
- * @param quoteQuantity 严格为正的权威报价资产成交数量
+ * @param baseQuantity 严格为正的权威基础资产成交数量，单位为基础资产最小单位并由卖方冻结余额交付
+ * @param quoteQuantity 严格为正的权威报价资产成交数量，单位为报价资产最小单位并由买方冻结余额支付
  * @param buyOrderSequence 严格为正的买方订单权威序号
  * @param sellOrderSequence 严格为正的卖方订单权威序号
  * @param executedAtMillis 非负的执行毫秒时间戳
@@ -33,8 +33,8 @@ public record TradeExecution(
      * @param buyOrderId 严格为正的买方订单标识
      * @param sellOrderId 严格为正的卖方订单标识，且不同于买方订单标识
      * @param pair 成交所属交易对
-     * @param baseQuantity 严格为正的权威基础资产成交数量
-     * @param quoteQuantity 严格为正的权威报价资产成交数量
+     * @param baseQuantity 严格为正的权威基础资产成交数量，单位为基础资产最小单位并由卖方冻结余额交付
+     * @param quoteQuantity 严格为正的权威报价资产成交数量，单位为报价资产最小单位并由买方冻结余额支付
      * @param buyOrderSequence 严格为正的买方订单权威序号
      * @param sellOrderSequence 严格为正的卖方订单权威序号
      * @param executedAtMillis 非负的执行毫秒时间戳

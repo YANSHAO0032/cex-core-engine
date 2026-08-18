@@ -266,7 +266,13 @@ class OutOfOrderStateMachineTest {
         }
     }
 
-    /** 保存乱序状态机测试使用的真实账本与引擎。 */
+    /**
+     * 保存乱序状态机测试使用的真实账本与引擎。
+     *
+     * <p>核心能力：提供固定双边输入并观察序号空洞、重复与终态行为。</p>
+     * <p>线程安全：测试可并发调用生产引擎，夹具引用初始化后保持只读。</p>
+     * <p>使用限制：每个测试独占夹具，结束时必须关闭异步资源。</p>
+     */
     private static final class Fixture implements AutoCloseable {
         /** 多资产账户账本。 */
         private final AccountLedger ledger =

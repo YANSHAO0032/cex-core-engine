@@ -46,9 +46,12 @@ import org.junit.jupiter.api.Test;
  *
  * <p>保留 300,000 个主订单工作量，并额外覆盖部分成交、撤单确认、双序号空洞、
  * 风控审批、成交幂等和相反用户锁顺序的八类最终验收场景。</p>
+ * <p>线程安全：测试通过原子计数器、闭锁和生产条带锁协调 16 个工作线程与 watchdog。</p>
+ * <p>使用限制：固定随机种子、线程数和工作量属于验收门槛，不得以降低负载或放宽超时换取通过。</p>
  *
  * @note 注入线程让出、短暂停顿和线程中断，并由 watchdog 与 worker 周期性校验逐资产不变量。
  * @note 买卖双方成交通过固定条带顺序原子提交，任何时刻不得出现负余额或单边成交。
+ * @note 本类汇总领域处理计数和资产不变量；TPS 与延迟由同一验收套件的 {@code PerformanceTest} 使用直方图独立统计，避免混沌故障注入污染性能样本。
  */
 class ChaosInvariantTest {
     /** 创建混沌不变量测试实例。 */
@@ -982,7 +985,13 @@ class ChaosInvariantTest {
         return SCENARIO_CYCLE[(int) (orderIndex % SCENARIO_CYCLE.length)];
     }
 
-    /** 聚合多引擎、多线程混沌场景的原始计数，避免为每次投递分配报告对象。 */
+    /**
+     * 聚合多引擎、多线程混沌场景的原始验收计数。
+     *
+     * <p>核心能力：汇总九项领域指标、全条带资产快照和八场景覆盖数。</p>
+     * <p>线程安全：所有累计值使用 {@link LongAdder} 或 {@link AtomicInteger}，支持 worker 与 watchdog 并发写入。</p>
+     * <p>使用限制：仅在单次混沌运行内使用，为减少 GC 不为每次投递分配独立报告对象。</p>
+     */
     private static final class ChaosReport {
         /** 调用强类型成交入口的总次数。 */
         private final LongAdder processedExecutions = new LongAdder();
@@ -1116,7 +1125,13 @@ class ChaosInvariantTest {
         private int coveredScenarios() { return coveredScenarios.get(); }
     }
 
-    /** 最终验收必须逐项覆盖的八类双边成交混沌场景。 */
+    /**
+     * 最终验收必须逐项覆盖的八类双边成交混沌场景。
+     *
+     * <p>核心能力：固定描述预创建、部分成交、撤单、重复、乱序、审批和锁竞争边界。</p>
+     * <p>线程安全：枚举值不可变，可由并发场景任务安全共享。</p>
+     * <p>使用限制：验收配置必须覆盖全部枚举值，不得仅抽样部分场景。</p>
+     */
     private enum AcceptanceScenario {
         /** 成交早于买卖双方订单创建。 */
         TRADE_BEFORE_BOTH_SUBMISSIONS,
@@ -1136,7 +1151,13 @@ class ChaosInvariantTest {
         REVERSED_USER_LOCK_CONTENTION
     }
 
-    /** 混沌强类型输入排列场景。 */
+    /**
+     * 主工作量中强类型输入到达次序与预期终态的场景元数据。
+     *
+     * <p>核心能力：把顺序/乱序成交与撤单映射为确定的订单终态和成交需求。</p>
+     * <p>线程安全：枚举字段不可变，可按固定随机序列在多个 worker 间安全共享。</p>
+     * <p>使用限制：仅描述主订单输入排列，不替代八类独立最终验收场景。</p>
+     */
     private enum Scenario {
         /** 创建后成交，预期完成双边结算。 */
         FILL_IN_ORDER(OrderStatus.FILLED, true),

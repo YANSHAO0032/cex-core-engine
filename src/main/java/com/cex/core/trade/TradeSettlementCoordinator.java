@@ -171,6 +171,8 @@ public final class TradeSettlementCoordinator {
      *
      * @param record 已发布的权威成交记录
      * @return 本次处理结果
+     * @note 终态记录直接按幂等重复返回；非终态记录仅在双方订单均已发布且用户不同后，才按固定条带顺序获取双用户锁。
+     * @note 风控时间在锁外读取，乱序时间由 {@link TradeWindow} 的有序提交逻辑处理，避免在用户锁内调用外部时钟。
      */
     private TradeResult processRegistered(TradeExecutionRecord record) {
         if (record.state().isTerminal()) {
@@ -201,6 +203,8 @@ public final class TradeSettlementCoordinator {
      * @param initialSeller 锁外解析的卖方上下文
      * @param riskRecordedAtMillis 获取双方用户锁前读取的风险窗口记录时间
      * @return 本次处理结果
+     * @note 调用方已按条带索引升序持有双方用户锁；同条带用户只加锁一次，不允许绕过该入口直接调用本方法。
+     * @note 锁内再次核对成交记录与订单对象，防止等待锁期间引用被替换；记录监视器保证同一 tradeId 的准备与终结单飞执行。
      */
     private TradeResult processWithBothUserLocks(
             TradeExecutionRecord expectedRecord,
@@ -237,6 +241,9 @@ public final class TradeSettlementCoordinator {
      * @param seller 已持所属用户锁的卖单上下文
      * @param riskRecordedAtMillis 获取双方锁前读取的风险窗口记录时间
      * @return 挂起、结算或确定拒绝结果
+     * @note 先准备订单、四个资产余额和双方 10 秒风险窗口，全部确定性校验成功后才统一提交；任一准备失败不得产生单边资金或窗口变更。
+     * @note 结算遵守基础资产与报价资产分别守恒：SELL 冻结基础资产转入 BUY 可用余额，BUY 冻结报价资产转入 SELL 可用余额并释放价格改善余款。
+     * @note 同一 tradeId 由成交记录监视器保障幂等；双序号占用冲突会先将当前记录终结为拒绝并释放 pending 容量，同时保留先到权威引用。
      */
     private TradeResult prepareThenCommitLocked(
             TradeExecutionRecord record,

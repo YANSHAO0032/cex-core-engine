@@ -726,7 +726,10 @@ public final class OrderEngine implements AutoCloseable {
 
     /**
      * 用户锁内撤单登记与发送权竞争的不可变结果。
-     * 实例仅跨越一次锁外发送调用，不对外发布。
+     *
+     * <p>核心能力：同时携带撤单业务结果和当前线程是否取得唯一外部发送权。</p>
+     * <p>线程安全：字段不可变，可安全跨越一次用户锁内登记与锁外发送边界。</p>
+     * <p>使用限制：实例不对外发布且不得复用，发送失败重试必须重新在用户锁内竞争。</p>
      */
     private static final class CancelRequestAttempt {
         /** 撤单首次登记、重复或已终态结果。 */

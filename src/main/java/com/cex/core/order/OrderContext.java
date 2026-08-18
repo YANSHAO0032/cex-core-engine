@@ -24,21 +24,21 @@ public final class OrderContext {
     private final OrderSide side;
     /** 基础资产与报价资产交易对。 */
     private final TradingPair pair;
-    /** 原始基础资产委托数量。 */
+    /** 原始基础资产委托数量，单位为基础资产最小单位，成交累计量不得超过该值。 */
     private final long originalBaseQuantity;
-    /** 原始报价或基础资产冻结量。 */
+    /** 原始冻结资产数量，BUY 为报价资产、SELL 为基础资产，单位为对应资产最小单位。 */
     private final long originalReservedAmount;
-    /** 上游提供的报价资产风控名义金额。 */
+    /** 上游提供的报价资产风控名义金额，单位为报价资产最小单位，不直接参与账本扣减。 */
     private final long riskQuoteAmount;
     /** 当前可见订单状态。 */
     private volatile OrderStatus status;
-    /** 已成交基础资产累计量。 */
+    /** 已成交基础资产累计量，单位为基础资产最小单位，并与剩余委托量共同保持原始数量守恒。 */
     private long cumulativeBaseFilled;
-    /** 已成交报价资产累计量。 */
+    /** 已成交报价资产累计量，单位为报价资产最小单位，对应买方支出与卖方收入。 */
     private long cumulativeQuoteFilled;
-    /** 尚未成交的基础资产数量。 */
+    /** 尚未成交的基础资产数量，单位为基础资产最小单位，与累计成交量之和等于原始委托量。 */
     private long remainingBaseQuantity;
-    /** 活动订单尚在冻结的资产数量。 */
+    /** 活动订单尚在冻结的资产数量，BUY 为报价资产、SELL 为基础资产，终态必须归零。 */
     private long remainingReservedAmount;
     /** 最后成功提交的权威订单序号。 */
     private long lastAppliedSequence;

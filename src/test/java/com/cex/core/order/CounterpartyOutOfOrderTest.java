@@ -178,7 +178,13 @@ class CounterpartyOutOfOrderTest {
         return new Fixture(ledger, engine);
     }
 
-    /** 保存双边乱序场景中的真实依赖和权威输入工厂。 */
+    /**
+     * 保存双边乱序场景中的真实依赖和权威输入工厂。
+     *
+     * <p>核心能力：统一构造买卖提交、成交与订单查询，减少场景间元数据偏差。</p>
+     * <p>线程安全：夹具只在单个测试线程中装配，生产引擎自身负责并发安全。</p>
+     * <p>使用限制：仅供本测试类使用，每个场景必须创建独立实例。</p>
+     */
     private static final class Fixture {
         /** 场景使用的多资产账本。 */
         private final AccountLedger ledger;

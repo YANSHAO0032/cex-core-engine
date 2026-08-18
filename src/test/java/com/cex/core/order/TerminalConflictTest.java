@@ -85,7 +85,13 @@ class TerminalConflictTest {
         }
     }
 
-    /** 保存终态裁决场景的账本与引擎。 */
+    /**
+     * 保存终态裁决场景的账本与引擎。
+     *
+     * <p>核心能力：构造成交与撤单竞争，验证唯一终态和冻结资金释放。</p>
+     * <p>线程安全：夹具仅由单个测试控制线程装配，生产组件负责竞争路径同步。</p>
+     * <p>使用限制：每个场景独占实例并在结束时关闭引擎。</p>
+     */
     private static final class Fixture implements AutoCloseable {
         /** 多资产账户账本。 */
         private final AccountLedger ledger =

@@ -3,8 +3,12 @@ package com.cex.core.order;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
+import com.cex.core.account.BalanceSnapshot;
 import com.cex.core.risk.ApprovalDecision;
 import com.cex.core.risk.ApprovalResult;
+import com.cex.core.risk.RiskWindowKey;
+import com.cex.core.trade.TradeExecutionStore;
+import com.cex.core.trade.TradeRegistrationOutcome;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -81,6 +85,23 @@ class OrderInputValidationTest {
                 new ApprovalResult(11L, ApprovalDecision.PASS, 104L);
         assertEquals(firstApproval, secondApproval);
         assertEquals(firstApproval.hashCode(), secondApproval.hashCode());
+
+        RiskWindowKey firstWindowKey = new RiskWindowKey(21L, new AssetId("USDT"));
+        RiskWindowKey secondWindowKey = new RiskWindowKey(21L, new AssetId("USDT"));
+        assertEquals(firstWindowKey, secondWindowKey);
+        assertEquals(firstWindowKey.hashCode(), secondWindowKey.hashCode());
+
+        BalanceSnapshot firstBalance = new BalanceSnapshot(500L, 100L);
+        BalanceSnapshot secondBalance = new BalanceSnapshot(500L, 100L);
+        assertEquals(firstBalance, secondBalance);
+        assertEquals(firstBalance.hashCode(), secondBalance.hashCode());
+
+        TradeRegistrationOutcome firstOutcome =
+                new TradeExecutionStore().registerWithOutcome(firstExecution);
+        TradeRegistrationOutcome secondOutcome =
+                new TradeRegistrationOutcome(firstOutcome.record(), false);
+        assertEquals(firstOutcome, secondOutcome);
+        assertEquals(firstOutcome.hashCode(), secondOutcome.hashCode());
     }
 
     /** 场景：提交订单应保留预留金额、风控名义金额和权威序号。 */

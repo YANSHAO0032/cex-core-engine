@@ -121,7 +121,13 @@ class OrderMetadataTest {
         }
     }
 
-    /** 保存元数据场景的真实账本与强类型引擎。 */
+    /**
+     * 保存元数据场景的真实账本与强类型引擎。
+     *
+     * <p>核心能力：集中提供固定买卖提交，验证重复订单的完整元数据一致性。</p>
+     * <p>线程安全：夹具只在单个测试线程内使用，生产引擎负责内部并发可见性。</p>
+     * <p>使用限制：每个场景独立创建并在结束时关闭引擎。</p>
+     */
     private static final class Fixture implements AutoCloseable {
         /** 多资产账户账本。 */
         private final AccountLedger ledger;

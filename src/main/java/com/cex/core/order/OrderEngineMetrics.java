@@ -36,17 +36,29 @@ public final class OrderEngineMetrics {
     public OrderEngineMetrics() {
     }
 
-    /** 累加一次部分成交。 */
+    /**
+     * 累加一次部分成交。
+     *
+     * @note 使用 {@link LongAdder} 无全局锁累加，可由多个结算线程并发调用。
+     */
     public void partialFill() {
         partialFillCount.increment();
     }
 
-    /** 累加一次成功双边结算。 */
+    /**
+     * 累加一次成功双边结算。
+     *
+     * @note 使用 {@link LongAdder} 无全局锁累加，可由多个结算线程并发调用。
+     */
     public void settledTrade() {
         settledTradeCount.increment();
     }
 
-    /** 累加一次精确重复成交投递。 */
+    /**
+     * 累加一次精确重复成交投递。
+     *
+     * @note 使用 {@link LongAdder} 无全局锁累加，注册线性化结果保证每个重复调用只计一次。
+     */
     public void duplicateTrade() {
         duplicateTradeCount.increment();
     }
@@ -56,6 +68,7 @@ public final class OrderEngineMetrics {
      *
      * @param count 非负挂起成交数量
      * @throws IllegalArgumentException 当数量为负数时抛出
+     * @note 使用 {@link AtomicInteger} 原子发布当前值；并发读取可见最新一次完整写入。
      */
     public void pendingTradeCount(int count) {
         if (count < 0) {
@@ -64,27 +77,47 @@ public final class OrderEngineMetrics {
         pendingTradeCount.set(count);
     }
 
-    /** 累加一次成交元数据冲突。 */
+    /**
+     * 累加一次成交元数据冲突。
+     *
+     * @note 使用 {@link LongAdder} 无全局锁累加，可由并发注册入口调用。
+     */
     public void tradeMetadataConflict() {
         tradeMetadataConflictCount.increment();
     }
 
-    /** 累加一次权威序号空洞。 */
+    /**
+     * 累加一次权威序号空洞。
+     *
+     * @note 使用 {@link LongAdder} 无全局锁累加；调用方保证同一事件首次进入空洞时才计数。
+     */
     public void sequenceGap() {
         sequenceGapCount.increment();
     }
 
-    /** 累加一次首次等待撤单确认。 */
+    /**
+     * 累加一次首次等待撤单确认。
+     *
+     * @note 使用 {@link LongAdder} 无全局锁累加；撤单登记幂等边界保证同一订单只计首次迁移。
+     */
     public void pendingCancel() {
         pendingCancelCount.increment();
     }
 
-    /** 累加一次过期撤单确认。 */
+    /**
+     * 累加一次过期撤单确认。
+     *
+     * @note 使用 {@link LongAdder} 无全局锁累加，可由多个订单入口并发调用。
+     */
     public void staleCancelConfirmation() {
         staleCancelConfirmationCount.increment();
     }
 
-    /** 累加一次确定拒绝成交；序号占用冲突拒绝不代表双方序号已被消费。 */
+    /**
+     * 累加一次确定拒绝成交；序号占用冲突拒绝不代表双方序号已被消费。
+     *
+     * @note 使用 {@link LongAdder} 无全局锁累加；成交记录终态竞争保证同一拒绝只计一次。
+     */
     public void tradeRejected() {
         tradeRejectedCount.increment();
     }
@@ -93,6 +126,7 @@ public final class OrderEngineMetrics {
      * 获取部分成交次数。
      *
      * @return 部分成交次数
+     * @note 并发读取为弱一致快照，不阻塞正在执行的累计写入。
      */
     public long partialFillCount() {
         return partialFillCount.sum();
@@ -102,6 +136,7 @@ public final class OrderEngineMetrics {
      * 获取成功双边结算次数。
      *
      * @return 成功双边结算次数
+     * @note 并发读取为弱一致快照，不阻塞正在执行的累计写入。
      */
     public long settledTradeCount() {
         return settledTradeCount.sum();
@@ -111,6 +146,7 @@ public final class OrderEngineMetrics {
      * 获取精确重复成交投递次数。
      *
      * @return 精确重复成交投递次数
+     * @note 并发读取为弱一致快照，不阻塞正在执行的累计写入。
      */
     public long duplicateTradeCount() {
         return duplicateTradeCount.sum();
@@ -120,6 +156,7 @@ public final class OrderEngineMetrics {
      * 获取当前挂起成交记录数。
      *
      * @return 当前挂起成交记录数
+     * @note 通过原子读取返回单值一致结果，不与其他指标组成原子快照。
      */
     public int pendingTradeCount() {
         return pendingTradeCount.get();
@@ -129,6 +166,7 @@ public final class OrderEngineMetrics {
      * 获取成交元数据冲突次数。
      *
      * @return 成交元数据冲突次数
+     * @note 并发读取为弱一致快照，不阻塞正在执行的累计写入。
      */
     public long tradeMetadataConflictCount() {
         return tradeMetadataConflictCount.sum();
@@ -138,6 +176,7 @@ public final class OrderEngineMetrics {
      * 获取权威序号空洞次数。
      *
      * @return 权威序号空洞次数
+     * @note 并发读取为弱一致快照，不阻塞正在执行的累计写入。
      */
     public long sequenceGapCount() {
         return sequenceGapCount.sum();
@@ -147,6 +186,7 @@ public final class OrderEngineMetrics {
      * 获取首次等待撤单确认次数。
      *
      * @return 首次等待撤单确认次数
+     * @note 并发读取为弱一致快照，不阻塞正在执行的累计写入。
      */
     public long pendingCancelCount() {
         return pendingCancelCount.sum();
@@ -156,6 +196,7 @@ public final class OrderEngineMetrics {
      * 获取过期撤单确认次数。
      *
      * @return 过期撤单确认次数
+     * @note 并发读取为弱一致快照，不阻塞正在执行的累计写入。
      */
     public long staleCancelConfirmationCount() {
         return staleCancelConfirmationCount.sum();
@@ -165,6 +206,7 @@ public final class OrderEngineMetrics {
      * 获取确定拒绝成交次数。
      *
      * @return 确定拒绝成交次数，包含不消费双方序号的权威序号占用冲突
+     * @note 并发读取为弱一致快照，不阻塞正在执行的累计写入。
      */
     public long tradeRejectedCount() {
         return tradeRejectedCount.sum();

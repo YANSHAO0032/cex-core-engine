@@ -375,7 +375,13 @@ class ApprovalTest {
         }
     }
 
-    /** 通过闭锁控制审批返回的强类型风险夹具。 */
+    /**
+     * 通过闭锁控制审批返回的强类型风险夹具。
+     *
+     * <p>核心能力：装配真实审批服务、风险管线与引擎，并确定性暂停审批回流。</p>
+     * <p>线程安全：闭锁在线程间发布状态，字段初始化后只读。</p>
+     * <p>使用限制：每个测试独占夹具并在结束时关闭审批线程池。</p>
+     */
     private static final class Fixture implements AutoCloseable {
         /** 多资产账户账本。 */
         private final AccountLedger ledger =

@@ -14,9 +14,9 @@ import java.util.Objects;
  * @param userId 严格为正的下单用户标识
  * @param side 订单买卖方向
  * @param pair 订单所属交易对
- * @param baseQuantity 严格为正的基础资产数量
- * @param reservedAmount 严格为正的预留资产金额
- * @param riskQuoteAmount 严格为正的上游报价资产风控名义金额
+ * @param baseQuantity 严格为正的基础资产最小单位数量
+ * @param reservedAmount 严格为正的冻结资产最小单位数量，BUY 为报价资产、SELL 为基础资产
+ * @param riskQuoteAmount 严格为正的上游报价资产风控名义金额，单位为报价资产最小单位
  * @param orderSequence 严格为正的订单权威序号
  * @param submittedAtMillis 非负的提交毫秒时间戳
  */
@@ -32,9 +32,9 @@ public record OrderSubmission(
      * @param userId 严格为正的下单用户标识
      * @param side 订单买卖方向
      * @param pair 订单所属交易对
-     * @param baseQuantity 严格为正的基础资产数量
-     * @param reservedAmount 严格为正的预留资产金额
-     * @param riskQuoteAmount 严格为正的上游报价资产风控名义金额
+     * @param baseQuantity 严格为正的基础资产最小单位数量
+     * @param reservedAmount 严格为正的冻结资产最小单位数量，BUY 为报价资产、SELL 为基础资产
+     * @param riskQuoteAmount 严格为正的上游报价资产风控名义金额，单位为报价资产最小单位
      * @param orderSequence 严格为正的订单权威序号
      * @param submittedAtMillis 非负的提交毫秒时间戳
      * @throws NullPointerException 当订单方向或交易对为 {@code null} 时抛出

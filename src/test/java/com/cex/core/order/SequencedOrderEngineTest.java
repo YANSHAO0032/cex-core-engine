@@ -325,7 +325,13 @@ class SequencedOrderEngineTest {
         return ledger;
     }
 
-    /** 保存单个测试场景的真实账本、引擎和不可变输入工厂。 */
+    /**
+     * 保存单个序号测试场景的真实账本、引擎和不可变输入工厂。
+     *
+     * <p>核心能力：统一构造订单、成交和资产初值，验证双序号与撤单交错。</p>
+     * <p>线程安全：并发用例共享线程安全生产引擎，夹具自身仅持有初始化后只读引用。</p>
+     * <p>使用限制：仅供本测试类使用，不跨测试方法复用。</p>
+     */
     private static final class Fixture {
         /** 场景使用的多资产账本。 */
         private final AccountLedger ledger;

@@ -192,6 +192,7 @@ public final class TradeExecutionStore {
      */
     public void markSettled(long tradeId, long completedAtMillis) {
         TradeExecutionRecord record = requireRecord(tradeId);
+        // 记录本地终态竞争仅允许一个调用获胜，只有胜者清理索引并释放一次 pending 容量。
         if (record.markSettled(completedAtMillis)) {
             removePendingIndexes(record);
             pendingRecords.decrementAndGet();
@@ -210,6 +211,7 @@ public final class TradeExecutionStore {
      */
     public void markRejected(long tradeId, String reason, long completedAtMillis) {
         TradeExecutionRecord record = requireRecord(tradeId);
+        // 记录本地终态竞争仅允许一个调用获胜，只有胜者清理索引并释放一次 pending 容量。
         if (record.markRejected(reason, completedAtMillis)) {
             removePendingIndexes(record);
             pendingRecords.decrementAndGet();
@@ -235,10 +237,15 @@ public final class TradeExecutionStore {
     }
 
     /**
-     * 由当前线程完成其独占登记槽的容量预留和发布。
+     * 由登记槽拥有者完成容量预留、双方挂起索引构造和权威记录发布。
      *
-     * @param registration 当前成交标识的独占登记槽
-     * @return 新建记录或极端竞争下已有精确重复记录的注册结果
+     * @param registration 当前线程独占的成交标识登记槽及候选成交载荷
+     * @return 新发布记录，或极端交错下已发布权威记录对应的精确重复结果
+     * @throws PendingCapacityExceededException 当总记录或挂起记录容量无法预留时抛出
+     * @throws TradeMetadataMismatchException 当发布竞争中已固化的同成交标识载荷不同时抛出
+     * @throws RuntimeException 当测试故障注入器中断发布时原样抛出
+     * @note 每个 tradeId 仅有一个登记槽拥有者执行本方法；先以 CAS 预留固定容量，再构造双方挂起索引并以 putIfAbsent 发布权威记录。
+     * @note 发布前任一步骤失败都会回滚已构造索引及容量名额；槽移除后等待者重新执行入口检查，以已发布记录判定幂等重复或协议冲突。
      */
     private TradeRegistrationOutcome registerOwned(Registration registration) {
         long tradeId = registration.execution.tradeId();
@@ -283,10 +290,12 @@ public final class TradeExecutionStore {
     }
 
     /**
-     * 在另一个线程发布或放弃同一成交标识时进行短暂自旋等待。
+     * 等待当前成交标识的登记槽拥有者完成发布或回滚。
      *
-     * @param tradeId 等待的成交标识
-     * @param registration 当前观察到的登记槽
+     * @param tradeId 正在等待完成单飞登记的成交标识
+     * @param registration 本次观察到且尚未移除的活动登记槽
+     * @throws RuntimeException 当测试登记观察器拒绝进入等待时原样抛出
+     * @note 等待期间不预留容量、不比较临时槽载荷，也不持有全局锁；槽结束后调用方必须重试入口，以权威发布记录执行幂等或冲突判断，拥有者回滚时允许等待者重新竞争。
      */
     private void awaitRegistration(long tradeId, Registration registration) {
         registrationObserver.beforeAwait(tradeId);
@@ -382,6 +391,7 @@ public final class TradeExecutionStore {
             if (current >= maximum) {
                 return false;
             }
+            // CAS 只允许一个竞争线程原子占用当前容量名额，失败者重读上限后再决定重试。
             if (counter.compareAndSet(current, current + 1)) {
                 return true;
             }
@@ -442,7 +452,13 @@ public final class TradeExecutionStore {
         publicationFailureInjector.before(stage);
     }
 
-    /** 同包测试可注入故障的记录发布阶段。 */
+    /**
+     * 成交记录发布过程中可注入故障的阶段。
+     *
+     * <p>核心能力：标识容量预留、双方索引写入和权威记录发布边界。</p>
+     * <p>线程安全：枚举值不可变，可由并发登记线程安全共享。</p>
+     * <p>使用限制：仅用于同包测试验证逐阶段回滚，生产路径不应依赖具体阶段顺序。</p>
+     */
     enum PublicationStage {
         /** 双容量已经预留但尚未写入任何订单索引。 */
         AFTER_RESERVATIONS,
@@ -454,7 +470,13 @@ public final class TradeExecutionStore {
         BEFORE_RECORD_PUBLICATION
     }
 
-    /** 仅供同包测试在记录发布阶段注入失败的最小回调。 */
+    /**
+     * 在成交记录发布阶段注入确定性故障的测试回调。
+     *
+     * <p>核心能力：验证容量和双方挂起索引在任一发布阶段失败时完整回滚。</p>
+     * <p>线程安全：实现会由并发登记线程调用，必须自行协调共享测试状态。</p>
+     * <p>使用限制：仅供同包测试使用，生产构造器始终采用无操作实现。</p>
+     */
     @FunctionalInterface
     interface PublicationFailureInjector {
         /**
@@ -465,7 +487,13 @@ public final class TradeExecutionStore {
         void before(PublicationStage stage);
     }
 
-    /** 仅供同包测试在权威记录初查与登记槽获取阶段协调确定性并发交错的最小回调。 */
+    /**
+     * 协调权威记录查询、登记槽获取与等待交错的测试回调。
+     *
+     * <p>核心能力：确定性复现精确重复、冲突载荷和登记槽回滚竞争。</p>
+     * <p>线程安全：实现可能同时收到多个成交登记线程的回调，必须自行保证线程安全。</p>
+     * <p>使用限制：不得修改成交存储；仅供同包测试暂停或观察指定线性化边界。</p>
+     */
     @FunctionalInterface
     interface RegistrationObserver {
         /**

@@ -18,13 +18,13 @@ public final class TradeLedgerMutation {
     private final AssetBalance sellerQuote;
     /** 买方报价资产提交后的冻结余额，单位为报价资产最小单位。 */
     private final long buyerQuoteFrozenAfter;
-    /** 买方报价资产提交后的可用余额，包含最终价格改善释放额。 */
+    /** 买方报价资产提交后的可用余额，单位为报价资产最小单位，包含价格改善释放额。 */
     private final long buyerQuoteAvailableAfter;
-    /** 买方基础资产提交后的可用余额，包含本次成交交付量。 */
+    /** 买方基础资产提交后的可用余额，单位为基础资产最小单位，包含卖方本次交付量。 */
     private final long buyerBaseAvailableAfter;
-    /** 卖方基础资产提交后的冻结余额，已扣除本次成交交付量。 */
+    /** 卖方基础资产提交后的冻结余额，单位为基础资产最小单位，已扣除本次交付量。 */
     private final long sellerBaseFrozenAfter;
-    /** 卖方报价资产提交后的可用余额，包含本次成交收款。 */
+    /** 卖方报价资产提交后的可用余额，单位为报价资产最小单位，包含买方本次支付。 */
     private final long sellerQuoteAvailableAfter;
 
     /**
