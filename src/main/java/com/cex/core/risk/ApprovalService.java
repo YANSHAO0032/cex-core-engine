@@ -115,11 +115,14 @@ public final class ApprovalService implements AutoCloseable {
      * @param unit 等待时长单位
      * @throws InterruptedException 当当前线程在等待期间被中断时抛出
      * @throws IllegalStateException 当超时后执行器仍未静止时抛出
-     * @note 结合原子完成计数、活动线程数和有界队列长度判定静止，不主动关闭执行器。
+     * @note 结合已越过接收边界的提交预约、原子完成计数、活动线程数和有界队列长度判定静止，不主动关闭执行器。
      */
     public void awaitQuiescence(long timeout, TimeUnit unit) throws InterruptedException {
         long deadline = System.nanoTime() + unit.toNanos(timeout);
-        while (completed.get() < submitted.get() || executor.getActiveCount() != 0 || !executor.getQueue().isEmpty()) {
+        while (hasSubmissionsInFlight()
+                || completed.get() < submitted.get()
+                || executor.getActiveCount() != 0
+                || !executor.getQueue().isEmpty()) {
             if (System.nanoTime() >= deadline) {
                 throw new IllegalStateException("approval executor did not quiesce");
             }
@@ -181,6 +184,17 @@ public final class ApprovalService implements AutoCloseable {
         }
         if (shutdownExecutor) {
             executor.shutdown();
+        }
+    }
+
+    /**
+     * 判断是否仍有已被服务接收但尚未从执行器提交调用返回的任务。
+     *
+     * @return 存在已接收的执行器边界内提交时为 {@code true}
+     */
+    private boolean hasSubmissionsInFlight() {
+        synchronized (lifecycleMonitor) {
+            return submissionsInFlight != 0;
         }
     }
 

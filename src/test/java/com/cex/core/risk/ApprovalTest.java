@@ -119,6 +119,42 @@ class ApprovalTest {
     }
 
     /**
+     * 场景：已越过接收边界但尚未进入执行器的任务必须参与静止等待，关闭不得令等待提前成功。
+     *
+     * @throws Exception 并发提交、关闭或审批等待失败时抛出
+     */
+    @Test
+    void quiescenceIncludesAcceptedSubmissionBeforeExecutorEntry() throws Exception {
+        CountDownLatch accepted = new CountDownLatch(1);
+        CountDownLatch releaseSubmission = new CountDownLatch(1);
+        ApprovalService service = new ApprovalService(1, 1, () -> {
+            accepted.countDown();
+            awaitLatch(releaseSubmission);
+        });
+        ExecutorService caller = Executors.newSingleThreadExecutor();
+        AtomicReference<ApprovalResult> received = new AtomicReference<>();
+        try {
+            Future<?> submission = caller.submit(() -> service.submit(
+                    buySubmission(), source -> ApprovalDecision.PASS, received::set));
+            assertTrue(accepted.await(2L, TimeUnit.SECONDS));
+            service.close();
+
+            assertThrows(IllegalStateException.class,
+                    () -> service.awaitQuiescence(20L, TimeUnit.MILLISECONDS));
+
+            releaseSubmission.countDown();
+            submission.get(2L, TimeUnit.SECONDS);
+            service.awaitQuiescence(2L, TimeUnit.SECONDS);
+            assertNotNull(received.get());
+        } finally {
+            releaseSubmission.countDown();
+            service.close();
+            caller.shutdownNow();
+            assertTrue(caller.awaitTermination(2L, TimeUnit.SECONDS));
+        }
+    }
+
+    /**
      * 场景：队列满触发提交线程执行时，结果回流内关闭服务不得形成生命周期锁升级死锁。
      *
      * @throws Exception 并发任务或审批等待失败时抛出
