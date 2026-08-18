@@ -384,6 +384,7 @@ public final class TradeExecutionStore {
      * @param counter 当前预留计数
      * @param maximum 固定容量上限
      * @return 成功保留名额时为 {@code true}
+     * @note 使用 {@link AtomicInteger} 与 CAS 无锁竞争容量名额，不持有全局锁；失败线程重读上限并重试，以保障高并发注册吞吐。
      */
     private static boolean tryReserve(AtomicInteger counter, int maximum) {
         for (;;) {

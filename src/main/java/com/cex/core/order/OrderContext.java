@@ -38,7 +38,7 @@ public final class OrderContext {
     private long cumulativeQuoteFilled;
     /** 尚未成交的基础资产数量，单位为基础资产最小单位，与累计成交量之和等于原始委托量。 */
     private long remainingBaseQuantity;
-    /** 活动订单尚在冻结的资产数量，BUY 为报价资产、SELL 为基础资产，终态必须归零。 */
+    /** 活动订单尚在冻结的资产最小单位数量，BUY 为报价资产、SELL 为基础资产，终态必须归零。 */
     private long remainingReservedAmount;
     /** 最后成功提交的权威订单序号。 */
     private long lastAppliedSequence;
@@ -159,7 +159,7 @@ public final class OrderContext {
     /**
      * 获取活动订单仍处于冻结状态的预留资产数量。
      *
-     * @return 活动买单的剩余报价资产或活动卖单的剩余基础资产；终态为零
+     * @return 活动买单的剩余报价资产最小单位数量或活动卖单的剩余基础资产最小单位数量；终态为零
      * @note 最终买单未花费报价资产通过成交变更单独释放，本字段提交后归零。
      */
     public long remainingReservedAmount() { return remainingReservedAmount; }

@@ -9,14 +9,14 @@ import com.cex.core.util.MoneyMath;
  * <p>线程安全：记录不可变，可在线程间安全传递。</p>
  * <p>限制：快照不保证跨用户或跨资产的一致性，需由调用方使用条带锁协调。</p>
  *
- * @param available 可用资产最小单位数量，与冻结余额共同参与该用户该资产总额守恒
+ * @param available 可用资产最小单位数量，与冻结余额共同组成用户余额，并参与全账本按资产汇总守恒
  * @param frozen 冻结资产最小单位数量，订单终结释放后应转为可用余额或完成交割
  */
 public record BalanceSnapshot(long available, long frozen) {
     /**
      * 创建并校验余额快照。
      *
-     * @param available 可用资产最小单位数量，与冻结余额共同参与该用户该资产总额守恒
+     * @param available 可用资产最小单位数量，与冻结余额共同组成用户余额，并参与全账本按资产汇总守恒
      * @param frozen 冻结资产最小单位数量，订单终结释放后应转为可用余额或完成交割
      * @throws IllegalArgumentException 当任一金额为负数时抛出
      */

@@ -29,7 +29,7 @@ public final class OrderEngineMetrics {
     private final LongAdder pendingCancelCount = new LongAdder();
     /** 已被订单序号消费的迟到撤单确认次数。 */
     private final LongAdder staleCancelConfirmationCount = new LongAdder();
-    /** 双方权威序号被消费且确定拒绝的成交次数。 */
+    /** 确定拒绝的成交次数；业务拒绝消费双方序号，序号占用冲突拒绝不消费双方序号。 */
     private final LongAdder tradeRejectedCount = new LongAdder();
 
     /** 创建全部累计值为零的订单引擎指标。 */
