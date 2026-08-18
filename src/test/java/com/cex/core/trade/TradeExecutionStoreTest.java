@@ -260,6 +260,127 @@ class TradeExecutionStoreTest {
         }
     }
 
+    /** 场景：权威记录发布后，精确重复必须优先于重建槽中的临时冲突载荷。 */
+    @Test
+    void authoritativeRecordWinsOverConflictingRecreatedRegistrationSlot() throws Exception {
+        CountDownLatch ownerBeforePublication = new CountDownLatch(1);
+        CountDownLatch allowOwnerPublication = new CountDownLatch(1);
+        CountDownLatch conflictAfterInitialMiss = new CountDownLatch(1);
+        CountDownLatch allowConflictRegistration = new CountDownLatch(1);
+        CountDownLatch conflictAcquiredRecreatedSlot = new CountDownLatch(1);
+        CountDownLatch allowConflictRecordRecheck = new CountDownLatch(1);
+        CountDownLatch duplicateAfterInitialMiss = new CountDownLatch(1);
+        CountDownLatch allowDuplicateRegistration = new CountDownLatch(1);
+        AtomicBoolean pauseOwnerOnce = new AtomicBoolean(true);
+        AtomicReference<Thread> conflictThread = new AtomicReference<>();
+        AtomicReference<Thread> duplicateThread = new AtomicReference<>();
+        TradeExecutionStore.RegistrationObserver registrationObserver =
+                new TradeExecutionStore.RegistrationObserver() {
+                    @Override
+                    public void afterMiss(long tradeId) {
+                        if (Thread.currentThread() == conflictThread.get()) {
+                            conflictAfterInitialMiss.countDown();
+                            await(allowConflictRegistration);
+                        } else if (Thread.currentThread() == duplicateThread.get()) {
+                            duplicateAfterInitialMiss.countDown();
+                            await(allowDuplicateRegistration);
+                        }
+                    }
+
+                    @Override
+                    public void afterRegistrationAcquired(long tradeId) {
+                        if (Thread.currentThread() == conflictThread.get()) {
+                            conflictAcquiredRecreatedSlot.countDown();
+                            await(allowConflictRecordRecheck);
+                        }
+                    }
+                };
+        TradeExecutionStore store = new TradeExecutionStore(1, 1, stage -> {
+            if (stage == TradeExecutionStore.PublicationStage.BEFORE_RECORD_PUBLICATION
+                    && pauseOwnerOnce.compareAndSet(true, false)) {
+                ownerBeforePublication.countDown();
+                await(allowOwnerPublication);
+            }
+        }, registrationObserver);
+        TradeExecution authoritative = execution(1L, 10L, 20L);
+        TradeExecution conflicting = execution(1L, 10L, 21L);
+        ExecutorService executor = Executors.newFixedThreadPool(3);
+        try {
+            Future<TradeRegistrationOutcome> owner = executor.submit(
+                    () -> store.registerWithOutcome(authoritative));
+            assertTrue(ownerBeforePublication.await(5L, TimeUnit.SECONDS));
+            Future<TradeRegistrationOutcome> conflict = executor.submit(() -> {
+                conflictThread.set(Thread.currentThread());
+                return store.registerWithOutcome(conflicting);
+            });
+            Future<TradeRegistrationOutcome> duplicate = executor.submit(() -> {
+                duplicateThread.set(Thread.currentThread());
+                return store.registerWithOutcome(authoritative);
+            });
+            assertTrue(conflictAfterInitialMiss.await(5L, TimeUnit.SECONDS));
+            assertTrue(duplicateAfterInitialMiss.await(5L, TimeUnit.SECONDS));
+
+            allowOwnerPublication.countDown();
+            TradeRegistrationOutcome created = getWithin(owner);
+            allowConflictRegistration.countDown();
+            assertTrue(conflictAcquiredRecreatedSlot.await(5L, TimeUnit.SECONDS));
+            allowDuplicateRegistration.countDown();
+            TradeRegistrationOutcome exactDuplicate = getWithin(duplicate);
+            allowConflictRecordRecheck.countDown();
+            ExecutionException conflictFailure = assertThrows(
+                    ExecutionException.class, () -> getWithin(conflict));
+
+            assertFalse(created.duplicate());
+            assertTrue(exactDuplicate.duplicate());
+            assertSame(created.record(), exactDuplicate.record());
+            assertTrue(conflictFailure.getCause() instanceof TradeMetadataMismatchException);
+            assertEquals(1, store.pendingCount());
+            assertEquals(1, store.totalCount());
+        } finally {
+            allowOwnerPublication.countDown();
+            allowConflictRegistration.countDown();
+            allowConflictRecordRecheck.countDown();
+            allowDuplicateRegistration.countDown();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5L, TimeUnit.SECONDS));
+        }
+    }
+
+    /** 场景：权威记录尚未发布时，冲突载荷必须立即按照真实活动登记槽拒绝。 */
+    @Test
+    void unpublishedConcurrentConflictStillRejectsAgainstActiveRegistration() throws Exception {
+        CountDownLatch ownerBeforePublication = new CountDownLatch(1);
+        CountDownLatch allowOwnerPublication = new CountDownLatch(1);
+        TradeExecutionStore store = new TradeExecutionStore(1, 1, stage -> {
+            if (stage == TradeExecutionStore.PublicationStage.BEFORE_RECORD_PUBLICATION) {
+                ownerBeforePublication.countDown();
+                await(allowOwnerPublication);
+            }
+        });
+        TradeExecution authoritative = execution(1L, 10L, 20L);
+        TradeExecution conflicting = execution(1L, 10L, 21L);
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<TradeRegistrationOutcome> owner = executor.submit(
+                    () -> store.registerWithOutcome(authoritative));
+            assertTrue(ownerBeforePublication.await(5L, TimeUnit.SECONDS));
+
+            assertThrows(TradeMetadataMismatchException.class,
+                    () -> store.registerWithOutcome(conflicting));
+            allowOwnerPublication.countDown();
+            TradeRegistrationOutcome created = getWithin(owner);
+
+            assertFalse(created.duplicate());
+            assertSame(created.record(), store.record(authoritative.tradeId()));
+            assertEquals(1, store.pendingCount());
+            assertEquals(1, store.totalCount());
+        } finally {
+            allowOwnerPublication.countDown();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5L, TimeUnit.SECONDS));
+        }
+    }
+
     /** 场景：并发结算与拒绝只允许一个终态获胜，等待任务必须在限定时间内结束。 */
     @Test
     void concurrentTerminalTransitionsChooseOneStateAndReleasePendingOnce() throws Exception {

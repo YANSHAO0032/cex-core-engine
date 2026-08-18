@@ -38,8 +38,8 @@ public final class TradeExecutionStore {
     private final AtomicInteger totalRecords = new AtomicInteger();
     /** 仅供同包测试在发布窗口注入失败的钩子。 */
     private final PublicationFailureInjector publicationFailureInjector;
-    /** 仅供同包测试在首次权威记录查询未命中后协调并发交错的观察器。 */
-    private final InitialRecordMissObserver initialRecordMissObserver;
+    /** 仅供同包测试协调登记竞态交错的观察器。 */
+    private final RegistrationObserver registrationObserver;
 
     /**
      * 使用引擎默认容量创建成交存储。
@@ -77,11 +77,11 @@ public final class TradeExecutionStore {
      * @param maxPendingRecords 最大挂起成交记录数，必须为正且不大于总容量
      * @param maxTotalRecords 最大总成交记录数，必须为正
      * @param publicationFailureInjector 仅测试使用的发布阶段回调，不能为空
-     * @param initialRecordMissObserver 仅测试使用的初次权威记录查询未命中回调，不能为空
+     * @param registrationObserver 仅测试使用的登记竞态观察器，不能为空
      */
     TradeExecutionStore(int maxPendingRecords, int maxTotalRecords,
                         PublicationFailureInjector publicationFailureInjector,
-                        InitialRecordMissObserver initialRecordMissObserver) {
+                        RegistrationObserver registrationObserver) {
         if (maxPendingRecords <= 0 || maxTotalRecords <= 0 || maxPendingRecords > maxTotalRecords) {
             throw new IllegalArgumentException("pending and total capacities must be positive and pending <= total");
         }
@@ -89,8 +89,8 @@ public final class TradeExecutionStore {
         this.maxTotalRecords = maxTotalRecords;
         this.publicationFailureInjector = Objects.requireNonNull(
                 publicationFailureInjector, "publicationFailureInjector");
-        this.initialRecordMissObserver = Objects.requireNonNull(
-                initialRecordMissObserver, "initialRecordMissObserver");
+        this.registrationObserver = Objects.requireNonNull(
+                registrationObserver, "registrationObserver");
     }
 
     /**
@@ -124,11 +124,17 @@ public final class TradeExecutionStore {
                 return new TradeRegistrationOutcome(
                         sameOrConflict(existing, execution), true);
             }
-            initialRecordMissObserver.afterMiss(tradeId);
+            registrationObserver.afterMiss(tradeId);
 
             Registration candidate = new Registration(execution);
             Registration inProgress = registrations.putIfAbsent(tradeId, candidate);
             if (inProgress != null) {
+                // 已发布权威记录优先于可能由迟到线程重建的临时登记槽。
+                existing = records.get(tradeId);
+                if (existing != null) {
+                    return new TradeRegistrationOutcome(
+                            sameOrConflict(existing, execution), true);
+                }
                 if (!inProgress.hasSameExecution(execution)) {
                     throw metadataMismatch(tradeId);
                 }
@@ -137,6 +143,7 @@ public final class TradeExecutionStore {
             }
 
             try {
+                registrationObserver.afterRegistrationAcquired(tradeId);
                 // 初查未命中后，上一任登记者可能已完成发布并移除旧槽；预留容量前必须二次复核。
                 existing = records.get(tradeId);
                 if (existing != null) {
@@ -459,15 +466,23 @@ public final class TradeExecutionStore {
         void before(PublicationStage stage);
     }
 
-    /** 仅供同包测试在首次权威记录查询未命中后协调确定性并发交错的最小回调。 */
+    /** 仅供同包测试在权威记录初查与登记槽获取阶段协调确定性并发交错的最小回调。 */
     @FunctionalInterface
-    interface InitialRecordMissObserver {
+    interface RegistrationObserver {
         /**
          * 观察当前成交标识的权威记录查询未命中。
          *
          * @param tradeId 查询未命中的成交标识
          */
         void afterMiss(long tradeId);
+
+        /**
+         * 观察当前线程已经赢得成交标识登记槽且尚未二次复核权威记录。
+         *
+         * @param tradeId 已赢得登记槽的成交标识
+         */
+        default void afterRegistrationAcquired(long tradeId) {
+        }
     }
 
     /**
