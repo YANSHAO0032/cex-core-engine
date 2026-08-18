@@ -210,7 +210,7 @@ Maven Surefire 固定使用：
 | `sequenceGapCount` | 首次登记的可见订单序号空洞数 |
 | `pendingCancelCount` | 首次进入等待撤单确认的订单数 |
 | `staleCancelConfirmationCount` | 已被序号消费的迟到确认数 |
-| `tradeRejectedCount` | 确定拒绝并消费双边序号的成交数 |
+| `tradeRejectedCount` | 确定拒绝成交数；业务校验失败会消费双边序号，权威序号占用冲突拒绝不消费双方序号 |
 
 这些计数使用 `LongAdder` / `AtomicInteger`，读取是观测快照，不参与订单或资金决策。
 

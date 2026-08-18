@@ -32,6 +32,10 @@ public final class OrderEngineMetrics {
     /** 双方权威序号被消费且确定拒绝的成交次数。 */
     private final LongAdder tradeRejectedCount = new LongAdder();
 
+    /** 创建全部累计值为零的订单引擎指标。 */
+    public OrderEngineMetrics() {
+    }
+
     /** 累加一次部分成交。 */
     public void partialFill() {
         partialFillCount.increment();
@@ -80,7 +84,7 @@ public final class OrderEngineMetrics {
         staleCancelConfirmationCount.increment();
     }
 
-    /** 累加一次确定拒绝成交。 */
+    /** 累加一次确定拒绝成交；序号占用冲突拒绝不代表双方序号已被消费。 */
     public void tradeRejected() {
         tradeRejectedCount.increment();
     }
@@ -160,7 +164,7 @@ public final class OrderEngineMetrics {
     /**
      * 获取确定拒绝成交次数。
      *
-     * @return 确定拒绝成交次数
+     * @return 确定拒绝成交次数，包含不消费双方序号的权威序号占用冲突
      */
     public long tradeRejectedCount() {
         return tradeRejectedCount.sum();

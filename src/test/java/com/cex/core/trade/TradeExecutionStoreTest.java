@@ -346,36 +346,106 @@ class TradeExecutionStoreTest {
         }
     }
 
-    /** 场景：权威记录尚未发布时，冲突载荷必须立即按照真实活动登记槽拒绝。 */
+    /** 场景：权威记录尚未发布时，冲突载荷等待活动槽结束后再按已发布记录拒绝。 */
     @Test
-    void unpublishedConcurrentConflictStillRejectsAgainstActiveRegistration() throws Exception {
+    void unpublishedConcurrentConflictWaitsForAuthoritativePublication() throws Exception {
         CountDownLatch ownerBeforePublication = new CountDownLatch(1);
         CountDownLatch allowOwnerPublication = new CountDownLatch(1);
+        CountDownLatch contenderWaitingForOwner = new CountDownLatch(1);
         TradeExecutionStore store = new TradeExecutionStore(1, 1, stage -> {
             if (stage == TradeExecutionStore.PublicationStage.BEFORE_RECORD_PUBLICATION) {
                 ownerBeforePublication.countDown();
                 await(allowOwnerPublication);
             }
+        }, new TradeExecutionStore.RegistrationObserver() {
+            @Override
+            public void afterMiss(long tradeId) {
+            }
+
+            @Override
+            public void beforeAwait(long tradeId) {
+                contenderWaitingForOwner.countDown();
+            }
         });
         TradeExecution authoritative = execution(1L, 10L, 20L);
         TradeExecution conflicting = execution(1L, 10L, 21L);
-        ExecutorService executor = Executors.newSingleThreadExecutor();
+        ExecutorService executor = Executors.newFixedThreadPool(2);
         try {
             Future<TradeRegistrationOutcome> owner = executor.submit(
                     () -> store.registerWithOutcome(authoritative));
             assertTrue(ownerBeforePublication.await(5L, TimeUnit.SECONDS));
-
-            assertThrows(TradeMetadataMismatchException.class,
+            Future<TradeRegistrationOutcome> contender = executor.submit(
                     () -> store.registerWithOutcome(conflicting));
+
+            assertTrue(contenderWaitingForOwner.await(5L, TimeUnit.SECONDS));
             allowOwnerPublication.countDown();
             TradeRegistrationOutcome created = getWithin(owner);
+            ExecutionException conflictFailure = assertThrows(
+                    ExecutionException.class, () -> getWithin(contender));
 
             assertFalse(created.duplicate());
+            assertTrue(conflictFailure.getCause() instanceof TradeMetadataMismatchException);
             assertSame(created.record(), store.record(authoritative.tradeId()));
             assertEquals(1, store.pendingCount());
             assertEquals(1, store.totalCount());
         } finally {
             allowOwnerPublication.countDown();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5L, TimeUnit.SECONDS));
+        }
+    }
+
+    /** 场景：活动槽拥有者回滚后，不同载荷等待者可重新竞争并成为该成交标识的新权威记录。 */
+    @Test
+    void conflictingContenderMayRegisterAfterOwnerPublicationFailure() throws Exception {
+        CountDownLatch ownerBeforeFailure = new CountDownLatch(1);
+        CountDownLatch allowOwnerFailure = new CountDownLatch(1);
+        CountDownLatch contenderWaitingForOwner = new CountDownLatch(1);
+        AtomicBoolean failOwnerOnce = new AtomicBoolean(true);
+        TradeExecutionStore store = new TradeExecutionStore(1, 1, stage -> {
+            if (stage == TradeExecutionStore.PublicationStage.BEFORE_RECORD_PUBLICATION
+                    && failOwnerOnce.compareAndSet(true, false)) {
+                ownerBeforeFailure.countDown();
+                await(allowOwnerFailure);
+                throw new InjectedPublicationFailure(stage);
+            }
+        }, new TradeExecutionStore.RegistrationObserver() {
+            @Override
+            public void afterMiss(long tradeId) {
+            }
+
+            @Override
+            public void beforeAwait(long tradeId) {
+                contenderWaitingForOwner.countDown();
+            }
+        });
+        TradeExecution abandoned = execution(1L, 10L, 20L);
+        TradeExecution recovered = execution(1L, 10L, 21L);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<TradeRegistrationOutcome> owner = executor.submit(
+                    () -> store.registerWithOutcome(abandoned));
+            assertTrue(ownerBeforeFailure.await(5L, TimeUnit.SECONDS));
+            Future<TradeRegistrationOutcome> contender = executor.submit(
+                    () -> store.registerWithOutcome(recovered));
+
+            assertTrue(contenderWaitingForOwner.await(5L, TimeUnit.SECONDS));
+            allowOwnerFailure.countDown();
+            ExecutionException ownerFailure = assertThrows(
+                    ExecutionException.class, () -> getWithin(owner));
+            TradeRegistrationOutcome created = getWithin(contender);
+
+            assertTrue(ownerFailure.getCause() instanceof InjectedPublicationFailure);
+            assertFalse(created.duplicate());
+            assertEquals(recovered, created.record().execution());
+            assertSame(created.record(), store.record(recovered.tradeId()));
+            assertEquals(1, store.pendingCount());
+            assertEquals(1, store.totalCount());
+            assertTrue(store.pendingTradeIds(abandoned.sellOrderId()).isEmpty());
+            assertEquals(List.of(recovered.tradeId()),
+                    store.pendingTradeIds(recovered.sellOrderId()));
+        } finally {
+            allowOwnerFailure.countDown();
             executor.shutdownNow();
             assertTrue(executor.awaitTermination(5L, TimeUnit.SECONDS));
         }

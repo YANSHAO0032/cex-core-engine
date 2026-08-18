@@ -129,6 +129,7 @@ public final class TradeSettlementCoordinator {
      * @throws NullPointerException 当成交为 {@code null} 时抛出
      * @throws TradeMetadataMismatchException 当相同成交标识已绑定不同载荷时抛出
      * @throws PendingCapacityExceededException 当新的成交标识超过固定存储容量时抛出
+     * @throws TradeSequenceConflictException 当订单同一未消费序号已由不同权威事件占用时抛出；本成交记录会先终结为拒绝
      * @note 成交首先在用户锁外登记；只有记录发布成功后才解析订单并获取条带锁，容量失败不消费订单序号。
      */
     public TradeResult accept(TradeExecution execution) {
@@ -247,90 +248,95 @@ public final class TradeSettlementCoordinator {
             return rejectLocked(record, "trade sequence is already consumed");
         }
 
-        TradeOrderReference buyerReference = new TradeOrderReference(
-                execution.tradeId(), execution.buyOrderId(), execution.buyOrderSequence());
-        TradeOrderReference sellerReference = new TradeOrderReference(
-                execution.tradeId(), execution.sellOrderId(), execution.sellOrderSequence());
-        if (!isNextForBothOrders(execution, buyer, seller)) {
-            prepareAndCommitBothReferencesLocked(
-                    buyer, seller, buyerReference, sellerReference);
-            return TradeResult.PENDING;
-        }
-        validateReferenceSlot(buyer, buyerReference);
-        validateReferenceSlot(seller, sellerReference);
-
-        OrderFillMutation buyerMutation;
-        OrderFillMutation sellerMutation;
-        TradeLedgerMutation ledgerMutation;
-        RiskWindowKey buyerWindowKey;
-        RiskWindowKey sellerWindowKey;
-        TradeWindow buyerWindow;
-        TradeWindow sellerWindow;
-        boolean publishBuyerWindow;
-        boolean publishSellerWindow;
-        TradeWindowMutation buyerWindowMutation;
-        TradeWindowMutation sellerWindowMutation;
         try {
-            validateCounterpartyMetadata(execution, buyer, seller);
-            buyerMutation = orderStateMachine.prepareFillLocked(buyer, execution);
-            sellerMutation = orderStateMachine.prepareFillLocked(seller, execution);
-            ledgerMutation = ledger.prepareTradeLocked(
-                    buyer.userId(),
-                    seller.userId(),
-                    execution.pair().baseAsset(),
-                    execution.pair().quoteAsset(),
-                    execution.baseQuantity(),
-                    execution.quoteQuantity(),
-                    buyerMutation.buyerQuoteReleaseAmount());
-            buyerWindowKey = new RiskWindowKey(
-                    buyer.userId(), execution.pair().quoteAsset());
-            sellerWindowKey = new RiskWindowKey(
-                    seller.userId(), execution.pair().quoteAsset());
-            buyerWindow = tradeWindows.get(buyerWindowKey);
-            publishBuyerWindow = buyerWindow == null;
-            if (publishBuyerWindow) {
-                buyerWindow = new TradeWindow(RISK_WINDOW_MILLIS);
+            TradeOrderReference buyerReference = new TradeOrderReference(
+                    execution.tradeId(), execution.buyOrderId(), execution.buyOrderSequence());
+            TradeOrderReference sellerReference = new TradeOrderReference(
+                    execution.tradeId(), execution.sellOrderId(), execution.sellOrderSequence());
+            if (!isNextForBothOrders(execution, buyer, seller)) {
+                prepareAndCommitBothReferencesLocked(
+                        buyer, seller, buyerReference, sellerReference);
+                return TradeResult.PENDING;
             }
-            sellerWindow = tradeWindows.get(sellerWindowKey);
-            publishSellerWindow = sellerWindow == null;
-            if (publishSellerWindow) {
-                sellerWindow = new TradeWindow(RISK_WINDOW_MILLIS);
+            validateReferenceSlot(buyer, buyerReference);
+            validateReferenceSlot(seller, sellerReference);
+
+            OrderFillMutation buyerMutation;
+            OrderFillMutation sellerMutation;
+            TradeLedgerMutation ledgerMutation;
+            RiskWindowKey buyerWindowKey;
+            RiskWindowKey sellerWindowKey;
+            TradeWindow buyerWindow;
+            TradeWindow sellerWindow;
+            boolean publishBuyerWindow;
+            boolean publishSellerWindow;
+            TradeWindowMutation buyerWindowMutation;
+            TradeWindowMutation sellerWindowMutation;
+            try {
+                validateCounterpartyMetadata(execution, buyer, seller);
+                buyerMutation = orderStateMachine.prepareFillLocked(buyer, execution);
+                sellerMutation = orderStateMachine.prepareFillLocked(seller, execution);
+                ledgerMutation = ledger.prepareTradeLocked(
+                        buyer.userId(),
+                        seller.userId(),
+                        execution.pair().baseAsset(),
+                        execution.pair().quoteAsset(),
+                        execution.baseQuantity(),
+                        execution.quoteQuantity(),
+                        buyerMutation.buyerQuoteReleaseAmount());
+                buyerWindowKey = new RiskWindowKey(
+                        buyer.userId(), execution.pair().quoteAsset());
+                sellerWindowKey = new RiskWindowKey(
+                        seller.userId(), execution.pair().quoteAsset());
+                buyerWindow = tradeWindows.get(buyerWindowKey);
+                publishBuyerWindow = buyerWindow == null;
+                if (publishBuyerWindow) {
+                    buyerWindow = new TradeWindow(RISK_WINDOW_MILLIS);
+                }
+                sellerWindow = tradeWindows.get(sellerWindowKey);
+                publishSellerWindow = sellerWindow == null;
+                if (publishSellerWindow) {
+                    sellerWindow = new TradeWindow(RISK_WINDOW_MILLIS);
+                }
+                buyerWindowMutation = buyerWindow.prepareRecord(
+                        riskRecordedAtMillis, execution.quoteQuantity());
+                sellerWindowMutation = sellerWindow.prepareRecord(
+                        riskRecordedAtMillis, execution.quoteQuantity());
+            } catch (TradeSequenceConflictException protocolConflict) {
+                throw protocolConflict;
+            } catch (IllegalArgumentException
+                     | OrderTerminalStateException
+                     | ArithmeticException deterministicFailure) {
+                prepareAndCommitBothReferencesLocked(
+                        buyer, seller, buyerReference, sellerReference);
+                return consumeBothReferencesAndRejectLocked(
+                        record, buyer, seller, buyerReference, sellerReference, deterministicFailure);
             }
-            buyerWindowMutation = buyerWindow.prepareRecord(
-                    riskRecordedAtMillis, execution.quoteQuantity());
-            sellerWindowMutation = sellerWindow.prepareRecord(
-                    riskRecordedAtMillis, execution.quoteQuantity());
-        } catch (TradeSequenceConflictException protocolConflict) {
-            throw protocolConflict;
-        } catch (IllegalArgumentException
-                 | OrderTerminalStateException
-                 | ArithmeticException deterministicFailure) {
+
             prepareAndCommitBothReferencesLocked(
                     buyer, seller, buyerReference, sellerReference);
-            return consumeBothReferencesAndRejectLocked(
-                    record, buyer, seller, buyerReference, sellerReference, deterministicFailure);
+            // 新窗口完成双方全部确定性预检后才发布，拒绝路径不得遗留空窗口键。
+            if (publishBuyerWindow) {
+                tradeWindows.put(buyerWindowKey, buyerWindow);
+            }
+            if (publishSellerWindow) {
+                tradeWindows.put(sellerWindowKey, sellerWindow);
+            }
+            ledger.commitTradeLocked(ledgerMutation);
+            orderStateMachine.commitFillLocked(buyer, buyerMutation);
+            orderStateMachine.commitFillLocked(seller, sellerMutation);
+            buyerWindow.commitRecord(buyerWindowMutation);
+            sellerWindow.commitRecord(sellerWindowMutation);
+            tradeStore.markSettled(execution.tradeId(), execution.executedAtMillis());
+            if (!buyerMutation.complete() || !sellerMutation.complete()) {
+                metrics.partialFill();
+            }
+            metrics.settledTrade();
+            return TradeResult.SETTLED;
+        } catch (TradeSequenceConflictException protocolConflict) {
+            rejectLocked(record, rejectionReason(protocolConflict));
+            throw protocolConflict;
         }
-
-        prepareAndCommitBothReferencesLocked(
-                buyer, seller, buyerReference, sellerReference);
-        // 新窗口完成双方全部确定性预检后才发布，拒绝路径不得遗留空窗口键。
-        if (publishBuyerWindow) {
-            tradeWindows.put(buyerWindowKey, buyerWindow);
-        }
-        if (publishSellerWindow) {
-            tradeWindows.put(sellerWindowKey, sellerWindow);
-        }
-        ledger.commitTradeLocked(ledgerMutation);
-        orderStateMachine.commitFillLocked(buyer, buyerMutation);
-        orderStateMachine.commitFillLocked(seller, sellerMutation);
-        buyerWindow.commitRecord(buyerWindowMutation);
-        sellerWindow.commitRecord(sellerWindowMutation);
-        tradeStore.markSettled(execution.tradeId(), execution.executedAtMillis());
-        if (!buyerMutation.complete() || !sellerMutation.complete()) {
-            metrics.partialFill();
-        }
-        metrics.settledTrade();
-        return TradeResult.SETTLED;
     }
 
     /**

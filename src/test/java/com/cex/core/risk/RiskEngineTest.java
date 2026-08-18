@@ -13,6 +13,9 @@ import com.cex.core.order.OrderSubmission;
 import com.cex.core.order.TradeExecution;
 import com.cex.core.order.TradingPair;
 import com.cex.core.trade.TradeResult;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Random;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -130,6 +133,62 @@ class RiskEngineTest {
         assertEquals(0L, window.currentSum(100L));
         window.commitRecord(mutation);
         assertEquals(40L, window.currentSum(100L));
+    }
+
+    /** 场景：跨越过期边界的逆序成交按最新已观察时间淘汰，不阻塞后续头部回收。 */
+    @Test
+    void tradeWindowEvictsOutOfOrderEntryAgainstLatestObservedTime() {
+        TradeWindow window = new TradeWindow(10_000L);
+        window.record(10_001L, 100L);
+        window.record(1L, 100L);
+
+        assertEquals(100L, window.currentSum(10_002L));
+        assertEquals(1, window.size());
+    }
+
+    /** 场景：仍在窗口内的逆序成交按时间排序保存，任意过期下界都可准确回收。 */
+    @Test
+    void tradeWindowRetainsAndOrdersInWindowOutOfOrderEntries() {
+        TradeWindow window = new TradeWindow(10_000L);
+        window.record(100L, 40L);
+        window.record(300L, 30L);
+        window.record(200L, 20L);
+
+        assertEquals(30L, window.currentSum(10_250L));
+        assertEquals(1, window.size());
+    }
+
+    /** 场景：确定性乱序序列始终与按时间排序的朴素窗口模型保持金额和记录数一致。 */
+    @Test
+    void tradeWindowMatchesReferenceModelForOutOfOrderTimestamps() {
+        TradeWindow window = new TradeWindow(10_000L);
+        List<long[]> reference = new ArrayList<>();
+        Random random = new Random(20260818L);
+        long latestObserved = 0L;
+        for (int step = 0; step < 2_000; step++) {
+            long timestamp;
+            if (step % 4 == 0) {
+                latestObserved += random.nextInt(500);
+                timestamp = latestObserved;
+            } else {
+                timestamp = Math.max(0L,
+                        latestObserved - random.nextInt(15_000));
+            }
+            long amount = random.nextInt(100) + 1L;
+            reference.add(new long[] {timestamp, amount});
+            long cutoff = latestObserved - 10_000L;
+            reference.removeIf(entry -> entry[0] < cutoff);
+            long expectedSum = reference.stream()
+                    .mapToLong(entry -> entry[1])
+                    .sum();
+
+            window.record(timestamp, amount);
+
+            assertEquals(expectedSum, window.currentSum(latestObserved),
+                    "rolling sum at step " + step);
+            assertEquals(reference.size(), window.size(),
+                    "window size at step " + step);
+        }
     }
 
     /**

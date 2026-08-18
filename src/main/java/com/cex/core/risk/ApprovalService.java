@@ -5,6 +5,7 @@ import java.util.Objects;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
@@ -19,6 +20,14 @@ public final class ApprovalService implements AutoCloseable {
     private final AtomicLong submitted = new AtomicLong();
     /** 已执行完毕（含失败清理）的审批任务总数。 */
     private final AtomicLong completed = new AtomicLong();
+    /** 仅供同包测试协调任务接收与关闭竞态的观察器。 */
+    private final SubmissionObserver submissionObserver;
+    /** 协调任务接收线性化边界与执行器关闭时机的生命周期监视器。 */
+    private final Object lifecycleMonitor = new Object();
+    /** 已进入接收边界但尚未从执行器提交调用返回的线程数。 */
+    private int submissionsInFlight;
+    /** 是否已停止接收新审批任务，默认 false 表示仍接收。 */
+    private boolean closed;
 
     /**
      * 创建审批执行服务。
@@ -28,9 +37,24 @@ public final class ApprovalService implements AutoCloseable {
      * @throws IllegalArgumentException 当线程数或队列容量不为正数时抛出
      */
     public ApprovalService(int workerCount, int queueCapacity) {
+        this(workerCount, queueCapacity, () -> { });
+    }
+
+    /**
+     * 使用接收边界观察器创建审批执行服务。
+     *
+     * @param workerCount 审批工作线程数，必须为正数
+     * @param queueCapacity 审批等待队列容量，必须为正数
+     * @param submissionObserver 仅测试使用的任务接收边界观察器
+     * @throws IllegalArgumentException 当线程数或队列容量不为正数时抛出
+     * @throws NullPointerException 当观察器为 {@code null} 时抛出
+     */
+    ApprovalService(int workerCount, int queueCapacity, SubmissionObserver submissionObserver) {
         if (workerCount <= 0 || queueCapacity <= 0) {
             throw new IllegalArgumentException("workerCount and queueCapacity must be positive");
         }
+        this.submissionObserver = Objects.requireNonNull(
+                submissionObserver, "submissionObserver");
         // 有界队列满时由提交线程执行，避免无界积压与丢失审批事件。
         executor = new ThreadPoolExecutor(workerCount, workerCount, 0L, TimeUnit.MILLISECONDS,
                 new ArrayBlockingQueue<>(queueCapacity), new ThreadPoolExecutor.CallerRunsPolicy());
@@ -44,7 +68,7 @@ public final class ApprovalService implements AutoCloseable {
      * @param sink 接收强类型审批结果的回流端
      * @throws NullPointerException 当任一必需参数为 {@code null} 时抛出
      * @throws IllegalStateException 当服务已关闭时抛出
-     * @note 任务计数在提交前递增、在 finally 中完成，支持并发静止判定与审批结果回流。
+     * @note 关闭检查与执行器接收之间使用短生命周期预约建立线性化边界；任务计数仅覆盖已接收任务，并在执行 finally 中完成。
      */
     public void submit(
             OrderSubmission submission,
@@ -53,17 +77,29 @@ public final class ApprovalService implements AutoCloseable {
         Objects.requireNonNull(submission, "submission");
         Objects.requireNonNull(policy, "policy");
         Objects.requireNonNull(sink, "sink");
-        if (executor.isShutdown()) {
-            throw new IllegalStateException("approval service is shut down");
-        }
-        submitted.incrementAndGet();
-        executor.execute(() -> {
-            try {
-                new ApprovalTask(submission, policy, sink).run();
-            } finally {
-                completed.incrementAndGet();
+        beginSubmission();
+        boolean counted = false;
+        AtomicBoolean taskStarted = new AtomicBoolean();
+        try {
+            submissionObserver.afterAcceptance();
+            submitted.incrementAndGet();
+            counted = true;
+            executor.execute(() -> {
+                taskStarted.set(true);
+                try {
+                    new ApprovalTask(submission, policy, sink).run();
+                } finally {
+                    completed.incrementAndGet();
+                }
+            });
+        } catch (RuntimeException | Error submissionFailure) {
+            if (counted && !taskStarted.get()) {
+                submitted.decrementAndGet();
             }
-        });
+            throw submissionFailure;
+        } finally {
+            finishSubmission();
+        }
     }
 
     /** 获取已提交的审批任务数量。
@@ -101,10 +137,57 @@ public final class ApprovalService implements AutoCloseable {
     /**
      * 停止接收新审批任务。
      *
-     * @note 使用 shutdown 保留已入队任务，保证其审批结果仍可回流。
+     * @note 先在线性化边界停止接收；若仍有提交正在调用 execute，由最后一个提交者执行 shutdown，保留所有已接收任务并避免回流端重入死锁。
      */
     @Override
     public void close() {
-        executor.shutdown();
+        boolean shutdownExecutor;
+        synchronized (lifecycleMonitor) {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            shutdownExecutor = submissionsInFlight == 0;
+        }
+        if (shutdownExecutor) {
+            executor.shutdown();
+        }
+    }
+
+    /**
+     * 在线性化边界接收一个提交并预约执行器仍保持开放。
+     *
+     * @throws IllegalStateException 当服务已停止接收新任务时抛出
+     */
+    private void beginSubmission() {
+        synchronized (lifecycleMonitor) {
+            if (closed) {
+                throw new IllegalStateException("approval service is shut down");
+            }
+            submissionsInFlight++;
+        }
+    }
+
+    /**
+     * 释放一个提交预约，并在关闭已发生时由最后一个提交者关闭执行器。
+     *
+     * @note 不等待任务执行完成；CallerRunsPolicy 回流端即使重入 close 也不会等待自身预约。
+     */
+    private void finishSubmission() {
+        boolean shutdownExecutor;
+        synchronized (lifecycleMonitor) {
+            submissionsInFlight--;
+            shutdownExecutor = closed && submissionsInFlight == 0;
+        }
+        if (shutdownExecutor) {
+            executor.shutdown();
+        }
+    }
+
+    /** 仅供同包测试观察提交已通过关闭检查的最小回调。 */
+    @FunctionalInterface
+    interface SubmissionObserver {
+        /** 观察任务已通过关闭检查但尚未交给执行器。 */
+        void afterAcceptance();
     }
 }

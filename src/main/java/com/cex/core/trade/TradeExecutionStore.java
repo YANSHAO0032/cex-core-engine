@@ -135,9 +135,7 @@ public final class TradeExecutionStore {
                     return new TradeRegistrationOutcome(
                             sameOrConflict(existing, execution), true);
                 }
-                if (!inProgress.hasSameExecution(execution)) {
-                    throw metadataMismatch(tradeId);
-                }
+                // 临时槽的载荷尚非权威；统一等待其发布或回滚后，再按 published record 判定重复或冲突。
                 awaitRegistration(tradeId, inProgress);
                 continue;
             }
@@ -291,6 +289,7 @@ public final class TradeExecutionStore {
      * @param registration 当前观察到的登记槽
      */
     private void awaitRegistration(long tradeId, Registration registration) {
+        registrationObserver.beforeAwait(tradeId);
         while (registrations.get(tradeId) == registration) {
             Thread.onSpinWait();
         }
@@ -483,6 +482,14 @@ public final class TradeExecutionStore {
          */
         default void afterRegistrationAcquired(long tradeId) {
         }
+
+        /**
+         * 观察当前线程即将等待已存在的成交标识登记槽结束。
+         *
+         * @param tradeId 即将等待的成交标识
+         */
+        default void beforeAwait(long tradeId) {
+        }
     }
 
     /**
@@ -505,14 +512,5 @@ public final class TradeExecutionStore {
             this.execution = execution;
         }
 
-        /**
-         * 判断候选成交是否与正在登记的成交相同。
-         *
-         * @param candidate 待比较的候选成交
-         * @return 所有成交记录组件均相同时为 {@code true}
-         */
-        private boolean hasSameExecution(TradeExecution candidate) {
-            return execution.equals(candidate);
-        }
     }
 }

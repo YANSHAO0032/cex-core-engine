@@ -2,6 +2,7 @@ package com.cex.core.risk;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.cex.core.account.AccountLedger;
@@ -22,6 +23,9 @@ import com.cex.core.trade.TradeResult;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
@@ -71,6 +75,114 @@ class ApprovalTest {
             assertTrue(received.get().decidedAtMillis() >= 0L);
             assertEquals(1L, service.submittedCount());
         } finally {
+            service.close();
+        }
+    }
+
+    /**
+     * 场景：提交已越过接收边界后并发关闭，已接收任务仍须完成，关闭后的新提交必须拒绝。
+     *
+     * @throws Exception 并发提交、关闭或审批等待失败时抛出
+     */
+    @Test
+    void acceptedSubmissionCompletesWhenCloseRacesAfterAcceptance() throws Exception {
+        CountDownLatch accepted = new CountDownLatch(1);
+        CountDownLatch releaseSubmission = new CountDownLatch(1);
+        ApprovalService service = new ApprovalService(1, 1, () -> {
+            accepted.countDown();
+            awaitLatch(releaseSubmission);
+        });
+        ExecutorService callers = Executors.newFixedThreadPool(2);
+        AtomicReference<ApprovalResult> received = new AtomicReference<>();
+        try {
+            Future<?> submission = callers.submit(() -> service.submit(
+                    buySubmission(), source -> ApprovalDecision.PASS, received::set));
+            assertTrue(accepted.await(2L, TimeUnit.SECONDS));
+
+            Future<?> closing = callers.submit(service::close);
+            closing.get(2L, TimeUnit.SECONDS);
+            assertThrows(IllegalStateException.class, () -> service.submit(
+                    buySubmission(), source -> ApprovalDecision.PASS, result -> { }));
+
+            releaseSubmission.countDown();
+            submission.get(2L, TimeUnit.SECONDS);
+            service.awaitQuiescence(2L, TimeUnit.SECONDS);
+
+            assertNotNull(received.get());
+            assertEquals(1L, service.submittedCount());
+        } finally {
+            releaseSubmission.countDown();
+            service.close();
+            callers.shutdownNow();
+            assertTrue(callers.awaitTermination(2L, TimeUnit.SECONDS));
+        }
+    }
+
+    /**
+     * 场景：队列满触发提交线程执行时，结果回流内关闭服务不得形成生命周期锁升级死锁。
+     *
+     * @throws Exception 并发任务或审批等待失败时抛出
+     */
+    @Test
+    void callerRunsSinkMayCloseServiceWithoutDeadlock() throws Exception {
+        ApprovalService service = new ApprovalService(1, 1);
+        CountDownLatch workerEntered = new CountDownLatch(1);
+        CountDownLatch releaseWorker = new CountDownLatch(1);
+        ExecutorService caller = Executors.newSingleThreadExecutor();
+        try {
+            service.submit(buySubmission(), submission -> {
+                workerEntered.countDown();
+                awaitLatch(releaseWorker);
+                return ApprovalDecision.PASS;
+            }, result -> { });
+            assertTrue(workerEntered.await(2L, TimeUnit.SECONDS));
+            service.submit(buySubmission(), submission -> ApprovalDecision.PASS, result -> { });
+
+            Future<?> callerRuns = caller.submit(() -> service.submit(
+                    buySubmission(), submission -> ApprovalDecision.PASS,
+                    result -> service.close()));
+            callerRuns.get(2L, TimeUnit.SECONDS);
+            releaseWorker.countDown();
+            service.awaitQuiescence(2L, TimeUnit.SECONDS);
+
+            assertEquals(3L, service.submittedCount());
+        } finally {
+            releaseWorker.countDown();
+            service.close();
+            caller.shutdownNow();
+            assertTrue(caller.awaitTermination(2L, TimeUnit.SECONDS));
+        }
+    }
+
+    /**
+     * 场景：提交线程执行的审批策略失败仍属于已接收且已完成任务，不得回滚接收计数。
+     *
+     * @throws Exception 并发任务或审批等待失败时抛出
+     */
+    @Test
+    void callerRunsTaskFailureStillBalancesAcceptedCount() throws Exception {
+        ApprovalService service = new ApprovalService(1, 1);
+        CountDownLatch workerEntered = new CountDownLatch(1);
+        CountDownLatch releaseWorker = new CountDownLatch(1);
+        try {
+            service.submit(buySubmission(), submission -> {
+                workerEntered.countDown();
+                awaitLatch(releaseWorker);
+                return ApprovalDecision.PASS;
+            }, result -> { });
+            assertTrue(workerEntered.await(2L, TimeUnit.SECONDS));
+            service.submit(buySubmission(), submission -> ApprovalDecision.PASS, result -> { });
+
+            assertThrows(IllegalStateException.class, () -> service.submit(
+                    buySubmission(), submission -> {
+                        throw new IllegalStateException("injected approval failure");
+                    }, result -> { }));
+            releaseWorker.countDown();
+            service.awaitQuiescence(2L, TimeUnit.SECONDS);
+
+            assertEquals(3L, service.submittedCount());
+        } finally {
+            releaseWorker.countDown();
             service.close();
         }
     }
@@ -197,6 +309,22 @@ class ApprovalTest {
                 tradeId, BUY_ORDER_ID, SELL_ORDER_ID, BTC_USDT,
                 baseQuantity, quoteQuantity,
                 buySequence, sellSequence, 2L);
+    }
+
+    /**
+     * 在限定时间内等待测试同步信号。
+     *
+     * @param latch 待等待的同步信号
+     */
+    private static void awaitLatch(CountDownLatch latch) {
+        try {
+            if (!latch.await(2L, TimeUnit.SECONDS)) {
+                throw new AssertionError("timed out waiting for test synchronization");
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("interrupted while waiting for test synchronization", interrupted);
+        }
     }
 
     /** 通过闭锁控制审批返回的强类型风险夹具。 */

@@ -263,10 +263,10 @@ class TradeSettlementCoordinatorTest {
                         () -> fixture.machine.registerEventLocked(fixture.seller, sellerHead)));
         BalanceSnapshot buyerQuoteBefore = fixture.ledger.balance(fixture.buyerId, USDT);
         BalanceSnapshot sellerBaseBefore = fixture.ledger.balance(fixture.sellerId, BTC);
+        TradeExecution conflicting = fixture.execution(1L, 2L, 200L, 3L, 3L);
 
         assertThrows(TradeSequenceConflictException.class,
-                () -> fixture.coordinator.accept(
-                        fixture.execution(1L, 2L, 200L, 3L, 3L)));
+                () -> fixture.coordinator.accept(conflicting));
 
         assertEquals(0, pendingEventCount(fixture, fixture.buyer));
         assertEquals(1, pendingEventCount(fixture, fixture.seller));
@@ -278,13 +278,29 @@ class TradeSettlementCoordinatorTest {
         assertEquals(OrderStatus.NEW, fixture.seller.status());
         assertEquals(buyerQuoteBefore, fixture.ledger.balance(fixture.buyerId, USDT));
         assertEquals(sellerBaseBefore, fixture.ledger.balance(fixture.sellerId, BTC));
+        assertEquals(TradeExecutionState.REJECTED, fixture.store.record(1L).state());
+        assertEquals(0, fixture.store.pendingCount());
+        assertTrue(fixture.store.pendingTradeIds(fixture.buyer.orderId()).isEmpty());
+        assertTrue(fixture.store.pendingTradeIds(fixture.seller.orderId()).isEmpty());
+        assertEquals(1L, fixture.metrics.tradeRejectedCount());
 
-        TradeOrderReference legitimateBuyerEvent = new TradeOrderReference(
-                91L, fixture.buyer.orderId(), 3L);
-        assertEquals(SequenceRegistrationResult.BUFFERED,
-                withUserLockResult(fixture.locks, fixture.buyerId,
-                        () -> fixture.machine.registerEventLocked(
-                                fixture.buyer, legitimateBuyerEvent)));
+        assertEquals(TradeResult.DUPLICATE,
+                fixture.coordinator.accept(conflicting));
+        assertEquals(1L, fixture.metrics.tradeRejectedCount());
+
+        assertEquals(TradeResult.SETTLED,
+                fixture.coordinator.accept(
+                        fixture.execution(2L, 1L, 100L, 2L, 2L)));
+        assertEquals(sellerHead, withUserLockResult(
+                fixture.locks, fixture.sellerId,
+                () -> fixture.machine.nextEventLocked(fixture.seller)));
+        assertEquals(TradeResult.SETTLED,
+                fixture.coordinator.accept(
+                        fixture.execution(90L, 1L, 100L, 3L, 3L)));
+        assertEquals(3L, fixture.buyer.lastAppliedSequence());
+        assertEquals(3L, fixture.seller.lastAppliedSequence());
+        assertEquals(0, pendingEventCount(fixture, fixture.buyer));
+        assertEquals(0, pendingEventCount(fixture, fixture.seller));
     }
 
     /** 场景：第二侧未来缓存满时不得在第一侧遗留孤儿成交引用。 */
