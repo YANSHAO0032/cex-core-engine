@@ -17,6 +17,10 @@ import org.junit.jupiter.api.Test;
  * <p>限制：测试仅覆盖内存账本，不涉及订单撮合或持久化。</p>
  */
 class MultiAssetLedgerTest {
+    /** 创建多资产账本测试实例。 */
+    MultiAssetLedgerTest() {
+    }
+
 
     /** 比特币基础资产。 */
     private static final AssetId BTC = new AssetId("BTC");

@@ -41,6 +41,10 @@ import org.junit.jupiter.api.Test;
  * <p>使用限制：测试直接装配协调器，不经过后续任务提供的订单引擎门面。</p>
  */
 class TradeSettlementCoordinatorTest {
+    /** 创建成交协调器测试实例。 */
+    TradeSettlementCoordinatorTest() {
+    }
+
 
     /** 测试基础资产。 */
     private static final AssetId BTC = new AssetId("BTC");

@@ -16,6 +16,10 @@ import org.junit.jupiter.api.Test;
  * <p>使用限制：仅验证单 JVM 内订单上下文的并发语义，不覆盖跨进程或持久化恢复。</p>
  */
 class OrderContextTest {
+    /** 创建订单上下文测试实例。 */
+    OrderContextTest() {
+    }
+
 
     /**
      * 场景：未持锁读取状态时，状态字段必须具备 volatile 可见性。

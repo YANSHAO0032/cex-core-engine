@@ -8,6 +8,7 @@ package com.cex.core.order;
  * <p>使用限制：不表示同序号载荷冲突，序号协议错误使用独立异常。</p>
  */
 public final class InvalidTradeExecutionException extends IllegalArgumentException {
+    /** 异常序列化版本标识。 */
     private static final long serialVersionUID = 1L;
 
     /**

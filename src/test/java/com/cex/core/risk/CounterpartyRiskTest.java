@@ -35,6 +35,10 @@ import org.junit.jupiter.api.Test;
  * <p>使用限制：测试只覆盖任务 7 风控边界，不替代后续混沌和性能验收。</p>
  */
 class CounterpartyRiskTest {
+    /** 创建双边风控测试实例。 */
+    CounterpartyRiskTest() {
+    }
+
 
     /** 测试基础资产。 */
     private static final AssetId BTC = new AssetId("BTC");

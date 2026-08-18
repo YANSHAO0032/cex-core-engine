@@ -39,8 +39,31 @@ public final class OrderEventRegistrationMutation {
         this.insertsEvent = insertsEvent;
     }
 
+    /**
+     * 获取变更绑定的目标订单。
+     *
+     * @return 已验证的目标订单上下文
+     */
     OrderContext order() { return order; }
+
+    /**
+     * 获取待登记的权威事件。
+     *
+     * @return 已验证的候选事件
+     */
     SequencedOrderEvent event() { return event; }
+
+    /**
+     * 获取准备阶段确定的登记结果。
+     *
+     * @return 可处理、已缓存、重复或过期结果
+     */
     SequenceRegistrationResult result() { return result; }
+
+    /**
+     * 判断提交阶段是否需要写入待处理事件映射。
+     *
+     * @return 需要插入候选事件时为 {@code true}
+     */
     boolean insertsEvent() { return insertsEvent; }
 }

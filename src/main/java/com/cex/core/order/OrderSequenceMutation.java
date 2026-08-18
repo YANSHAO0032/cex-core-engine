@@ -8,7 +8,9 @@ package com.cex.core.order;
  * <p>使用限制：只能由 {@link OrderStateMachine} 创建和提交，不携带成交或资金变更。</p>
  */
 public final class OrderSequenceMutation {
+    /** 接收本次权威序号推进的目标订单。 */
     private final OrderContext order;
+    /** 已验证且必须紧邻当前序号的下一权威序号。 */
     private final long orderSequence;
 
     /**
@@ -23,6 +25,17 @@ public final class OrderSequenceMutation {
         this.orderSequence = orderSequence;
     }
 
+    /**
+     * 获取变更绑定的目标订单。
+     *
+     * @return 已验证的订单上下文
+     */
     OrderContext order() { return order; }
+
+    /**
+     * 获取待提交的下一权威序号。
+     *
+     * @return 已验证的订单权威序号
+     */
     long orderSequence() { return orderSequence; }
 }

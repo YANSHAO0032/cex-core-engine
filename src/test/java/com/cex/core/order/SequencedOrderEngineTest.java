@@ -35,6 +35,10 @@ import org.junit.jupiter.api.Test;
  * <p>每个场景使用真实多资产账本与订单引擎，防止测试替身掩盖资金或锁边界副作用。</p>
  */
 class SequencedOrderEngineTest {
+    /** 创建权威序号订单引擎测试实例。 */
+    SequencedOrderEngineTest() {
+    }
+
     /** 测试基础资产。 */
     private static final AssetId BTC = new AssetId("BTC");
     /** 测试报价资产。 */
@@ -155,7 +159,11 @@ class SequencedOrderEngineTest {
         assertEquals(2, attempts.get());
     }
 
-    /** 场景：同 ID 并发重试只能有一个线程占用发送权，其他调用不得并行触发 sink。 */
+    /**
+     * 场景：同 ID 并发重试只能有一个线程占用发送权，其他调用不得并行触发 sink。
+     *
+     * @throws Exception 当并发任务等待、取回结果或线程池关闭失败时抛出
+     */
     @Test
     void concurrentSameIdRetryDoesNotStartParallelDelivery() throws Exception {
         StripedLockManager locks = new StripedLockManager(16);
@@ -259,6 +267,11 @@ class SequencedOrderEngineTest {
         assertEquals(List.of(), buffer.removeAll(BUY_ORDER_ID));
     }
 
+    /**
+     * 创建已提交买卖双方订单的可成交夹具。
+     *
+     * @return 已提交双方订单的夹具
+     */
     private Fixture readyFixture() {
         Fixture fixture = fixture(1_000L);
         fixture.engine.submit(fixture.buySubmission());
@@ -266,10 +279,23 @@ class SequencedOrderEngineTest {
         return fixture;
     }
 
+    /**
+     * 创建使用默认撤单投递边界的夹具。
+     *
+     * @param buyerQuoteAvailable 买方报价资产可用余额，单位为最小货币单位
+     * @return 未提交订单的夹具
+     */
     private Fixture fixture(long buyerQuoteAvailable) {
         return fixture(buyerQuoteAvailable, request -> { });
     }
 
+    /**
+     * 创建使用指定撤单投递边界的夹具。
+     *
+     * @param buyerQuoteAvailable 买方报价资产可用余额，单位为最小货币单位
+     * @param cancelRequestSink 撤单请求外部投递边界
+     * @return 未提交订单的夹具
+     */
     private Fixture fixture(
             long buyerQuoteAvailable, CancelRequestSink cancelRequestSink) {
         StripedLockManager locks = new StripedLockManager(16);
@@ -282,6 +308,13 @@ class SequencedOrderEngineTest {
         return new Fixture(ledger, engine);
     }
 
+    /**
+     * 创建满足资产守恒的买卖双方测试账本。
+     *
+     * @param locks 用户条带锁管理器
+     * @param buyerQuoteAvailable 买方报价资产可用余额，单位为最小货币单位
+     * @return 初始化完成的多资产账本
+     */
     private static AccountLedger ledger(
             StripedLockManager locks, long buyerQuoteAvailable) {
         AccountLedger ledger = new AccountLedger(locks);
@@ -299,23 +332,49 @@ class SequencedOrderEngineTest {
         /** 场景使用的强类型订单引擎。 */
         private final OrderEngine engine;
 
+        /**
+         * 创建订单入口测试夹具。
+         *
+         * @param ledger 场景使用的多资产账本
+         * @param engine 场景使用的强类型订单引擎
+         */
         private Fixture(AccountLedger ledger, OrderEngine engine) {
             this.ledger = ledger;
             this.engine = engine;
         }
 
+        /**
+         * 构造固定买单提交。
+         *
+         * @return 固定买单提交
+         */
         private OrderSubmission buySubmission() {
             return new OrderSubmission(
                     BUY_ORDER_ID, BUYER_ID, OrderSide.BUY, BTC_USDT,
                     10L, 1_000L, 1_000L, 1L, 10L);
         }
 
+        /**
+         * 构造固定卖单提交。
+         *
+         * @return 固定卖单提交
+         */
         private OrderSubmission sellSubmission() {
             return new OrderSubmission(
                     SELL_ORDER_ID, SELLER_ID, OrderSide.SELL, BTC_USDT,
                     10L, 10L, 1_000L, 1L, 10L);
         }
 
+        /**
+         * 构造指定数量与双方权威序号的成交输入。
+         *
+         * @param tradeId 成交标识
+         * @param baseQuantity 基础资产成交数量，单位为最小资产单位
+         * @param quoteQuantity 报价资产成交金额，单位为最小货币单位
+         * @param buySequence 买单权威序号
+         * @param sellSequence 卖单权威序号
+         * @return 不可变成交输入
+         */
         private TradeExecution execution(
                 long tradeId,
                 long baseQuantity,
@@ -328,6 +387,11 @@ class SequencedOrderEngineTest {
                     buySequence, sellSequence, 30L + tradeId);
         }
 
+        /**
+         * 查询当前买单上下文。
+         *
+         * @return 当前买单上下文
+         */
         private OrderContext buyOrder() {
             return engine.order(BUY_ORDER_ID);
         }

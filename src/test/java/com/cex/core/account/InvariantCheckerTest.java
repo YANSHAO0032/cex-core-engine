@@ -12,6 +12,10 @@ import static org.junit.jupiter.api.Assertions.*;
  * <p>限制：本测试只覆盖守恒成立的基础快照场景。</p>
  */
 class InvariantCheckerTest {
+    /** 创建资产不变量检查测试实例。 */
+    InvariantCheckerTest() {
+    }
+
     /** 场景：检查器锁定全部条带后应报告资产守恒并累计快照次数。 */
     @Test
     void snapshotLocksAllStripesAndPreservesAssetInvariant() {

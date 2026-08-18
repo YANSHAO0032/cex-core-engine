@@ -15,6 +15,10 @@ import org.junit.jupiter.api.Test;
  * <p>使用限制：不发送外部撤单请求，也不直接修改账户资金。</p>
  */
 class PendingCancelStateMachineTest {
+    /** 创建等待撤单状态机测试实例。 */
+    PendingCancelStateMachineTest() {
+    }
+
 
     /** 测试基础资产。 */
     private static final AssetId BTC = new AssetId("BTC");

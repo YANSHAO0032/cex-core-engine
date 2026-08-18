@@ -15,11 +15,73 @@ import org.junit.jupiter.api.Test;
  * <p>使用限制：仅验证输入模型，不覆盖订单状态迁移、账本或成交结算。</p>
  */
 class OrderInputValidationTest {
+    /** 创建强类型输入校验测试实例。 */
+    OrderInputValidationTest() {
+    }
+
 
     /** 用于交易对和订单测试的基础资产。 */
     private static final AssetId BTC = new AssetId("BTC");
     /** 用于交易对和订单测试的报价资产。 */
     private static final AssetId USDT = new AssetId("USDT");
+
+    /** 场景：全部强类型记录的同值实例应具有一致的相等性和哈希值。 */
+    @Test
+    void typedRecordsUseComponentValueEqualityAndHashCodes() {
+        AssetId firstAsset = new AssetId("BTC");
+        AssetId secondAsset = new AssetId("BTC");
+        assertEquals(firstAsset, secondAsset);
+        assertEquals(firstAsset.hashCode(), secondAsset.hashCode());
+
+        TradingPair firstPair = new TradingPair(
+                new AssetId("BTC"), new AssetId("USDT"));
+        TradingPair secondPair = new TradingPair(
+                new AssetId("BTC"), new AssetId("USDT"));
+        assertEquals(firstPair, secondPair);
+        assertEquals(firstPair.hashCode(), secondPair.hashCode());
+
+        OrderSubmission firstSubmission = new OrderSubmission(
+                11L, 21L, OrderSide.BUY, firstPair,
+                5L, 500L, 450L, 1L, 100L);
+        OrderSubmission secondSubmission = new OrderSubmission(
+                11L, 21L, OrderSide.BUY, secondPair,
+                5L, 500L, 450L, 1L, 100L);
+        assertEquals(firstSubmission, secondSubmission);
+        assertEquals(firstSubmission.hashCode(), secondSubmission.hashCode());
+
+        TradeExecution firstExecution = new TradeExecution(
+                31L, 11L, 12L, firstPair,
+                2L, 200L, 2L, 2L, 101L);
+        TradeExecution secondExecution = new TradeExecution(
+                31L, 11L, 12L, secondPair,
+                2L, 200L, 2L, 2L, 101L);
+        assertEquals(firstExecution, secondExecution);
+        assertEquals(firstExecution.hashCode(), secondExecution.hashCode());
+
+        TradeOrderReference firstReference = new TradeOrderReference(31L, 11L, 2L);
+        TradeOrderReference secondReference = new TradeOrderReference(31L, 11L, 2L);
+        assertEquals(firstReference, secondReference);
+        assertEquals(firstReference.hashCode(), secondReference.hashCode());
+
+        CancelRequest firstRequest = new CancelRequest(41L, 11L, 102L);
+        CancelRequest secondRequest = new CancelRequest(41L, 11L, 102L);
+        assertEquals(firstRequest, secondRequest);
+        assertEquals(firstRequest.hashCode(), secondRequest.hashCode());
+
+        CancelConfirmation firstConfirmation =
+                new CancelConfirmation(41L, 11L, 3L, 103L);
+        CancelConfirmation secondConfirmation =
+                new CancelConfirmation(41L, 11L, 3L, 103L);
+        assertEquals(firstConfirmation, secondConfirmation);
+        assertEquals(firstConfirmation.hashCode(), secondConfirmation.hashCode());
+
+        ApprovalResult firstApproval =
+                new ApprovalResult(11L, ApprovalDecision.PASS, 104L);
+        ApprovalResult secondApproval =
+                new ApprovalResult(11L, ApprovalDecision.PASS, 104L);
+        assertEquals(firstApproval, secondApproval);
+        assertEquals(firstApproval.hashCode(), secondApproval.hashCode());
+    }
 
     /** 场景：提交订单应保留预留金额、风控名义金额和权威序号。 */
     @Test

@@ -8,8 +8,11 @@ package com.cex.core.account;
  * <p>限制：不携带锁，也不在提交阶段重新计算或校验金额。</p>
  */
 public final class BalanceMutation {
+    /** 接收本次预计算结果的单资产余额桶。 */
     private final AssetBalance balance;
+    /** 提交后的可用资产余额，单位为资产最小单位。 */
     private final long availableAfter;
+    /** 提交后的冻结资产余额，单位为资产最小单位；与可用余额之和保持不变。 */
     private final long frozenAfter;
 
     /**
@@ -26,7 +29,24 @@ public final class BalanceMutation {
         this.frozenAfter = frozenAfter;
     }
 
+    /**
+     * 获取目标资产余额桶。
+     *
+     * @return 接收预计算结果的余额桶
+     */
     AssetBalance balance() { return balance; }
+
+    /**
+     * 获取提交后的可用资产余额。
+     *
+     * @return 可用资产数量，单位为资产最小单位
+     */
     long availableAfter() { return availableAfter; }
+
+    /**
+     * 获取提交后的冻结资产余额。
+     *
+     * @return 冻结资产数量，单位为资产最小单位
+     */
     long frozenAfter() { return frozenAfter; }
 }

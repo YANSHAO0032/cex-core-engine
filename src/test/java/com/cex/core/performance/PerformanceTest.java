@@ -35,6 +35,10 @@ import org.junit.jupiter.api.Test;
  * @note 撤单终态业务操作内部按规范依次发送请求和确认，延迟样本覆盖完整强类型撤单边界。
  */
 class PerformanceTest {
+    /** 创建性能验收测试实例。 */
+    PerformanceTest() {
+    }
+
     /** 性能测量使用的并发工作线程数量。 */
     private static final int THREADS = 16;
     /** 重复热路径正式测量前的预热操作次数。 */

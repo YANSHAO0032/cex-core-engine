@@ -38,6 +38,10 @@ import org.junit.jupiter.api.Test;
  * <p>使用限制：守护线程仅用于失败时避免故障锁序阻止测试进程退出，不放宽任何完成断言。</p>
  */
 class TradeSettlementConcurrencyTest {
+    /** 创建成交结算并发测试实例。 */
+    TradeSettlementConcurrencyTest() {
+    }
+
 
     /** 测试基础资产。 */
     private static final AssetId BTC = new AssetId("BTC");
@@ -50,7 +54,11 @@ class TradeSettlementConcurrencyTest {
     /** 固定并发工作线程数量。 */
     private static final int WORKER_COUNT = 16;
 
-    /** 场景：反向参数顺序的成交等待低条带时不得提前持有高条带。 */
+    /**
+     * 场景：反向参数顺序的成交等待低条带时不得提前持有高条带。
+     *
+     * @throws Exception 当并发任务等待、取回结果或线程池关闭失败时抛出
+     */
     @Test
     void reverseSubmissionWaitsForLowerStripeBeforeAcquiringHigherStripe() throws Exception {
         StripedLockManager locks = new StripedLockManager(8);
@@ -105,7 +113,11 @@ class TradeSettlementConcurrencyTest {
         assertEquals(1L, fixture.metrics.settledTradeCount());
     }
 
-    /** 场景：同用户自成交即使其条带被其他线程持有，也必须在获取用户锁之前完成拒绝。 */
+    /**
+     * 场景：同用户自成交即使其条带被其他线程持有，也必须在获取用户锁之前完成拒绝。
+     *
+     * @throws Exception 当并发任务等待、取回结果或线程池关闭失败时抛出
+     */
     @Test
     void sameUserSelfTradeRejectsBeforeWaitingForUserStripe() throws Exception {
         StripedLockManager locks = new StripedLockManager(8);
@@ -128,7 +140,12 @@ class TradeSettlementConcurrencyTest {
         }
     }
 
-    /** 场景：十六个线程并发提交 A/B 与 B/A 成交时应全部在限定时间内完成且资金守恒。 */
+    /**
+     * 场景：十六个线程并发提交 A/B 与 B/A 成交时应全部在共享截止时间内完成且资金守恒。
+     *
+     * @throws Exception 当并发任务等待、取回结果或线程池关闭失败时抛出
+     * @note 所有 Future 共用十秒截止时间，避免逐任务等待使死锁检测上限线性放大。
+     */
     @Test
     void reversedCounterpartyWorkloadsFinishWithoutDeadlockAndSettleExactlyOnce() throws Exception {
         ConcurrentFixture fixture = workloadFixture();
@@ -153,8 +170,10 @@ class TradeSettlementConcurrencyTest {
             start.countDown();
 
             int settledResults = 0;
+            long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(10L);
             for (Future<List<TradeResult>> future : futures) {
-                settledResults += future.get(10L, TimeUnit.SECONDS).stream()
+                long remainingNanos = deadlineNanos - System.nanoTime();
+                settledResults += future.get(remainingNanos, TimeUnit.NANOSECONDS).stream()
                         .filter(result -> result == TradeResult.SETTLED)
                         .count();
             }

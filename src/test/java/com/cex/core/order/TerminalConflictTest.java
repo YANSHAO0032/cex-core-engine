@@ -18,6 +18,10 @@ import org.junit.jupiter.api.Test;
  * <p>使用限制：不模拟订单簿，仅消费外部权威成交和撤单确认。</p>
  */
 class TerminalConflictTest {
+    /** 创建订单终态冲突测试实例。 */
+    TerminalConflictTest() {
+    }
+
     /** 测试基础资产。 */
     private static final AssetId BTC = new AssetId("BTC");
     /** 测试报价资产。 */
@@ -123,7 +127,11 @@ class TerminalConflictTest {
                     10L, 1_000L, buySequence, sellSequence, 4L);
         }
 
-        /** @return 当前买单上下文 */
+        /**
+         * 查询当前买单上下文。
+         *
+         * @return 当前买单上下文
+         */
         private OrderContext buyOrder() {
             return engine.order(BUY_ORDER_ID);
         }

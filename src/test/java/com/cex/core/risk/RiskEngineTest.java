@@ -29,6 +29,10 @@ import org.junit.jupiter.api.Test;
  * <p>使用限制：仅验证内存实现的确定性行为。</p>
  */
 class RiskEngineTest {
+    /** 创建风控引擎测试实例。 */
+    RiskEngineTest() {
+    }
+
     /** 风控上下文测试基础资产。 */
     private static final AssetId BTC = new AssetId("BTC");
     /** 风控上下文测试报价资产。 */

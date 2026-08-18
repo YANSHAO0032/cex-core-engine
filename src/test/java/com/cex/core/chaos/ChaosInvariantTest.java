@@ -51,6 +51,10 @@ import org.junit.jupiter.api.Test;
  * @note 买卖双方成交通过固定条带顺序原子提交，任何时刻不得出现负余额或单边成交。
  */
 class ChaosInvariantTest {
+    /** 创建混沌不变量测试实例。 */
+    ChaosInvariantTest() {
+    }
+
     /** 混沌场景随机种子，默认值固定为最终验收种子。 */
     private static final long CHAOS_SEED = 20260817L;
     /** 并发处理主订单的长生命周期工作线程数量。 */
@@ -986,7 +990,7 @@ class ChaosInvariantTest {
         private final LongAdder settledTrades = new LongAdder();
         /** 所有场景精确重复投递的成交数。 */
         private final LongAdder duplicateTrades = new LongAdder();
-        /** 所有场景确定拒绝且消费双序号的成交数。 */
+        /** 所有场景确定拒绝的成交数，包含不消费双方序号的权威序号占用冲突。 */
         private final LongAdder rejectedTrades = new LongAdder();
         /** 所有场景至少一侧仍有剩余数量的成交数。 */
         private final LongAdder partialFills = new LongAdder();
@@ -1000,6 +1004,10 @@ class ChaosInvariantTest {
         private final LongAdder invariantFailures = new LongAdder();
         /** 已执行完成的最终验收场景数量。 */
         private final AtomicInteger coveredScenarios = new AtomicInteger();
+
+        /** 创建全部计数为零的混沌测试报告。 */
+        private ChaosReport() {
+        }
 
         /** 记录一次强类型成交入口调用。 */
         private void processedExecution() {
@@ -1037,34 +1045,74 @@ class ChaosInvariantTest {
             coveredScenarios.incrementAndGet();
         }
 
-        /** @return 强类型成交入口调用总次数 */
+        /**
+         * 获取强类型成交入口调用总次数。
+         *
+         * @return 强类型成交入口调用总次数
+         */
         private long processedExecutions() { return processedExecutions.sum(); }
 
-        /** @return 成功双边结算成交总数 */
+        /**
+         * 获取成功双边结算成交总数。
+         *
+         * @return 成功双边结算成交总数
+         */
         private long settledTrades() { return settledTrades.sum(); }
 
-        /** @return 精确重复成交总数 */
+        /**
+         * 获取精确重复成交总数。
+         *
+         * @return 精确重复成交总数
+         */
         private long duplicateTrades() { return duplicateTrades.sum(); }
 
-        /** @return 确定拒绝成交总数 */
+        /**
+         * 获取确定拒绝成交总数。
+         *
+         * @return 确定拒绝成交总数
+         */
         private long rejectedTrades() { return rejectedTrades.sum(); }
 
-        /** @return 部分成交总数 */
+        /**
+         * 获取部分成交总数。
+         *
+         * @return 部分成交总数
+         */
         private long partialFills() { return partialFills.sum(); }
 
-        /** @return 首次等待撤单确认订单总数 */
+        /**
+         * 获取首次等待撤单确认订单总数。
+         *
+         * @return 首次等待撤单确认订单总数
+         */
         private long pendingCancels() { return pendingCancels.sum(); }
 
-        /** @return 权威序号空洞总数 */
+        /**
+         * 获取权威序号空洞总数。
+         *
+         * @return 权威序号空洞总数
+         */
         private long sequenceGaps() { return sequenceGaps.sum(); }
 
-        /** @return 已完成的全条带一致快照总数 */
+        /**
+         * 获取已完成的全条带一致快照总数。
+         *
+         * @return 已完成的全条带一致快照总数
+         */
         private long invariantSnapshots() { return invariantSnapshots.sum(); }
 
-        /** @return 失败的全条带一致快照总数 */
+        /**
+         * 获取失败的全条带一致快照总数。
+         *
+         * @return 失败的全条带一致快照总数
+         */
         private long invariantFailures() { return invariantFailures.sum(); }
 
-        /** @return 已执行完成的最终验收场景数量 */
+        /**
+         * 获取已执行完成的最终验收场景数量。
+         *
+         * @return 已执行完成的最终验收场景数量
+         */
         private int coveredScenarios() { return coveredScenarios.get(); }
     }
 

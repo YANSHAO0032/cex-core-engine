@@ -19,6 +19,10 @@ import org.junit.jupiter.api.Test;
  * <p>使用限制：仅验证入口元数据，不覆盖外部序列化。</p>
  */
 class OrderMetadataTest {
+    /** 创建订单元数据幂等测试实例。 */
+    OrderMetadataTest() {
+    }
+
     /** 测试基础资产。 */
     private static final AssetId BTC = new AssetId("BTC");
     /** 测试替代基础资产。 */
@@ -142,14 +146,22 @@ class OrderMetadataTest {
             engine.submit(sellSubmission());
         }
 
-        /** @return 固定买单提交 */
+        /**
+         * 构造固定买单提交。
+         *
+         * @return 固定买单提交
+         */
         private OrderSubmission buySubmission() {
             return new OrderSubmission(
                     BUY_ORDER_ID, BUYER_ID, OrderSide.BUY, BTC_USDT,
                     10L, 1_000L, 1_000L, 1L, 1L);
         }
 
-        /** @return 固定卖单提交 */
+        /**
+         * 构造固定卖单提交。
+         *
+         * @return 固定卖单提交
+         */
         private OrderSubmission sellSubmission() {
             return new OrderSubmission(
                     SELL_ORDER_ID, SELLER_ID, OrderSide.SELL, BTC_USDT,

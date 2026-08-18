@@ -8,6 +8,7 @@ package com.cex.core.order;
  * <p>使用限制：未来事件正常缓存不属于冲突；该异常仅在拒绝或错误提交时使用。</p>
  */
 public final class TradeSequenceConflictException extends IllegalStateException {
+    /** 异常序列化版本标识。 */
     private static final long serialVersionUID = 1L;
 
     /**

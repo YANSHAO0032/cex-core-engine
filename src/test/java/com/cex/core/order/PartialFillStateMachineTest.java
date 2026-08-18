@@ -13,6 +13,10 @@ import org.junit.jupiter.api.Test;
  * <p>使用限制：不执行账户资金变更，也不验证双边协调器的原子提交。</p>
  */
 class PartialFillStateMachineTest {
+    /** 创建部分成交状态机测试实例。 */
+    PartialFillStateMachineTest() {
+    }
+
 
     /** 测试基础资产。 */
     private static final AssetId BTC = new AssetId("BTC");

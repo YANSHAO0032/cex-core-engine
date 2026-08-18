@@ -8,6 +8,7 @@ package com.cex.core.order;
  * <p>使用限制：只在准备阶段抛出，不表示账本或订单已经发生部分提交。</p>
  */
 public final class OrderTerminalStateException extends IllegalStateException {
+    /** 异常序列化版本标识。 */
     private static final long serialVersionUID = 1L;
 
     /**

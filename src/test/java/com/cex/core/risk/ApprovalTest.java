@@ -38,6 +38,10 @@ import org.junit.jupiter.api.Test;
  * <p>使用限制：依赖测试专用内存账本，不覆盖外部撮合实现。</p>
  */
 class ApprovalTest {
+    /** 创建审批集成测试实例。 */
+    ApprovalTest() {
+    }
+
     /** 测试基础资产。 */
     private static final AssetId BTC = new AssetId("BTC");
     /** 测试报价资产。 */
@@ -314,14 +318,22 @@ class ApprovalTest {
         }
     }
 
-    /** @return 固定买单提交 */
+    /**
+     * 创建固定买单提交。
+     *
+     * @return 固定买单提交
+     */
     private static OrderSubmission buySubmission() {
         return new OrderSubmission(
                 BUY_ORDER_ID, BUYER_ID, OrderSide.BUY, BTC_USDT,
                 10L, 1_000L, 1_000L, 1L, 1L);
     }
 
-    /** @return 固定卖单提交 */
+    /**
+     * 创建固定卖单提交。
+     *
+     * @return 固定卖单提交
+     */
     private static OrderSubmission sellSubmission() {
         return new OrderSubmission(
                 SELL_ORDER_ID, SELLER_ID, OrderSide.SELL, BTC_USDT,

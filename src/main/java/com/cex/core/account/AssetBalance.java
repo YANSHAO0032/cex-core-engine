@@ -10,7 +10,9 @@ import com.cex.core.util.MoneyMath;
  * <p>限制：不执行跨账户校验或资产守恒计算。</p>
  */
 final class AssetBalance {
+    /** 可直接用于下单或转入冻结桶的资产余额，单位为资产最小单位。 */
     private long available;
+    /** 已为活动订单预留的冻结资产余额，单位为资产最小单位；与可用余额之和参与资产守恒。 */
     private long frozen;
 
     /**
@@ -26,8 +28,18 @@ final class AssetBalance {
         this.frozen = MoneyMath.requireNonNegative(frozen);
     }
 
+    /**
+     * 获取当前可用资产余额。
+     *
+     * @return 可用资产数量，单位为资产最小单位
+     */
     long available() { return available; }
 
+    /**
+     * 获取当前冻结资产余额。
+     *
+     * @return 活动订单预留的冻结资产数量，单位为资产最小单位
+     */
     long frozen() { return frozen; }
 
     /**

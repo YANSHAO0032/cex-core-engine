@@ -23,6 +23,10 @@ import org.junit.jupiter.api.Test;
  * <p>限制：覆盖内存账本行为，不涉及外部持久化或跨进程并发。</p>
  */
 class LedgerInvariantTest {
+    /** 创建账本不变量测试实例。 */
+    LedgerInvariantTest() {
+    }
+
     /** 测试基础资产。 */
     private static final AssetId BTC = new AssetId("BTC");
     /** 测试报价资产。 */

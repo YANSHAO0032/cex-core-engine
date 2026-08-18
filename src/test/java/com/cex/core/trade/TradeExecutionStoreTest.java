@@ -33,6 +33,10 @@ import org.junit.jupiter.api.Test;
  * <p>使用限制：仅验证进程内存储，不覆盖后续双边结算协调器。</p>
  */
 class TradeExecutionStoreTest {
+    /** 创建成交存储测试实例。 */
+    TradeExecutionStoreTest() {
+    }
+
     /** 成交存储测试使用的固定交易对。 */
     private static final TradingPair BTC_USDT = new TradingPair(new AssetId("BTC"), new AssetId("USDT"));
 
@@ -99,7 +103,11 @@ class TradeExecutionStoreTest {
         assertEquals(1, store.totalCount());
     }
 
-    /** 场景：并发新 ID 注册永不突破任一容量，失败预留不会遗留在计数中。 */
+    /**
+     * 场景：并发新 ID 注册永不突破任一容量，失败预留不会遗留在计数中。
+     *
+     * @throws Exception 当并发任务等待、取回结果或线程池关闭失败时抛出
+     */
     @Test
     void concurrentRegistrationsKeepPendingAndTotalCountsBounded() throws Exception {
         TradeExecutionStore store = new TradeExecutionStore(8, 8);
@@ -136,7 +144,11 @@ class TradeExecutionStoreTest {
         }
     }
 
-    /** 场景：容量为一时并发同载荷登记全部返回同一记录，竞争预留最终完全回滚。 */
+    /**
+     * 场景：容量为一时并发同载荷登记全部返回同一记录，竞争预留最终完全回滚。
+     *
+     * @throws Exception 当并发任务等待、取回结果或线程池关闭失败时抛出
+     */
     @Test
     void concurrentExactDuplicatesReturnOriginalRecordWhenCapacityIsFull() throws Exception {
         TradeExecutionStore store = new TradeExecutionStore(1, 1);
@@ -165,7 +177,11 @@ class TradeExecutionStoreTest {
         }
     }
 
-    /** 场景：注册结果必须在线性化点精确区分一个首次登记与其余 31 个并发重复。 */
+    /**
+     * 场景：注册结果必须在线性化点精确区分一个首次登记与其余 31 个并发重复。
+     *
+     * @throws Exception 当并发任务等待、取回结果或线程池关闭失败时抛出
+     */
     @Test
     void concurrentRegistrationOutcomeIdentifiesOneNewAndThirtyOneDuplicates() throws Exception {
         TradeExecutionStore store = new TradeExecutionStore(1, 1);
@@ -209,7 +225,11 @@ class TradeExecutionStoreTest {
         }
     }
 
-    /** 场景：迟到重复在首次查询未命中后，必须识别另一线程已经发布并移除登记槽的权威记录。 */
+    /**
+     * 场景：迟到重复在首次查询未命中后，必须识别另一线程已经发布并移除登记槽的权威记录。
+     *
+     * @throws Exception 当并发任务等待、取回结果或线程池关闭失败时抛出
+     */
     @Test
     void exactDuplicateRechecksPublishedRecordAfterWinningRecreatedRegistrationSlot() throws Exception {
         CountDownLatch ownerBeforePublication = new CountDownLatch(1);
@@ -260,7 +280,11 @@ class TradeExecutionStoreTest {
         }
     }
 
-    /** 场景：权威记录发布后，精确重复必须优先于重建槽中的临时冲突载荷。 */
+    /**
+     * 场景：权威记录发布后，精确重复必须优先于重建槽中的临时冲突载荷。
+     *
+     * @throws Exception 当并发任务等待、取回结果或线程池关闭失败时抛出
+     */
     @Test
     void authoritativeRecordWinsOverConflictingRecreatedRegistrationSlot() throws Exception {
         CountDownLatch ownerBeforePublication = new CountDownLatch(1);
@@ -346,7 +370,11 @@ class TradeExecutionStoreTest {
         }
     }
 
-    /** 场景：权威记录尚未发布时，冲突载荷等待活动槽结束后再按已发布记录拒绝。 */
+    /**
+     * 场景：权威记录尚未发布时，冲突载荷等待活动槽结束后再按已发布记录拒绝。
+     *
+     * @throws Exception 当并发任务等待、取回结果或线程池关闭失败时抛出
+     */
     @Test
     void unpublishedConcurrentConflictWaitsForAuthoritativePublication() throws Exception {
         CountDownLatch ownerBeforePublication = new CountDownLatch(1);
@@ -395,7 +423,11 @@ class TradeExecutionStoreTest {
         }
     }
 
-    /** 场景：活动槽拥有者回滚后，不同载荷等待者可重新竞争并成为该成交标识的新权威记录。 */
+    /**
+     * 场景：活动槽拥有者回滚后，不同载荷等待者可重新竞争并成为该成交标识的新权威记录。
+     *
+     * @throws Exception 当并发任务等待、取回结果或线程池关闭失败时抛出
+     */
     @Test
     void conflictingContenderMayRegisterAfterOwnerPublicationFailure() throws Exception {
         CountDownLatch ownerBeforeFailure = new CountDownLatch(1);
@@ -451,7 +483,11 @@ class TradeExecutionStoreTest {
         }
     }
 
-    /** 场景：并发结算与拒绝只允许一个终态获胜，等待任务必须在限定时间内结束。 */
+    /**
+     * 场景：并发结算与拒绝只允许一个终态获胜，等待任务必须在限定时间内结束。
+     *
+     * @throws Exception 当并发任务等待、取回结果或线程池关闭失败时抛出
+     */
     @Test
     void concurrentTerminalTransitionsChooseOneStateAndReleasePendingOnce() throws Exception {
         TradeExecutionStore store = new TradeExecutionStore(1, 1);
@@ -529,7 +565,11 @@ class TradeExecutionStoreTest {
         }
     }
 
-    /** 场景：首个登记者发布失败后，同载荷等待者释放登记槽、在限定时间内重试并成功。 */
+    /**
+     * 场景：首个登记者发布失败后，同载荷等待者释放登记槽、在限定时间内重试并成功。
+     *
+     * @throws Exception 当并发任务等待、取回结果或线程池关闭失败时抛出
+     */
     @Test
     void ownerPublicationFailureReleasesInFlightSlotForWaitingDuplicateRetry() throws Exception {
         CountDownLatch ownerAtFailurePoint = new CountDownLatch(1);
@@ -574,6 +614,7 @@ class TradeExecutionStoreTest {
      * @return 成功注册的新成交数量
      * @throws InterruptedException 当当前线程被中断时抛出
      * @throws ExecutionException 当任务抛出未预期异常时抛出
+     * @throws TimeoutException 当任一任务未在限定时间内完成时抛出
      */
     private static int completedTrueCount(Collection<Future<Boolean>> futures)
             throws InterruptedException, ExecutionException, TimeoutException {

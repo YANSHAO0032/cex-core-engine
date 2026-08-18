@@ -29,6 +29,7 @@ public final class AccountLedger {
      * 创建空的多资产账本。
      *
      * @param lockManager 用户条带锁管理器
+     * @throws NullPointerException 当锁管理器为 {@code null} 时抛出
      */
     public AccountLedger(StripedLockManager lockManager) {
         this.lockManager = Objects.requireNonNull(lockManager, "lockManager");
@@ -49,6 +50,7 @@ public final class AccountLedger {
      * @param available 初始可用数量
      * @return 包含该余额的用户账户
      * @throws IllegalArgumentException 当参数无效或该资产余额已存在时抛出
+     * @throws NullPointerException 当资产标识为 {@code null} 时抛出
      * @throws ArithmeticException 当初始资产总额溢出时抛出
      */
     public Account createBalance(long userId, AssetId asset, long available) {
@@ -64,6 +66,7 @@ public final class AccountLedger {
      * @param frozen 初始冻结数量
      * @return 包含该余额的用户账户
      * @throws IllegalArgumentException 当参数无效或该资产余额已存在时抛出
+     * @throws NullPointerException 当资产标识为 {@code null} 时抛出
      * @throws ArithmeticException 当初始资产总额溢出时抛出
      * @note 先完成逐资产总额精确加法，再发布账户和余额桶，失败时不留下部分状态。
      */
@@ -119,6 +122,7 @@ public final class AccountLedger {
      * @param asset 资产标识
      * @return 可用与冻结余额快照
      * @throws IllegalArgumentException 当账户或资产余额不存在时抛出
+     * @throws NullPointerException 当资产标识为 {@code null} 时抛出
      * @note 调用方应持有用户条带锁以取得与其他资产操作一致的快照。
      */
     public BalanceSnapshot balance(long userId, AssetId asset) {
@@ -160,6 +164,7 @@ public final class AccountLedger {
      *
      * @param asset 资产标识
      * @return 指定资产总额守恒时为 {@code true}
+     * @throws NullPointerException 当资产标识为 {@code null} 时抛出
      * @note 调用方必须持有全部条带锁，否则并发成交的中间赋值可能产生瞬时假失败；外部一致性检查应调用 {@link InvariantChecker#check()}。
      */
     public boolean invariantHolds(AssetId asset) {
@@ -209,6 +214,7 @@ public final class AccountLedger {
      * @param asset 资产标识
      * @param amount 要冻结的正数资产数量
      * @throws IllegalArgumentException 当金额无效、账户或余额不存在时抛出
+     * @throws NullPointerException 当资产标识为 {@code null} 时抛出
      * @throws InsufficientBalanceException 当可用余额不足时抛出
      * @throws ArithmeticException 当余额计算溢出时抛出
      * @note 调用前必须持有用户条带锁；同额资金仅在同一资产的可用与冻结余额间迁移。
@@ -233,6 +239,7 @@ public final class AccountLedger {
      * @param amount 要解冻的正数资产数量
      * @return 已校验的余额变更
      * @throws IllegalArgumentException 当金额无效、账户或余额不存在时抛出
+     * @throws NullPointerException 当资产标识为 {@code null} 时抛出
      * @throws InsufficientBalanceException 当冻结余额不足时抛出
      * @throws ArithmeticException 当余额计算溢出时抛出
      * @note 调用前必须持有用户条带锁；准备阶段不写入余额以支持取消的失败原子性。
@@ -253,6 +260,7 @@ public final class AccountLedger {
      * 提交已预计算的单余额变更。
      *
      * @param mutation 已校验的余额变更
+     * @throws NullPointerException 当余额变更为 {@code null} 时抛出
      * @note 调用前必须持有用户条带锁；本方法仅执行预计算字段赋值，不进行算术或校验。
      */
     public void commitBalanceLocked(BalanceMutation mutation) {
@@ -267,6 +275,7 @@ public final class AccountLedger {
      * @param asset 资产标识
      * @param amount 要解冻的正数资产数量
      * @throws IllegalArgumentException 当金额无效、账户或余额不存在时抛出
+     * @throws NullPointerException 当资产标识为 {@code null} 时抛出
      * @throws InsufficientBalanceException 当冻结余额不足时抛出
      * @throws ArithmeticException 当余额计算溢出时抛出
      * @note 调用前必须持有用户条带锁；以同一预计算变更完成可用与冻结资金迁移。
@@ -287,6 +296,7 @@ public final class AccountLedger {
      * @param buyerQuoteRelease 买方完全成交后释放的未花费报价预留
      * @return 包含全部最终余额的不可变成交变更
      * @throws IllegalArgumentException 当用户、资产或金额无效，或余额桶不存在时抛出
+     * @throws NullPointerException 当基础资产或报价资产标识为 {@code null} 时抛出
      * @throws InsufficientBalanceException 当买方报价冻结或卖方基础冻结不足时抛出
      * @throws ArithmeticException 当最终余额计算溢出时抛出
      * @note 调用前必须持有买卖双方用户条带锁；报价支出和价格改善释放被合并到同一余额桶变更中。
@@ -347,6 +357,7 @@ public final class AccountLedger {
      * 提交已预计算的双边成交变更。
      *
      * @param mutation 已校验的成交变更
+     * @throws NullPointerException 当成交变更为 {@code null} 时抛出
      * @note 调用前必须持有买卖双方用户条带锁；本方法仅执行预计算赋值，不使用全局结算锁或重新计算金额。
      */
     public void commitTradeLocked(TradeLedgerMutation mutation) {

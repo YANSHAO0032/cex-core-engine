@@ -83,64 +83,108 @@ public final class OrderContext {
         return new OrderContext(Objects.requireNonNull(submission, "submission"));
     }
 
-    /** @return 不可变订单唯一标识 */
+    /**
+     * 获取不可变订单唯一标识。
+     *
+     * @return 不可变订单唯一标识
+     */
     public long orderId() { return orderId; }
 
-    /** @return 不可变用户唯一标识 */
+    /**
+     * 获取不可变用户唯一标识。
+     *
+     * @return 不可变用户唯一标识
+     */
     public long userId() { return userId; }
 
-    /** @return 决定冻结资产类型的订单方向 */
+    /**
+     * 获取决定冻结资产类型的订单方向。
+     *
+     * @return 买入或卖出方向
+     */
     public OrderSide side() { return side; }
 
-    /** @return 不可变基础/报价资产对 */
+    /**
+     * 获取不可变基础资产与报价资产交易对。
+     *
+     * @return 基础资产与报价资产交易对
+     */
     public TradingPair pair() { return pair; }
 
-    /** @return 严格为正的原始基础资产数量 */
+    /**
+     * 获取原始基础资产委托数量。
+     *
+     * @return 严格为正的基础资产最小单位数量
+     */
     public long originalBaseQuantity() { return originalBaseQuantity; }
 
-    /** @return 买单报价资产或卖单基础资产的原始冻结量 */
+    /**
+     * 获取订单创建时的原始冻结资产数量。
+     *
+     * @return 买单报价资产或卖单基础资产的最小单位数量
+     */
     public long originalReservedAmount() { return originalReservedAmount; }
 
-    /** @return 严格为正的报价资产风控名义金额 */
+    /**
+     * 获取上游声明的报价资产风控名义金额。
+     *
+     * @return 严格为正的报价资产最小单位数量
+     */
     public long riskQuoteAmount() { return riskQuoteAmount; }
 
     /**
+     * 获取累计基础资产成交量。
+     *
      * @return 非负且不大于原始基础数量的累计值
      * @note 未持用户锁时只适合诊断快照；一致业务决策必须在锁内读取。
      */
     public long cumulativeBaseFilled() { return cumulativeBaseFilled; }
 
     /**
+     * 获取累计报价资产成交量。
+     *
      * @return 非负的权威累计报价资产数量
      * @note 未持用户锁时只适合诊断快照；一致业务决策必须在锁内读取。
      */
     public long cumulativeQuoteFilled() { return cumulativeQuoteFilled; }
 
     /**
+     * 获取尚未成交的基础资产数量。
+     *
      * @return 原始基础数量减累计基础成交量
      * @note 未持用户锁时只适合诊断快照；一致业务决策必须在锁内读取。
      */
     public long remainingBaseQuantity() { return remainingBaseQuantity; }
 
     /**
+     * 获取活动订单仍处于冻结状态的预留资产数量。
+     *
      * @return 活动买单的剩余报价资产或活动卖单的剩余基础资产；终态为零
      * @note 最终买单未花费报价资产通过成交变更单独释放，本字段提交后归零。
      */
     public long remainingReservedAmount() { return remainingReservedAmount; }
 
     /**
+     * 获取最后成功提交的订单权威序号。
+     *
      * @return 创建、成交或撤单确认最后提交的序号
      * @note 读取和推进必须在所属用户锁内进行，防止跳过序号空洞。
      */
     public long lastAppliedSequence() { return lastAppliedSequence; }
 
     /**
+     * 获取当前稳定撤单请求标识。
+     *
      * @return 严格为正的撤单请求标识，尚未请求时为零
      * @note 读取和写入必须由所属用户锁保护。
      */
     public long cancelRequestId() { return cancelRequestId; }
 
-    /** @return 当前可见订单状态 */
+    /**
+     * 获取当前对无锁读者可见的订单状态。
+     *
+     * @return 当前订单状态
+     */
     public OrderStatus status() { return status; }
 
     /**

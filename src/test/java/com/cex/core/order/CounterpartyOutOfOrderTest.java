@@ -19,6 +19,10 @@ import org.junit.jupiter.api.Test;
  * <p>测试只通过 {@link OrderEngine} 强类型门面驱动真实协调器，不建立第二套撮合或结算逻辑。</p>
  */
 class CounterpartyOutOfOrderTest {
+    /** 创建双边乱序成交测试实例。 */
+    CounterpartyOutOfOrderTest() {
+    }
+
     /** 测试基础资产。 */
     private static final AssetId BTC = new AssetId("BTC");
     /** 测试报价资产。 */
@@ -145,6 +149,11 @@ class CounterpartyOutOfOrderTest {
         assertTrue(fixture.ledger.allAssetInvariantsHold());
     }
 
+    /**
+     * 创建并提交买卖双方订单的就绪夹具。
+     *
+     * @return 双方订单已发布且资金已冻结的测试夹具
+     */
     private Fixture readyFixture() {
         Fixture fixture = fixture();
         fixture.engine.submit(fixture.buySubmission());
@@ -152,6 +161,11 @@ class CounterpartyOutOfOrderTest {
         return fixture;
     }
 
+    /**
+     * 创建仅初始化账本和引擎的双边测试夹具。
+     *
+     * @return 尚未提交订单的测试夹具
+     */
     private Fixture fixture() {
         StripedLockManager locks = new StripedLockManager(16);
         AccountLedger ledger = new AccountLedger(locks);
@@ -171,23 +185,49 @@ class CounterpartyOutOfOrderTest {
         /** 场景使用的强类型订单引擎。 */
         private final OrderEngine engine;
 
+        /**
+         * 创建双边乱序测试夹具。
+         *
+         * @param ledger 多资产内存账本
+         * @param engine 强类型订单引擎
+         */
         private Fixture(AccountLedger ledger, OrderEngine engine) {
             this.ledger = ledger;
             this.engine = engine;
         }
 
+        /**
+         * 创建固定买单提交。
+         *
+         * @return 固定买单提交
+         */
         private OrderSubmission buySubmission() {
             return new OrderSubmission(
                     BUY_ORDER_ID, BUYER_ID, OrderSide.BUY, BTC_USDT,
                     10L, 1_000L, 1_000L, 1L, 10L);
         }
 
+        /**
+         * 创建固定卖单提交。
+         *
+         * @return 固定卖单提交
+         */
         private OrderSubmission sellSubmission() {
             return new OrderSubmission(
                     SELL_ORDER_ID, SELLER_ID, OrderSide.SELL, BTC_USDT,
                     10L, 10L, 1_000L, 1L, 10L);
         }
 
+        /**
+         * 创建关联固定买卖订单的权威成交。
+         *
+         * @param tradeId 成交唯一标识
+         * @param baseQuantity 基础资产成交量
+         * @param quoteQuantity 报价资产成交量
+         * @param buySequence 买单权威序号
+         * @param sellSequence 卖单权威序号
+         * @return 不可变双边成交
+         */
         private TradeExecution execution(
                 long tradeId,
                 long baseQuantity,
@@ -200,10 +240,20 @@ class CounterpartyOutOfOrderTest {
                     buySequence, sellSequence, 30L + tradeId);
         }
 
+        /**
+         * 获取当前买单上下文。
+         *
+         * @return 买单上下文
+         */
         private OrderContext buyOrder() {
             return engine.order(BUY_ORDER_ID);
         }
 
+        /**
+         * 获取当前卖单上下文。
+         *
+         * @return 卖单上下文
+         */
         private OrderContext sellOrder() {
             return engine.order(SELL_ORDER_ID);
         }

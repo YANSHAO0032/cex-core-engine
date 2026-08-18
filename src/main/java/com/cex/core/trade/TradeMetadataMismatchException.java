@@ -8,6 +8,7 @@ package com.cex.core.trade;
  * <p>使用限制：仅表示 {@code tradeId} 载荷冲突，不表示订单或资产结算校验失败。</p>
  */
 public final class TradeMetadataMismatchException extends IllegalStateException {
+    /** 异常序列化版本标识。 */
     private static final long serialVersionUID = 1L;
 
     /**

@@ -8,12 +8,19 @@ package com.cex.core.order;
  * <p>使用限制：只能提交到准备它的订单，不能替代双边账本变更。</p>
  */
 public final class OrderFillMutation {
+    /** 提交后的累计基础资产成交量，单位为基础资产最小单位。 */
     private final long cumulativeBaseFilled;
+    /** 提交后的累计报价资产成交量，单位为报价资产最小单位。 */
     private final long cumulativeQuoteFilled;
+    /** 提交后的剩余基础资产委托量，单位为基础资产最小单位。 */
     private final long remainingBaseQuantity;
+    /** 提交后仍冻结的预留资产数量；买单为报价资产、卖单为基础资产。 */
     private final long remainingReservedAmount;
+    /** 最终买单价格改善产生的报价资产释放额，计入可用余额并保持资产守恒。 */
     private final long buyerQuoteReleaseAmount;
+    /** 本次成交消费的订单权威序号。 */
     private final long orderSequence;
+    /** 提交成交后的订单状态。 */
     private final OrderStatus status;
 
     /**
@@ -45,9 +52,32 @@ public final class OrderFillMutation {
         this.status = status;
     }
 
+    /**
+     * 获取提交后的累计基础资产成交量。
+     *
+     * @return 基础资产最小单位数量
+     */
     long cumulativeBaseFilled() { return cumulativeBaseFilled; }
+
+    /**
+     * 获取提交后的累计报价资产成交量。
+     *
+     * @return 报价资产最小单位数量
+     */
     long cumulativeQuoteFilled() { return cumulativeQuoteFilled; }
+
+    /**
+     * 获取提交后的剩余基础资产委托量。
+     *
+     * @return 基础资产最小单位数量
+     */
     long remainingBaseQuantity() { return remainingBaseQuantity; }
+
+    /**
+     * 获取提交后仍冻结的预留资产数量。
+     *
+     * @return 买单报价资产或卖单基础资产的最小单位数量
+     */
     long remainingReservedAmount() { return remainingReservedAmount; }
 
     /**
@@ -64,6 +94,17 @@ public final class OrderFillMutation {
      */
     public long buyerQuoteReleaseAmount() { return buyerQuoteReleaseAmount; }
 
+    /**
+     * 获取本次成交消费的订单权威序号。
+     *
+     * @return 订单权威序号
+     */
     long orderSequence() { return orderSequence; }
+
+    /**
+     * 获取提交成交后的订单状态。
+     *
+     * @return 部分成交、等待撤单或完全成交状态
+     */
     OrderStatus status() { return status; }
 }

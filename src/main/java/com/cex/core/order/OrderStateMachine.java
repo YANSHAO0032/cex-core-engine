@@ -10,6 +10,7 @@ import java.util.Objects;
  * <p>使用限制：不读取或修改账户余额，也不协调成交对手方订单。</p>
  */
 public final class OrderStateMachine {
+    /** 单订单允许缓存的未来权威事件数量上限，用于限制乱序事件内存。 */
     private final int maxPendingEvents;
 
     /**
@@ -355,6 +356,12 @@ public final class OrderStateMachine {
         order.commitCancelLocked(mutation);
     }
 
+    /**
+     * 校验订单当前状态允许继续应用权威成交。
+     *
+     * @param order 已持所属用户锁的目标订单
+     * @throws InvalidTradeExecutionException 当订单处于风控暂挂或其他不可成交状态时抛出
+     */
     private static void requireFillableState(OrderContext order) {
         if (order.status() != OrderStatus.NEW
                 && order.status() != OrderStatus.PARTIALLY_FILLED
@@ -364,6 +371,12 @@ public final class OrderStateMachine {
         }
     }
 
+    /**
+     * 拒绝对已终结订单再次应用成交。
+     *
+     * @param order 已持所属用户锁的目标订单
+     * @throws OrderTerminalStateException 当订单已经完全成交或取消时抛出
+     */
     private static void rejectTerminalFill(OrderContext order) {
         if (order.status() == OrderStatus.FILLED || order.status() == OrderStatus.CANCELED) {
             throw new OrderTerminalStateException(
@@ -372,6 +385,13 @@ public final class OrderStateMachine {
         }
     }
 
+    /**
+     * 校验成交声明的订单方向、订单标识和交易对与目标订单一致。
+     *
+     * @param order 已持所属用户锁的目标订单
+     * @param execution 外部撮合提供的权威双边成交
+     * @throws InvalidTradeExecutionException 当成交引用错误订单或交易对时抛出
+     */
     private static void validateExecutionMetadata(
             OrderContext order, TradeExecution execution) {
         long executionOrderId = order.side() == OrderSide.BUY
@@ -383,12 +403,28 @@ public final class OrderStateMachine {
         }
     }
 
+    /**
+     * 按订单方向提取成交对应的单订单权威序号。
+     *
+     * @param order 决定读取买方或卖方序号的目标订单
+     * @param execution 包含双边序号的权威成交
+     * @return 买单的买方序号或卖单的卖方序号
+     */
     private static long executionSequence(OrderContext order, TradeExecution execution) {
         return order.side() == OrderSide.BUY
                 ? execution.buyOrderSequence()
                 : execution.sellOrderSequence();
     }
 
+    /**
+     * 校验指定序号已缓存的权威事件与当前成交引用一致。
+     *
+     * @param order 已持所属用户锁的目标订单
+     * @param execution 当前权威成交
+     * @param sequence 当前成交在目标订单上的权威序号
+     * @throws TradeSequenceConflictException 当同一未消费序号已由其他事件占用时抛出
+     * @note 允许序号尚未缓存；若已缓存，只接受相同 tradeId、orderId 和序号的成交引用。
+     */
     private static void validateRegisteredTrade(
             OrderContext order, TradeExecution execution, long sequence) {
         SequencedOrderEvent registered = order.pendingEventLocked(sequence);
@@ -404,6 +440,15 @@ public final class OrderStateMachine {
         }
     }
 
+    /**
+     * 校验指定序号已缓存事件与当前权威事件载荷一致。
+     *
+     * @param order 已持所属用户锁的目标订单
+     * @param event 当前待处理权威事件
+     * @param sequence 当前事件的订单权威序号
+     * @throws TradeSequenceConflictException 当同一未消费序号已有不同载荷时抛出
+     * @note 允许序号尚未缓存；已缓存时必须保持精确幂等，禁止覆盖乱序事件。
+     */
     private static void validateRegisteredEvent(
             OrderContext order, SequencedOrderEvent event, long sequence) {
         SequencedOrderEvent registered = order.pendingEventLocked(sequence);
@@ -414,6 +459,13 @@ public final class OrderStateMachine {
         }
     }
 
+    /**
+     * 校验权威事件声明的订单标识属于目标订单。
+     *
+     * @param order 目标订单上下文
+     * @param eventOrderId 权威事件声明的订单标识
+     * @throws IllegalArgumentException 当事件订单标识与目标订单不一致时抛出
+     */
     private static void requireOrderId(OrderContext order, long eventOrderId) {
         if (order.orderId() != eventOrderId) {
             throw new IllegalArgumentException(
@@ -422,6 +474,14 @@ public final class OrderStateMachine {
         }
     }
 
+    /**
+     * 校验候选序号严格等于订单下一权威序号。
+     *
+     * @param order 已持所属用户锁的目标订单
+     * @param sequence 待消费的候选权威序号
+     * @throws TradeSequenceConflictException 当候选序号造成跳号、重复消费或序号耗尽时抛出
+     * @note 状态推进禁止跳过乱序缓存空洞，确保成交与撤单按单订单权威顺序提交。
+     */
     private static void requireNextSequence(OrderContext order, long sequence) {
         long expected = nextSequence(order.lastAppliedSequence());
         if (sequence != expected) {
@@ -431,6 +491,13 @@ public final class OrderStateMachine {
         }
     }
 
+    /**
+     * 计算最后已提交序号之后的下一权威序号。
+     *
+     * @param lastAppliedSequence 最后成功提交的订单权威序号
+     * @return 精确加一后的下一权威序号
+     * @throws TradeSequenceConflictException 当序号已达到长整型上限时抛出
+     */
     private static long nextSequence(long lastAppliedSequence) {
         try {
             return Math.addExact(lastAppliedSequence, 1L);
@@ -439,6 +506,14 @@ public final class OrderStateMachine {
         }
     }
 
+    /**
+     * 根据剩余数量和撤单等待状态确定成交后的订单状态。
+     *
+     * @param currentStatus 成交提交前的订单状态
+     * @param completelyFilled 是否已无剩余基础资产数量
+     * @return 完全成交、继续等待撤单或部分成交状态
+     * @note 等待撤单期间到达的较低序号成交保持 {@code PENDING_CANCEL}，直到权威撤单确认消费下一序号。
+     */
     private static OrderStatus targetFillStatus(
             OrderStatus currentStatus, boolean completelyFilled) {
         if (completelyFilled) {

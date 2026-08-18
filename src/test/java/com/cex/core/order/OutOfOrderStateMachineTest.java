@@ -28,6 +28,10 @@ import org.junit.jupiter.api.Test;
  * <p>使用限制：仅覆盖内存引擎的代表性乱序组合，不模拟持久化恢复。</p>
  */
 class OutOfOrderStateMachineTest {
+    /** 创建乱序状态机测试实例。 */
+    OutOfOrderStateMachineTest() {
+    }
+
     /** 测试基础资产。 */
     private static final AssetId BTC = new AssetId("BTC");
     /** 测试报价资产。 */
@@ -104,7 +108,11 @@ class OutOfOrderStateMachineTest {
         }
     }
 
-    /** 场景：32 个线程首次并发提交同一成交时，业务结果与重复指标都必须精确收敛为 1+31。 */
+    /**
+     * 场景：32 个线程首次并发提交同一成交时，业务结果与重复指标都必须精确收敛为 1+31。
+     *
+     * @throws Exception 当并发任务等待、取回结果或线程池关闭失败时抛出
+     */
     @Test
     void concurrentFirstTradeCountsEveryDuplicateExactlyOnce() throws Exception {
         try (Fixture fixture = new Fixture()) {
@@ -162,7 +170,11 @@ class OutOfOrderStateMachineTest {
         }
     }
 
-    /** 场景：同一未来序号成交的并发首次投递只累计一个空洞和 31 个重复。 */
+    /**
+     * 场景：同一未来序号成交的并发首次投递只累计一个空洞和 31 个重复。
+     *
+     * @throws Exception 当并发任务等待、取回结果或线程池关闭失败时抛出
+     */
     @Test
     void concurrentDuplicateGapCountsSequenceGapOnce() throws Exception {
         try (Fixture fixture = new Fixture()) {
@@ -277,14 +289,22 @@ class OutOfOrderStateMachineTest {
             engine.submit(sellSubmission());
         }
 
-        /** @return 固定买单提交 */
+        /**
+         * 构造固定买单提交。
+         *
+         * @return 固定买单提交
+         */
         private OrderSubmission buySubmission() {
             return new OrderSubmission(
                     BUY_ORDER_ID, BUYER_ID, OrderSide.BUY, BTC_USDT,
                     10L, 1_000L, 1_000L, 1L, 1L);
         }
 
-        /** @return 固定卖单提交 */
+        /**
+         * 构造固定卖单提交。
+         *
+         * @return 固定卖单提交
+         */
         private OrderSubmission sellSubmission() {
             return new OrderSubmission(
                     SELL_ORDER_ID, SELLER_ID, OrderSide.SELL, BTC_USDT,
@@ -306,12 +326,20 @@ class OutOfOrderStateMachineTest {
                     10L, 1_000L, buySequence, sellSequence, 2L);
         }
 
-        /** @return 当前买单上下文 */
+        /**
+         * 查询当前买单上下文。
+         *
+         * @return 当前买单上下文
+         */
         private OrderContext buyOrder() {
             return engine.order(BUY_ORDER_ID);
         }
 
-        /** @return 当前卖单上下文 */
+        /**
+         * 查询当前卖单上下文。
+         *
+         * @return 当前卖单上下文
+         */
         private OrderContext sellOrder() {
             return engine.order(SELL_ORDER_ID);
         }

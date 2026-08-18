@@ -8,6 +8,7 @@ package com.cex.core.trade;
  * <p>使用限制：相同 {@code tradeId} 的精确重复不应触发本异常。</p>
  */
 public final class PendingCapacityExceededException extends IllegalStateException {
+    /** 异常序列化版本标识。 */
     private static final long serialVersionUID = 1L;
 
     /**

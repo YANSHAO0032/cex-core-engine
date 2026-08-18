@@ -8,14 +8,23 @@ package com.cex.core.account;
  * <p>限制：不携带用户标识或锁状态，不能在另一笔准备结果之间交错提交。</p>
  */
 public final class TradeLedgerMutation {
+    /** 买方报价资产余额桶，成交扣减与余款释放均在此桶结算。 */
     private final AssetBalance buyerQuote;
+    /** 买方基础资产余额桶，接收卖方交付并保持基础资产守恒。 */
     private final AssetBalance buyerBase;
+    /** 卖方基础资产余额桶，从冻结余额扣减实际交付数量。 */
     private final AssetBalance sellerBase;
+    /** 卖方报价资产余额桶，接收买方支付并保持报价资产守恒。 */
     private final AssetBalance sellerQuote;
+    /** 买方报价资产提交后的冻结余额，单位为报价资产最小单位。 */
     private final long buyerQuoteFrozenAfter;
+    /** 买方报价资产提交后的可用余额，包含最终价格改善释放额。 */
     private final long buyerQuoteAvailableAfter;
+    /** 买方基础资产提交后的可用余额，包含本次成交交付量。 */
     private final long buyerBaseAvailableAfter;
+    /** 卖方基础资产提交后的冻结余额，已扣除本次成交交付量。 */
     private final long sellerBaseFrozenAfter;
+    /** 卖方报价资产提交后的可用余额，包含本次成交收款。 */
     private final long sellerQuoteAvailableAfter;
 
     /**
@@ -53,13 +62,66 @@ public final class TradeLedgerMutation {
         this.sellerQuoteAvailableAfter = sellerQuoteAvailableAfter;
     }
 
+    /**
+     * 获取买方报价资产余额桶。
+     *
+     * @return 买方报价资产余额桶
+     */
     AssetBalance buyerQuote() { return buyerQuote; }
+
+    /**
+     * 获取买方基础资产余额桶。
+     *
+     * @return 买方基础资产余额桶
+     */
     AssetBalance buyerBase() { return buyerBase; }
+
+    /**
+     * 获取卖方基础资产余额桶。
+     *
+     * @return 卖方基础资产余额桶
+     */
     AssetBalance sellerBase() { return sellerBase; }
+
+    /**
+     * 获取卖方报价资产余额桶。
+     *
+     * @return 卖方报价资产余额桶
+     */
     AssetBalance sellerQuote() { return sellerQuote; }
+
+    /**
+     * 获取买方报价资产提交后的冻结余额。
+     *
+     * @return 报价资产最小单位数量
+     */
     long buyerQuoteFrozenAfter() { return buyerQuoteFrozenAfter; }
+
+    /**
+     * 获取买方报价资产提交后的可用余额。
+     *
+     * @return 报价资产最小单位数量
+     */
     long buyerQuoteAvailableAfter() { return buyerQuoteAvailableAfter; }
+
+    /**
+     * 获取买方基础资产提交后的可用余额。
+     *
+     * @return 基础资产最小单位数量
+     */
     long buyerBaseAvailableAfter() { return buyerBaseAvailableAfter; }
+
+    /**
+     * 获取卖方基础资产提交后的冻结余额。
+     *
+     * @return 基础资产最小单位数量
+     */
     long sellerBaseFrozenAfter() { return sellerBaseFrozenAfter; }
+
+    /**
+     * 获取卖方报价资产提交后的可用余额。
+     *
+     * @return 报价资产最小单位数量
+     */
     long sellerQuoteAvailableAfter() { return sellerQuoteAvailableAfter; }
 }
