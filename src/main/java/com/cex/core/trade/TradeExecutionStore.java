@@ -38,6 +38,8 @@ public final class TradeExecutionStore {
     private final AtomicInteger totalRecords = new AtomicInteger();
     /** 仅供同包测试在发布窗口注入失败的钩子。 */
     private final PublicationFailureInjector publicationFailureInjector;
+    /** 仅供同包测试在首次权威记录查询未命中后协调并发交错的观察器。 */
+    private final InitialRecordMissObserver initialRecordMissObserver;
 
     /**
      * 使用引擎默认容量创建成交存储。
@@ -54,7 +56,7 @@ public final class TradeExecutionStore {
      * @throws IllegalArgumentException 当容量不为正或挂起容量大于总容量时抛出
      */
     public TradeExecutionStore(int maxPendingRecords, int maxTotalRecords) {
-        this(maxPendingRecords, maxTotalRecords, stage -> { });
+        this(maxPendingRecords, maxTotalRecords, stage -> { }, tradeId -> { });
     }
 
     /**
@@ -66,6 +68,20 @@ public final class TradeExecutionStore {
      */
     TradeExecutionStore(int maxPendingRecords, int maxTotalRecords,
                         PublicationFailureInjector publicationFailureInjector) {
+        this(maxPendingRecords, maxTotalRecords, publicationFailureInjector, tradeId -> { });
+    }
+
+    /**
+     * 使用固定容量、发布故障注入器和初次查询观察器创建成交存储。
+     *
+     * @param maxPendingRecords 最大挂起成交记录数，必须为正且不大于总容量
+     * @param maxTotalRecords 最大总成交记录数，必须为正
+     * @param publicationFailureInjector 仅测试使用的发布阶段回调，不能为空
+     * @param initialRecordMissObserver 仅测试使用的初次权威记录查询未命中回调，不能为空
+     */
+    TradeExecutionStore(int maxPendingRecords, int maxTotalRecords,
+                        PublicationFailureInjector publicationFailureInjector,
+                        InitialRecordMissObserver initialRecordMissObserver) {
         if (maxPendingRecords <= 0 || maxTotalRecords <= 0 || maxPendingRecords > maxTotalRecords) {
             throw new IllegalArgumentException("pending and total capacities must be positive and pending <= total");
         }
@@ -73,6 +89,8 @@ public final class TradeExecutionStore {
         this.maxTotalRecords = maxTotalRecords;
         this.publicationFailureInjector = Objects.requireNonNull(
                 publicationFailureInjector, "publicationFailureInjector");
+        this.initialRecordMissObserver = Objects.requireNonNull(
+                initialRecordMissObserver, "initialRecordMissObserver");
     }
 
     /**
@@ -95,7 +113,7 @@ public final class TradeExecutionStore {
      * @return 同时包含权威记录与本次调用重复标志的不可变结果
      * @throws TradeMetadataMismatchException 当相同成交标识载荷不同
      * @throws PendingCapacityExceededException 当新成交标识超过挂起或总记录容量
-     * @note 并发同 ID 调用共享登记槽；只有最终成功发布记录的调用返回非重复，等待后命中已发布记录的调用均返回重复。
+     * @note 并发同 ID 调用共享登记槽；赢得槽后会在容量预留前二次复核权威记录，避免迟到精确重复被误判为新成交。
      */
     public TradeRegistrationOutcome registerWithOutcome(TradeExecution execution) {
         Objects.requireNonNull(execution, "execution");
@@ -106,6 +124,7 @@ public final class TradeExecutionStore {
                 return new TradeRegistrationOutcome(
                         sameOrConflict(existing, execution), true);
             }
+            initialRecordMissObserver.afterMiss(tradeId);
 
             Registration candidate = new Registration(execution);
             Registration inProgress = registrations.putIfAbsent(tradeId, candidate);
@@ -118,6 +137,12 @@ public final class TradeExecutionStore {
             }
 
             try {
+                // 初查未命中后，上一任登记者可能已完成发布并移除旧槽；预留容量前必须二次复核。
+                existing = records.get(tradeId);
+                if (existing != null) {
+                    return new TradeRegistrationOutcome(
+                            sameOrConflict(existing, execution), true);
+                }
                 return registerOwned(candidate);
             } finally {
                 registrations.remove(tradeId, candidate);
@@ -432,6 +457,17 @@ public final class TradeExecutionStore {
          * @param stage 当前发布阶段
          */
         void before(PublicationStage stage);
+    }
+
+    /** 仅供同包测试在首次权威记录查询未命中后协调确定性并发交错的最小回调。 */
+    @FunctionalInterface
+    interface InitialRecordMissObserver {
+        /**
+         * 观察当前成交标识的权威记录查询未命中。
+         *
+         * @param tradeId 查询未命中的成交标识
+         */
+        void afterMiss(long tradeId);
     }
 
     /**

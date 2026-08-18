@@ -1,6 +1,7 @@
 package com.cex.core.trade;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -22,6 +23,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -202,6 +204,57 @@ class TradeExecutionStoreTest {
             assertEquals(1, store.pendingCount());
             assertEquals(1, store.totalCount());
         } finally {
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5L, TimeUnit.SECONDS));
+        }
+    }
+
+    /** 场景：迟到重复在首次查询未命中后，必须识别另一线程已经发布并移除登记槽的权威记录。 */
+    @Test
+    void exactDuplicateRechecksPublishedRecordAfterWinningRecreatedRegistrationSlot() throws Exception {
+        CountDownLatch ownerBeforePublication = new CountDownLatch(1);
+        CountDownLatch allowOwnerPublication = new CountDownLatch(1);
+        CountDownLatch contenderAfterInitialMiss = new CountDownLatch(1);
+        CountDownLatch allowContenderRegistration = new CountDownLatch(1);
+        AtomicBoolean pauseOwnerOnce = new AtomicBoolean(true);
+        AtomicReference<Thread> contenderThread = new AtomicReference<>();
+        TradeExecutionStore store = new TradeExecutionStore(1, 1, stage -> {
+            if (stage == TradeExecutionStore.PublicationStage.BEFORE_RECORD_PUBLICATION
+                    && pauseOwnerOnce.compareAndSet(true, false)) {
+                ownerBeforePublication.countDown();
+                await(allowOwnerPublication);
+            }
+        }, tradeId -> {
+            if (Thread.currentThread() == contenderThread.get()) {
+                contenderAfterInitialMiss.countDown();
+                await(allowContenderRegistration);
+            }
+        });
+        TradeExecution execution = execution(1L, 10L, 20L);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<TradeRegistrationOutcome> owner = executor.submit(
+                    () -> store.registerWithOutcome(execution));
+            assertTrue(ownerBeforePublication.await(5L, TimeUnit.SECONDS));
+            Future<TradeRegistrationOutcome> contender = executor.submit(() -> {
+                contenderThread.set(Thread.currentThread());
+                return store.registerWithOutcome(execution);
+            });
+            assertTrue(contenderAfterInitialMiss.await(5L, TimeUnit.SECONDS));
+
+            allowOwnerPublication.countDown();
+            TradeRegistrationOutcome created = getWithin(owner);
+            allowContenderRegistration.countDown();
+            TradeRegistrationOutcome duplicate = getWithin(contender);
+
+            assertFalse(created.duplicate());
+            assertTrue(duplicate.duplicate());
+            assertSame(created.record(), duplicate.record());
+            assertEquals(1, store.pendingCount());
+            assertEquals(1, store.totalCount());
+        } finally {
+            allowOwnerPublication.countDown();
+            allowContenderRegistration.countDown();
             executor.shutdownNow();
             assertTrue(executor.awaitTermination(5L, TimeUnit.SECONDS));
         }
