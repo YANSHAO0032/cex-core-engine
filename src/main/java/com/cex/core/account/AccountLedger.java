@@ -1,51 +1,38 @@
 package com.cex.core.account;
 
 import com.cex.core.concurrent.StripedLockManager;
+import com.cex.core.order.AssetId;
 import com.cex.core.util.MoneyMath;
-import java.util.Map;
 import java.util.Collection;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * 管理用户账户及系统已结算资金的内存账本。
+ * 管理用户多资产余额与双边交割的内存账本。
  *
- * <p>能力：创建账户、在外部持锁条件下冻结、解冻与结算资金，并校验资产总额守恒。</p>
- * <p>线程安全：账户变更由用户条带锁串行化；账户创建额外持有账本监视器；已结算金额使用 CAS 更新。</p>
- * <p>限制：锁定操作不会自行加锁，调用方必须先持有对应用户的条带锁。</p>
+ * <p>能力：创建资产余额、在外部持锁条件下冻结、解冻和成交结算，并逐资产校验守恒。</p>
+ * <p>线程安全：账户余额由用户条带锁串行化；余额创建额外持有账本监视器。</p>
+ * <p>限制：锁定操作不会自行加锁，调用方必须先持有相关用户的所有条带锁。</p>
  */
 public final class AccountLedger {
-
     /** 为用户操作提供条带化互斥的锁管理器。 */
     private final StripedLockManager lockManager;
     /** 按用户标识索引的账户集合。 */
     private final Map<Long, Account> accounts = new ConcurrentHashMap<>();
-    /** 系统已结算资产总额，单位为货币最小单位，与全部账户余额共同满足总资产守恒。 */
-    private final AtomicLong systemSettledAmount;
-    /** 账本初始总资产，单位为货币最小单位，等于全部可用余额、冻结余额及系统已结算金额之和。 */
-    private long initialTotalAsset;
+    /** 各资产应保持守恒的初始总额，仅在账本监视器内更新。 */
+    private final Map<AssetId, Long> initialTotalByAsset = new HashMap<>();
 
     /**
-     * 使用零初始已结算金额创建账本。
+     * 创建空的多资产账本。
      *
      * @param lockManager 用户条带锁管理器
+     * @throws NullPointerException 当锁管理器为 {@code null} 时抛出
      */
     public AccountLedger(StripedLockManager lockManager) {
-        this(lockManager, 0L);
-    }
-
-    /**
-     * 使用指定初始已结算金额创建账本。
-     *
-     * @param lockManager 用户条带锁管理器
-     * @param initialSystemSettledAmount 初始系统已结算资产，必须非负
-     * @throws IllegalArgumentException 当初始已结算金额为负数时抛出
-     */
-    public AccountLedger(StripedLockManager lockManager, long initialSystemSettledAmount) {
-        this.lockManager = lockManager;
-        long seededSystemSettledAmount = MoneyMath.requireNonNegative(initialSystemSettledAmount);
-        this.systemSettledAmount = new AtomicLong(seededSystemSettledAmount);
-        this.initialTotalAsset = seededSystemSettledAmount;
+        this.lockManager = Objects.requireNonNull(lockManager, "lockManager");
     }
 
     /**
@@ -53,74 +40,64 @@ public final class AccountLedger {
      *
      * @return 条带锁管理器
      */
-    public StripedLockManager lockManager() {
-        return lockManager;
-    }
+    public StripedLockManager lockManager() { return lockManager; }
 
     /**
-     * 使用零冻结余额创建用户账户。
+     * 为用户创建零冻结的指定资产余额。
      *
-     * @param userId 用户标识，必须为正数
-     * @param available 初始可用资产，必须非负
-     * @return 新创建的账户
-     * @throws IllegalArgumentException 当用户标识或余额无效，或账户已存在时抛出
-     */
-    public Account createAccount(long userId, long available) {
-        return createAccount(userId, available, 0L);
-    }
-
-    /**
-     * 创建同时包含可用与冻结余额的用户账户。
-     *
-     * @param userId 用户标识，必须为正数
-     * @param available 初始可用资产，必须非负
-     * @param frozen 初始冻结资产，必须非负
-     * @return 新创建的账户
-     * @throws IllegalArgumentException 当参数无效或账户已存在时抛出
+     * @param userId 用户标识
+     * @param asset 资产标识
+     * @param available 初始可用数量
+     * @return 包含该余额的用户账户
+     * @throws IllegalArgumentException 当参数无效或该资产余额已存在时抛出
+     * @throws NullPointerException 当资产标识为 {@code null} 时抛出
      * @throws ArithmeticException 当初始资产总额溢出时抛出
-     * @note 先获取用户条带锁再获取账本监视器，确保同一用户创建幂等地拒绝重复发布。
      */
-    public Account createAccount(long userId, long available, long frozen) {
+    public Account createBalance(long userId, AssetId asset, long available) {
+        return createBalance(userId, asset, available, 0L);
+    }
+
+    /**
+     * 为用户创建指定资产的可用与冻结余额。
+     *
+     * @param userId 用户标识
+     * @param asset 资产标识
+     * @param available 初始可用数量
+     * @param frozen 初始冻结数量
+     * @return 包含该余额的用户账户
+     * @throws IllegalArgumentException 当参数无效或该资产余额已存在时抛出
+     * @throws NullPointerException 当资产标识为 {@code null} 时抛出
+     * @throws ArithmeticException 当初始资产总额溢出时抛出
+     * @note 先完成逐资产总额精确加法，再发布账户和余额桶，失败时不留下部分状态。
+     */
+    public Account createBalance(long userId, AssetId asset, long available, long frozen) {
         requirePositiveId(userId, "userId");
-        java.util.concurrent.locks.ReentrantLock userLock = lockManager.lockForUser(userId);
-        // 先锁定用户，避免同一用户并发创建时重复发布账户。
+        Objects.requireNonNull(asset, "asset");
+        long normalizedAvailable = MoneyMath.requireNonNegative(available);
+        long normalizedFrozen = MoneyMath.requireNonNegative(frozen);
+        ReentrantLock userLock = lockManager.lockForUser(userId);
         userLock.lock();
         try {
             synchronized (this) {
-                return createAccountUnderLocks(userId, available, frozen);
+                Account existing = accounts.get(userId);
+                if (existing != null && existing.hasBalance(asset)) {
+                    throw new IllegalArgumentException("balance already exists: userId=" + userId + ", asset=" + asset.value());
+                }
+                long amount = MoneyMath.checkedAdd(normalizedAvailable, normalizedFrozen);
+                long initial = initialTotalByAsset.getOrDefault(asset, 0L);
+                long updatedInitial = MoneyMath.checkedAdd(initial, amount);
+                Account account = existing == null ? new Account(userId) : existing;
+                AssetBalance balance = new AssetBalance(normalizedAvailable, normalizedFrozen);
+                account.addBalance(asset, balance);
+                if (existing == null) {
+                    accounts.put(userId, account);
+                }
+                initialTotalByAsset.put(asset, updatedInitial);
+                return account;
             }
         } finally {
             userLock.unlock();
         }
-    }
-
-    /**
-     * 在用户条带锁和账本监视器均已持有时创建账户并更新初始资产。
-     *
-     * @param userId 用户标识
-     * @param available 初始可用资产
-     * @param frozen 初始冻结资产
-     * @return 已发布的账户
-     * @throws IllegalArgumentException 当余额无效或账户已存在时抛出
-     * @throws ArithmeticException 当资产总额计算溢出时抛出
-     * @note 先完成资产总额的溢出校验，再发布账户，避免失败时破坏资产守恒或留下半成品状态。
-     */
-    private Account createAccountUnderLocks(long userId, long available, long frozen) {
-        long normalizedAvailable = MoneyMath.requireNonNegative(available);
-        long normalizedFrozen = MoneyMath.requireNonNegative(frozen);
-        if (accounts.containsKey(userId)) {
-            throw new IllegalArgumentException("account already exists for userId=" + userId);
-        }
-        long updatedInitialTotalAsset = MoneyMath.checkedAdd(
-                initialTotalAsset,
-                MoneyMath.checkedAdd(normalizedAvailable, normalizedFrozen));
-        Account account = new Account(userId, normalizedAvailable, normalizedFrozen);
-        Account existing = accounts.putIfAbsent(userId, account);
-        if (existing != null) {
-            throw new IllegalArgumentException("account already exists for userId=" + userId);
-        }
-        initialTotalAsset = updatedInitialTotalAsset;
-        return account;
     }
 
     /**
@@ -139,45 +116,88 @@ public final class AccountLedger {
     }
 
     /**
-     * 获取系统已结算资产总额。
+     * 获取用户指定资产的不可变余额快照。
      *
-     * @return 已结算资产数量
+     * @param userId 用户标识
+     * @param asset 资产标识
+     * @return 可用与冻结余额快照
+     * @throws IllegalArgumentException 当账户或资产余额不存在时抛出
+     * @throws NullPointerException 当资产标识为 {@code null} 时抛出
+     * @note 调用方应持有用户条带锁以取得与其他资产操作一致的快照。
      */
-    public long systemSettledAmount() {
-        return systemSettledAmount.get();
+    public BalanceSnapshot balance(long userId, AssetId asset) {
+        Objects.requireNonNull(asset, "asset");
+        AssetBalance balance = getRequiredAccount(userId).requiredBalance(asset);
+        return new BalanceSnapshot(balance.available(), balance.frozen());
     }
 
     /**
-     * 获取账本应保持守恒的初始资产总额。
+     * 获取各资产应守恒的初始总额快照。
      *
-     * @return 初始资产总额
+     * @return 资产到初始总额的不可修改映射
+     * @note 初始总额本身由账本监视器保护；若要与当前余额组成一致快照，调用方必须持有全部条带锁，或调用 {@link InvariantChecker#check()}。
      */
-    public synchronized long initialTotalAsset() {
-        return initialTotalAsset;
-    }
+    public synchronized Map<AssetId, Long> initialTotalAssets() { return Map.copyOf(initialTotalByAsset); }
 
     /**
-     * 汇总账户可用、冻结及系统已结算资产。
+     * 汇总各资产的账户可用与冻结数量。
      *
-     * @return 当前资产总额
-     * @throws ArithmeticException 当汇总结果溢出时抛出
+     * @return 资产到当前总额的不可修改映射
+     * @throws ArithmeticException 当任一资产汇总结果溢出时抛出
+     * @note 要获得一致汇总，调用方必须持有全部条带锁；外部一致性检查应调用 {@link InvariantChecker#check()}。
      */
-    public long currentTotalAsset() {
-        long total = 0L;
+    public Map<AssetId, Long> currentTotalAssets() {
+        Map<AssetId, Long> totals = new HashMap<>();
         for (Account account : accounts.values()) {
-            total = MoneyMath.checkedAdd(total, account.available());
-            total = MoneyMath.checkedAdd(total, account.frozen());
+            for (Map.Entry<AssetId, AssetBalance> entry : account.balancesSnapshot().entrySet()) {
+                AssetBalance balance = entry.getValue();
+                long current = totals.getOrDefault(entry.getKey(), 0L);
+                current = MoneyMath.checkedAdd(current, balance.available());
+                totals.put(entry.getKey(), MoneyMath.checkedAdd(current, balance.frozen()));
+            }
         }
-        return MoneyMath.checkedAdd(total, systemSettledAmount());
+        return Map.copyOf(totals);
     }
 
     /**
-     * 判断当前资产总额是否等于应守恒的初始总额。
+     * 判断指定资产总额是否守恒。
      *
-     * @return 总额守恒时为 {@code true}
+     * @param asset 资产标识
+     * @return 指定资产总额守恒时为 {@code true}
+     * @throws NullPointerException 当资产标识为 {@code null} 时抛出
+     * @note 调用方必须持有全部条带锁，否则并发成交的中间赋值可能产生瞬时假失败；外部一致性检查应调用 {@link InvariantChecker#check()}。
      */
-    public boolean invariantHolds() {
-        return currentTotalAsset() == initialTotalAsset();
+    public boolean invariantHolds(AssetId asset) {
+        Objects.requireNonNull(asset, "asset");
+        return currentTotalAssets().getOrDefault(asset, 0L)
+                .equals(initialTotalAssets().getOrDefault(asset, 0L));
+    }
+
+    /**
+     * 判断所有资产总额均守恒且所有余额桶均非负。
+     *
+     * @return 全部资产不变量成立时为 {@code true}
+     * @note 调用方必须持有全部条带锁，否则并发成交的中间赋值可能产生瞬时假失败；外部一致性检查应调用 {@link InvariantChecker#check()}。
+     */
+    public boolean allAssetInvariantsHold() {
+        return allBalancesNonNegative() && currentTotalAssets().equals(initialTotalAssets());
+    }
+
+    /**
+     * 判断所有账户资产余额桶是否均为非负数。
+     *
+     * @return 所有可用与冻结余额非负时为 {@code true}
+     * @note 调用方必须持有全部条带锁，否则并发成交的中间赋值可能产生瞬时假失败；外部一致性检查应调用 {@link InvariantChecker#check()}。
+     */
+    public boolean allBalancesNonNegative() {
+        for (Account account : accounts.values()) {
+            for (AssetBalance balance : account.balancesSnapshot().values()) {
+                if (balance.available() < 0L || balance.frozen() < 0L) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     /**
@@ -185,94 +205,175 @@ public final class AccountLedger {
      *
      * @return 账户快照
      */
-    public Collection<Account> accountsSnapshot() {
-        return java.util.List.copyOf(accounts.values());
-    }
+    public Collection<Account> accountsSnapshot() { return java.util.List.copyOf(accounts.values()); }
 
     /**
-     * 将用户可用资产转入冻结资产。
+     * 将用户指定资产的可用资金转入冻结资金。
      *
      * @param userId 用户标识
+     * @param asset 资产标识
      * @param amount 要冻结的正数资产数量
-     * @throws IllegalArgumentException 当金额无效、账户不存在或可用余额不足时抛出
+     * @throws IllegalArgumentException 当金额无效、账户或余额不存在时抛出
+     * @throws NullPointerException 当资产标识为 {@code null} 时抛出
+     * @throws InsufficientBalanceException 当可用余额不足时抛出
      * @throws ArithmeticException 当余额计算溢出时抛出
-     * @note 调用前必须持有用户条带锁；同额资金仅在可用与冻结余额间迁移，保持资产守恒。
+     * @note 调用前必须持有用户条带锁；同额资金仅在同一资产的可用与冻结余额间迁移。
      */
-    public void freezeLocked(long userId, long amount) {
-        long normalizedAmount = MoneyMath.requirePositive(amount);
-        Account account = getRequiredAccount(userId);
-        // 余额校验必须在同一用户锁内完成，避免并发超额冻结。
-        if (account.available() < normalizedAmount) {
-            throw new IllegalArgumentException("available balance is insufficient");
+    public void freezeLocked(long userId, AssetId asset, long amount) {
+        long normalized = MoneyMath.requirePositive(amount);
+        AssetBalance balance = getRequiredAccount(userId).requiredBalance(Objects.requireNonNull(asset, "asset"));
+        if (balance.available() < normalized) {
+            throw new InsufficientBalanceException("available balance is insufficient");
         }
-        account.setAvailable(MoneyMath.checkedSubtract(account.available(), normalizedAmount));
-        account.setFrozen(MoneyMath.checkedAdd(account.frozen(), normalizedAmount));
+        long availableAfter = MoneyMath.checkedSubtract(balance.available(), normalized);
+        long frozenAfter = MoneyMath.checkedAdd(balance.frozen(), normalized);
+        balance.setAvailable(availableAfter);
+        balance.setFrozen(frozenAfter);
     }
 
     /**
-     * 将用户冻结资产转回可用资产。
+     * 为指定资产准备从冻结资金回到可用资金的变更。
      *
      * @param userId 用户标识
+     * @param asset 资产标识
      * @param amount 要解冻的正数资产数量
-     * @throws IllegalArgumentException 当金额无效、账户不存在或冻结余额不足时抛出
+     * @return 已校验的余额变更
+     * @throws IllegalArgumentException 当金额无效、账户或余额不存在时抛出
+     * @throws NullPointerException 当资产标识为 {@code null} 时抛出
+     * @throws InsufficientBalanceException 当冻结余额不足时抛出
      * @throws ArithmeticException 当余额计算溢出时抛出
-     * @note 调用前必须持有用户条带锁；操作只改变资金归属，不改变总资产。
+     * @note 调用前必须持有用户条带锁；准备阶段不写入余额以支持取消的失败原子性。
      */
-    public void unfreezeLocked(long userId, long amount) {
-        long normalizedAmount = MoneyMath.requirePositive(amount);
-        Account account = getRequiredAccount(userId);
-        // 余额校验必须在同一用户锁内完成，避免并发超额解冻。
-        if (account.frozen() < normalizedAmount) {
-            throw new IllegalArgumentException("frozen balance is insufficient");
+    public BalanceMutation prepareUnfreezeLocked(long userId, AssetId asset, long amount) {
+        long normalized = MoneyMath.requirePositive(amount);
+        AssetBalance balance = getRequiredAccount(userId).requiredBalance(Objects.requireNonNull(asset, "asset"));
+        if (balance.frozen() < normalized) {
+            throw new InsufficientBalanceException("frozen balance is insufficient");
         }
-        account.setFrozen(MoneyMath.checkedSubtract(account.frozen(), normalizedAmount));
-        account.setAvailable(MoneyMath.checkedAdd(account.available(), normalizedAmount));
+        return new BalanceMutation(
+                balance,
+                MoneyMath.checkedAdd(balance.available(), normalized),
+                MoneyMath.checkedSubtract(balance.frozen(), normalized));
     }
 
     /**
-     * 将用户冻结资产结算至系统已结算金额。
+     * 提交已预计算的单余额变更。
+     *
+     * @param mutation 已校验的余额变更
+     * @throws NullPointerException 当余额变更为 {@code null} 时抛出
+     * @note 调用前必须持有用户条带锁；本方法仅执行预计算字段赋值，不进行算术或校验。
+     */
+    public void commitBalanceLocked(BalanceMutation mutation) {
+        mutation.balance().setAvailable(mutation.availableAfter());
+        mutation.balance().setFrozen(mutation.frozenAfter());
+    }
+
+    /**
+     * 将用户指定资产的冻结资金转回可用资金。
      *
      * @param userId 用户标识
-     * @param amount 要结算的正数资产数量
-     * @throws IllegalArgumentException 当金额无效、账户不存在或冻结余额不足时抛出
-     * @throws ArithmeticException 当已结算金额累计溢出时抛出
-     * @note 调用前必须持有用户条带锁；CAS 成功后再扣减冻结余额，确保总资产守恒。
+     * @param asset 资产标识
+     * @param amount 要解冻的正数资产数量
+     * @throws IllegalArgumentException 当金额无效、账户或余额不存在时抛出
+     * @throws NullPointerException 当资产标识为 {@code null} 时抛出
+     * @throws InsufficientBalanceException 当冻结余额不足时抛出
+     * @throws ArithmeticException 当余额计算溢出时抛出
+     * @note 调用前必须持有用户条带锁；以同一预计算变更完成可用与冻结资金迁移。
      */
-    public void settleLocked(long userId, long amount) {
-        long normalizedAmount = MoneyMath.requirePositive(amount);
-        Account account = getRequiredAccount(userId);
-        // 在用户锁内确认冻结余额足额，防止重复结算同一笔资金。
-        if (account.frozen() < normalizedAmount) {
-            throw new IllegalArgumentException("frozen balance is insufficient");
-        }
-        reserveSystemSettledAmount(normalizedAmount);
-        account.setFrozen(MoneyMath.checkedSubtract(account.frozen(), normalizedAmount));
+    public void unfreezeLocked(long userId, AssetId asset, long amount) {
+        commitBalanceLocked(prepareUnfreezeLocked(userId, asset, amount));
     }
 
     /**
-     * 通过 CAS 原子累加系统已结算金额。
+     * 准备买卖双方的基础资产与报价资产交割。
      *
-     * @param amount 要累加的结算资产数量
-     * @throws ArithmeticException 当累计结果溢出时抛出
-     * @note 使用 AtomicLong/CAS 无全局锁累加；CAS 失败仅表示并发更新，本次调用基于最新值重试并只成功提交一次。
+     * @param buyerUserId 买方用户标识
+     * @param sellerUserId 卖方用户标识
+     * @param baseAsset 基础资产标识
+     * @param quoteAsset 报价资产标识
+     * @param baseQuantity 交付给买方的基础资产数量
+     * @param quoteQuantity 支付给卖方的报价资产数量
+     * @param buyerQuoteRelease 买方完全成交后释放的未花费报价预留
+     * @return 包含全部最终余额的不可变成交变更
+     * @throws IllegalArgumentException 当用户、资产或金额无效，或余额桶不存在时抛出
+     * @throws NullPointerException 当基础资产或报价资产标识为 {@code null} 时抛出
+     * @throws InsufficientBalanceException 当买方报价冻结或卖方基础冻结不足时抛出
+     * @throws ArithmeticException 当最终余额计算溢出时抛出
+     * @note 调用前必须持有买卖双方用户条带锁；报价支出和价格改善释放被合并到同一余额桶变更中。
      */
-    private void reserveSystemSettledAmount(long amount) {
-        while (true) {
-            long current = systemSettledAmount.get();
-            long updated = MoneyMath.checkedAdd(current, amount);
-            // 仅在观察值未变化时提交，失败后基于最新值重试。
-            if (systemSettledAmount.compareAndSet(current, updated)) {
-                return;
-            }
+    public TradeLedgerMutation prepareTradeLocked(
+            long buyerUserId,
+            long sellerUserId,
+            AssetId baseAsset,
+            AssetId quoteAsset,
+            long baseQuantity,
+            long quoteQuantity,
+            long buyerQuoteRelease) {
+        requirePositiveId(buyerUserId, "buyerUserId");
+        requirePositiveId(sellerUserId, "sellerUserId");
+        if (buyerUserId == sellerUserId) {
+            throw new IllegalArgumentException("buyer and seller must differ");
         }
+        Objects.requireNonNull(baseAsset, "baseAsset");
+        Objects.requireNonNull(quoteAsset, "quoteAsset");
+        if (baseAsset.equals(quoteAsset)) {
+            throw new IllegalArgumentException("base and quote assets must differ");
+        }
+        long normalizedBase = MoneyMath.requirePositive(baseQuantity);
+        long normalizedQuote = MoneyMath.requirePositive(quoteQuantity);
+        long normalizedRelease = MoneyMath.requireNonNegative(buyerQuoteRelease);
+
+        Account buyer = getRequiredAccount(buyerUserId);
+        Account seller = getRequiredAccount(sellerUserId);
+        AssetBalance buyerQuote = buyer.requiredBalance(quoteAsset);
+        AssetBalance buyerBase = buyer.requiredBalance(baseAsset);
+        AssetBalance sellerBase = seller.requiredBalance(baseAsset);
+        AssetBalance sellerQuote = seller.requiredBalance(quoteAsset);
+        long buyerQuoteDeduction = MoneyMath.checkedAdd(normalizedQuote, normalizedRelease);
+        if (buyerQuote.frozen() < buyerQuoteDeduction) {
+            throw new InsufficientBalanceException("buyer quote frozen balance is insufficient");
+        }
+        if (sellerBase.frozen() < normalizedBase) {
+            throw new InsufficientBalanceException("seller base frozen balance is insufficient");
+        }
+        long buyerQuoteFrozenAfter = MoneyMath.checkedSubtract(buyerQuote.frozen(), buyerQuoteDeduction);
+        long buyerQuoteAvailableAfter = MoneyMath.checkedAdd(buyerQuote.available(), normalizedRelease);
+        long buyerBaseAvailableAfter = MoneyMath.checkedAdd(buyerBase.available(), normalizedBase);
+        long sellerBaseFrozenAfter = MoneyMath.checkedSubtract(sellerBase.frozen(), normalizedBase);
+        long sellerQuoteAvailableAfter = MoneyMath.checkedAdd(sellerQuote.available(), normalizedQuote);
+        return new TradeLedgerMutation(
+                buyerQuote,
+                buyerBase,
+                sellerBase,
+                sellerQuote,
+                buyerQuoteFrozenAfter,
+                buyerQuoteAvailableAfter,
+                buyerBaseAvailableAfter,
+                sellerBaseFrozenAfter,
+                sellerQuoteAvailableAfter);
     }
 
     /**
-     * 校验标识值为正数。
+     * 提交已预计算的双边成交变更。
      *
-     * @param value 待校验的标识值
-     * @param fieldName 用于异常信息的字段名称
-     * @throws IllegalArgumentException 当标识值不是正数时抛出
+     * @param mutation 已校验的成交变更
+     * @throws NullPointerException 当成交变更为 {@code null} 时抛出
+     * @note 调用前必须持有买卖双方用户条带锁；本方法仅执行预计算赋值，不使用全局结算锁或重新计算金额。
+     */
+    public void commitTradeLocked(TradeLedgerMutation mutation) {
+        mutation.buyerQuote().setFrozen(mutation.buyerQuoteFrozenAfter());
+        mutation.buyerQuote().setAvailable(mutation.buyerQuoteAvailableAfter());
+        mutation.buyerBase().setAvailable(mutation.buyerBaseAvailableAfter());
+        mutation.sellerBase().setFrozen(mutation.sellerBaseFrozenAfter());
+        mutation.sellerQuote().setAvailable(mutation.sellerQuoteAvailableAfter());
+    }
+
+    /**
+     * 校验业务标识严格为正数。
+     *
+     * @param value 待校验标识值
+     * @param fieldName 异常消息使用的字段名
+     * @throws IllegalArgumentException 当标识不为正数时抛出
      */
     private static void requirePositiveId(long value, String fieldName) {
         if (value <= 0L) {

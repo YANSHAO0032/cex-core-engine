@@ -46,7 +46,7 @@ public final class InvariantChecker {
                 locks.lockForStripe(acquired).lock();
             }
             snapshots.increment();
-            boolean valid = ledger.currentTotalAsset() == ledger.initialTotalAsset();
+            boolean valid = ledger.allAssetInvariantsHold();
             if (!valid) {
                 failures.increment();
             }

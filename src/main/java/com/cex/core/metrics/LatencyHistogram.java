@@ -37,6 +37,7 @@ public final class LatencyHistogram {
      *
      * @param nanos 延迟值，单位为纳秒，必须非负
      * @throws IllegalArgumentException 当延迟为负数时抛出
+     * @note 桶计数和汇总值使用原子累加器，无全局锁，支持多个性能工作线程并发记录。
      */
     public void record(long nanos) {
         if (nanos < 0L) {
@@ -56,6 +57,7 @@ public final class LatencyHistogram {
      * 获取已记录延迟样本数。
      *
      * @return 样本总数
+     * @note 并发读取为弱一致快照，不阻塞正在记录的线程。
      */
     public long count() { return count.sum(); }
 
@@ -63,6 +65,7 @@ public final class LatencyHistogram {
      * 获取已记录延迟的纳秒总和。
      *
      * @return 延迟纳秒总和
+     * @note 并发读取为弱一致快照，不阻塞正在记录的线程。
      */
     public long totalNanos() { return totalNanos.sum(); }
 
@@ -70,6 +73,7 @@ public final class LatencyHistogram {
      * 获取已记录的最大延迟。
      *
      * @return 最大延迟，单位为纳秒
+     * @note 使用原子读取返回单值一致结果。
      */
     public long maxNanos() { return maxNanos.get(); }
 
@@ -77,6 +81,7 @@ public final class LatencyHistogram {
      * 计算平均延迟，单位为微秒。
      *
      * @return 平均延迟；没有样本时返回 {@code 0.0}
+     * @note 计数和总和分别读取，并发记录期间结果为弱一致估算值。
      */
     public double averageMicros() { return count() == 0L ? 0.0 : totalNanos() / (double) count() / 1_000.0; }
 
@@ -86,6 +91,7 @@ public final class LatencyHistogram {
      * @param percentile 分位数，范围为 {@code [0.0, 1.0]}
      * @return 对应桶上界的估算延迟；没有样本时返回 {@code 0L}
      * @throws IllegalArgumentException 当分位数不在有效范围内时抛出
+     * @note 逐桶读取并发计数形成弱一致快照，不锁定正在记录的线程。
      */
     public long percentileNanos(double percentile) {
         if (percentile < 0.0 || percentile > 1.0) {
@@ -110,6 +116,7 @@ public final class LatencyHistogram {
      * 估算 P50 延迟。
      *
      * @return P50 延迟估算值，单位为纳秒
+     * @note 委托并发安全的桶快照估算，不阻塞记录线程。
      */
     public long p50Nanos() { return percentileNanos(0.50); }
 
@@ -117,6 +124,7 @@ public final class LatencyHistogram {
      * 估算 P95 延迟。
      *
      * @return P95 延迟估算值，单位为纳秒
+     * @note 委托并发安全的桶快照估算，不阻塞记录线程。
      */
     public long p95Nanos() { return percentileNanos(0.95); }
 
@@ -124,6 +132,7 @@ public final class LatencyHistogram {
      * 估算 P99 延迟。
      *
      * @return P99 延迟估算值，单位为纳秒
+     * @note 委托并发安全的桶快照估算，不阻塞记录线程。
      */
     public long p99Nanos() { return percentileNanos(0.99); }
 }

@@ -12,6 +12,10 @@ public enum OrderStatus {
     NEW,
     /** 风控要求人工或异步审批时的暂挂状态。 */
     RISK_HOLD,
+    /** 已发生至少一笔成交但仍有基础资产数量待成交。 */
+    PARTIALLY_FILLED,
+    /** 撤单请求已发出但尚未收到权威撤单确认。 */
+    PENDING_CANCEL,
     /** 已成交并完成资金结算的终态。 */
     FILLED,
     /** 已取消或审批拒绝且完成解冻的终态。 */

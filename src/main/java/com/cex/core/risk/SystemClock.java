@@ -5,6 +5,10 @@ package com.cex.core.risk;
  * 核心能力：提供实时毫秒时间；线程安全：无状态且天然线程安全；使用限制：依赖系统时钟，测试时间敏感场景应使用 {@link ManualClock}。
  */
 public final class SystemClock implements Clock {
+    /** 创建无状态的系统毫秒时钟。 */
+    public SystemClock() {
+    }
+
     /**
      * 获取系统当前时间。
      *

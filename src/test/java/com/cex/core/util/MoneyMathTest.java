@@ -12,6 +12,10 @@ import org.junit.jupiter.api.Test;
  * <p>限制：仅覆盖 {@code long} 整数金额，不涉及币种与舍入规则。</p>
  */
 class MoneyMathTest {
+    /** 创建资金算术测试实例。 */
+    MoneyMathTest() {
+    }
+
 
     /** 场景：精确加法返回正确结果，并在上溢时失败。 */
     @Test

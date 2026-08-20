@@ -12,16 +12,40 @@ import static org.junit.jupiter.api.Assertions.*;
  * <p>限制：本测试只覆盖守恒成立的基础快照场景。</p>
  */
 class InvariantCheckerTest {
+    /** 创建资产不变量检查测试实例。 */
+    InvariantCheckerTest() {
+    }
+
     /** 场景：检查器锁定全部条带后应报告资产守恒并累计快照次数。 */
     @Test
     void snapshotLocksAllStripesAndPreservesAssetInvariant() {
         AccountLedger ledger = new AccountLedger(new StripedLockManager(8));
-        ledger.createAccount(1L, 100L);
-        ledger.createAccount(2L, 200L);
+        com.cex.core.order.AssetId btc = new com.cex.core.order.AssetId("BTC");
+        com.cex.core.order.AssetId usdt = new com.cex.core.order.AssetId("USDT");
+        ledger.createBalance(1L, btc, 100L);
+        ledger.createBalance(1L, usdt, 200L);
+        ledger.createBalance(2L, btc, 300L);
         InvariantChecker checker = new InvariantChecker(ledger);
 
         assertTrue(checker.check());
+        assertTrue(ledger.allAssetInvariantsHold());
         assertEquals(1L, checker.snapshotCount());
         assertEquals(0L, checker.failureCount());
+    }
+
+    /** 场景：即使资产总额恰好守恒，负余额桶也必须使检查器报告失败。 */
+    @Test
+    void checkRejectsNegativeBalanceBucketEvenWhenAssetTotalMatches() {
+        AccountLedger ledger = new AccountLedger(new StripedLockManager(8));
+        com.cex.core.order.AssetId btc = new com.cex.core.order.AssetId("BTC");
+        ledger.createBalance(1L, btc, 100L);
+        AssetBalance balance = ledger.getRequiredAccount(1L).requiredBalance(btc);
+        balance.setAvailable(-1L);
+        balance.setFrozen(101L);
+        InvariantChecker checker = new InvariantChecker(ledger);
+
+        assertTrue(ledger.invariantHolds(btc));
+        assertFalse(checker.check());
+        assertEquals(1L, checker.failureCount());
     }
 }

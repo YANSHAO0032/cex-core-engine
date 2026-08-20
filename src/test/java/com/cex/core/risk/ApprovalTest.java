@@ -1,210 +1,445 @@
 package com.cex.core.risk;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
 import com.cex.core.account.AccountLedger;
+import com.cex.core.account.BalanceSnapshot;
 import com.cex.core.concurrent.StripedLockManager;
+import com.cex.core.order.AssetId;
+import com.cex.core.order.CancelConfirmation;
+import com.cex.core.order.CancelRequest;
+import com.cex.core.order.OrderContext;
 import com.cex.core.order.OrderEngine;
-import com.cex.core.order.OrderEvent;
-import com.cex.core.order.OrderEventType;
+import com.cex.core.order.OrderSide;
 import com.cex.core.order.OrderStatus;
+import com.cex.core.order.OrderSubmission;
+import com.cex.core.order.TradeExecution;
+import com.cex.core.order.TradingPair;
+import com.cex.core.trade.TradeExecutionState;
+import com.cex.core.trade.TradeResult;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
-import static org.junit.jupiter.api.Assertions.*;
-
 /**
- * 审批结果回流、订单乱序成交门禁与冻结资金处理的集成场景测试。
- * 核心能力：验证审批只发布事件并经统一订单入口生效；线程安全：通过闭锁协调异步审批；使用限制：依赖测试专用内存账务组件。
+ * 审批结果回流、风险暂挂成交门禁与权威撤单确认的集成测试。
+ *
+ * <p>核心能力：验证审批服务只发布强类型结果，PASS 排空成交，REJECT 等待撤单确认。</p>
+ * <p>线程安全：通过闭锁协调异步审批，撤单收集使用并发列表。</p>
+ * <p>使用限制：依赖测试专用内存账本，不覆盖外部撮合实现。</p>
  */
 class ApprovalTest {
+    /** 创建审批集成测试实例。 */
+    ApprovalTest() {
+    }
+
+    /** 测试基础资产。 */
+    private static final AssetId BTC = new AssetId("BTC");
+    /** 测试报价资产。 */
+    private static final AssetId USDT = new AssetId("USDT");
+    /** 测试交易对。 */
+    private static final TradingPair BTC_USDT = new TradingPair(BTC, USDT);
+    /** 买方用户标识。 */
+    private static final long BUYER_ID = 1L;
+    /** 卖方用户标识。 */
+    private static final long SELLER_ID = 2L;
+    /** 买单标识。 */
+    private static final long BUY_ORDER_ID = 11L;
+    /** 卖单标识。 */
+    private static final long SELL_ORDER_ID = 22L;
+
     /**
-     * 场景：审批服务只发布拒绝事件，不直接修改订单状态或账务。
+     * 场景：审批服务只发布强类型拒绝结果，不直接修改订单或账本。
      *
      * @throws Exception 审批任务等待或服务关闭失败时抛出
      */
     @Test
-    void approvalServiceOnlyEmitsAnEvent() throws Exception {
+    void approvalServiceEmitsStrongResultWithoutChangingOrderState() throws Exception {
         ApprovalService service = new ApprovalService(1, 1);
         try {
-            java.util.concurrent.atomic.AtomicReference<OrderEvent> received = new java.util.concurrent.atomic.AtomicReference<>();
-            service.submit(new OrderEvent(1L, 1L, 10L, 1L, OrderEventType.ORDER_CREATED),
-                    event -> ApprovalDecision.REJECT, received::set);
-            service.awaitQuiescence(2, TimeUnit.SECONDS);
+            OrderSubmission submission = buySubmission();
+            AtomicReference<ApprovalResult> received = new AtomicReference<>();
+
+            service.submit(submission,
+                    source -> ApprovalDecision.REJECT, received::set);
+            service.awaitQuiescence(2L, TimeUnit.SECONDS);
+
             assertNotNull(received.get());
-            assertEquals(OrderEventType.APPROVAL_REJECTED, received.get().type());
+            assertEquals(BUY_ORDER_ID, received.get().orderId());
+            assertEquals(ApprovalDecision.REJECT, received.get().decision());
+            assertTrue(received.get().decidedAtMillis() >= 0L);
             assertEquals(1L, service.submittedCount());
-        } finally { service.close(); }
+        } finally {
+            service.close();
+        }
     }
 
     /**
-     * 场景：审批拒绝经统一入口仅解冻一次，即使原始创建事件重复到达。
+     * 场景：提交已越过接收边界后并发关闭，已接收任务仍须完成，关闭后的新提交必须拒绝。
      *
-     * @throws Exception 审批任务等待或引擎关闭失败时抛出
+     * @throws Exception 并发提交、关闭或审批等待失败时抛出
      */
     @Test
-    void rejectUnfreezesThroughUnifiedOrderEntryExactlyOnce() throws Exception {
-        AccountLedger ledger = new AccountLedger(new StripedLockManager());
-        ledger.createAccount(1L, 1000L);
-        ApprovalService approvals = new ApprovalService(1, 4);
-        OrderEngine engine = new OrderEngine(ledger,
-                new RiskPipeline(new SlidingWindowAmountRule(0L)), new ManualClock(1L), approvals,
-            event -> ApprovalDecision.REJECT);
+    void acceptedSubmissionCompletesWhenCloseRacesAfterAcceptance() throws Exception {
+        CountDownLatch accepted = new CountDownLatch(1);
+        CountDownLatch releaseSubmission = new CountDownLatch(1);
+        ApprovalService service = new ApprovalService(1, 1, () -> {
+            accepted.countDown();
+            awaitLatch(releaseSubmission);
+        });
+        ExecutorService callers = Executors.newFixedThreadPool(2);
+        AtomicReference<ApprovalResult> received = new AtomicReference<>();
         try {
-            engine.process(new OrderEvent(1L, 1L, 100L, 1L, OrderEventType.ORDER_CREATED));
-            engine.process(new OrderEvent(1L, 1L, 100L, 1L, OrderEventType.MATCH_FILLED));
-            engine.process(new OrderEvent(2L, 1L, 100L, 1L, OrderEventType.ORDER_CREATED));
-            engine.process(new OrderEvent(2L, 1L, 100L, 1L, OrderEventType.ORDER_CREATED));
-            engine.awaitApprovals(2, TimeUnit.SECONDS);
-            assertEquals(OrderStatus.CANCELED, engine.order(2L).status());
-            assertEquals(900L, ledger.getRequiredAccount(1L).available());
-            assertEquals(0L, ledger.getRequiredAccount(1L).frozen());
-            assertEquals(1L, engine.metrics().approvalScheduledCount());
-            assertEquals(1L, engine.metrics().unfreezeCount());
-        } finally { engine.close(); }
-    }
+            Future<?> submission = callers.submit(() -> service.submit(
+                    buySubmission(), source -> ApprovalDecision.PASS, received::set));
+            assertTrue(accepted.await(2L, TimeUnit.SECONDS));
 
-    /**
-     * 场景：风险挂起期间乱序或重复成交被门禁拦截，拒绝后取消且不再结算。
-     *
-     * @throws Exception 审批线程同步或测试夹具关闭失败时抛出
-     */
-    @Test
-    void fillDuringRiskHoldWaitsAndRejectedApprovalCancelsWithoutSettlement() throws Exception {
-        try (BlockingApprovalFixture fixture = new BlockingApprovalFixture(ApprovalDecision.REJECT)) {
-            fixture.process(2L, OrderEventType.ORDER_CREATED);
-            fixture.awaitApprovalEntry();
-            assertEquals(OrderStatus.RISK_HOLD, fixture.engine.order(2L).status());
-            assertEquals(100L, fixture.ledger.systemSettledAmount());
+            Future<?> closing = callers.submit(service::close);
+            closing.get(2L, TimeUnit.SECONDS);
+            assertThrows(IllegalStateException.class, () -> service.submit(
+                    buySubmission(), source -> ApprovalDecision.PASS, result -> { }));
 
-            fixture.process(2L, OrderEventType.MATCH_FILLED);
-            fixture.process(2L, OrderEventType.MATCH_FILLED);
+            releaseSubmission.countDown();
+            submission.get(2L, TimeUnit.SECONDS);
+            service.awaitQuiescence(2L, TimeUnit.SECONDS);
 
-            assertEquals(OrderStatus.RISK_HOLD, fixture.engine.order(2L).status());
-            assertEquals(100L, fixture.ledger.systemSettledAmount());
-            assertEquals(100L, fixture.ledger.getRequiredAccount(1L).frozen());
-
-            fixture.releaseApproval.countDown();
-            fixture.engine.awaitApprovals(2L, TimeUnit.SECONDS);
-
-            assertEquals(OrderStatus.CANCELED, fixture.engine.order(2L).status());
-            assertEquals(100L, fixture.ledger.systemSettledAmount());
-            assertEquals(900L, fixture.ledger.getRequiredAccount(1L).available());
-            assertEquals(0L, fixture.ledger.getRequiredAccount(1L).frozen());
-            assertEquals(1L, fixture.engine.metrics().settleCount());
-            assertEquals(1L, fixture.engine.metrics().unfreezeCount());
-            assertTrue(fixture.ledger.invariantHolds());
+            assertNotNull(received.get());
+            assertEquals(1L, service.submittedCount());
+        } finally {
+            releaseSubmission.countDown();
+            service.close();
+            callers.shutdownNow();
+            assertTrue(callers.awaitTermination(2L, TimeUnit.SECONDS));
         }
     }
 
     /**
-     * 场景：审批通过后仅回放一次挂起期间缓存的成交。
+     * 场景：已越过接收边界但尚未进入执行器的任务必须参与静止等待，关闭不得令等待提前成功。
      *
-     * @throws Exception 审批线程同步或测试夹具关闭失败时抛出
+     * @throws Exception 并发提交、关闭或审批等待失败时抛出
      */
     @Test
-    void approvedRiskHoldAppliesCachedFillExactlyOnce() throws Exception {
-        try (BlockingApprovalFixture fixture = new BlockingApprovalFixture(ApprovalDecision.PASS)) {
-            fixture.process(2L, OrderEventType.ORDER_CREATED);
-            fixture.awaitApprovalEntry();
-            fixture.process(2L, OrderEventType.MATCH_FILLED);
-            fixture.process(2L, OrderEventType.MATCH_FILLED);
+    void quiescenceIncludesAcceptedSubmissionBeforeExecutorEntry() throws Exception {
+        CountDownLatch accepted = new CountDownLatch(1);
+        CountDownLatch releaseSubmission = new CountDownLatch(1);
+        ApprovalService service = new ApprovalService(1, 1, () -> {
+            accepted.countDown();
+            awaitLatch(releaseSubmission);
+        });
+        ExecutorService caller = Executors.newSingleThreadExecutor();
+        AtomicReference<ApprovalResult> received = new AtomicReference<>();
+        try {
+            Future<?> submission = caller.submit(() -> service.submit(
+                    buySubmission(), source -> ApprovalDecision.PASS, received::set));
+            assertTrue(accepted.await(2L, TimeUnit.SECONDS));
+            service.close();
 
-            assertEquals(OrderStatus.RISK_HOLD, fixture.engine.order(2L).status());
-            assertEquals(100L, fixture.ledger.systemSettledAmount());
+            assertThrows(IllegalStateException.class,
+                    () -> service.awaitQuiescence(20L, TimeUnit.MILLISECONDS));
 
-            fixture.releaseApproval.countDown();
-            fixture.engine.awaitApprovals(2L, TimeUnit.SECONDS);
-
-            assertEquals(OrderStatus.FILLED, fixture.engine.order(2L).status());
-            assertEquals(200L, fixture.ledger.systemSettledAmount());
-            assertEquals(2L, fixture.engine.metrics().settleCount());
-            assertEquals(0L, fixture.engine.metrics().unfreezeCount());
-            assertTrue(fixture.ledger.invariantHolds());
+            releaseSubmission.countDown();
+            submission.get(2L, TimeUnit.SECONDS);
+            service.awaitQuiescence(2L, TimeUnit.SECONDS);
+            assertNotNull(received.get());
+        } finally {
+            releaseSubmission.countDown();
+            service.close();
+            caller.shutdownNow();
+            assertTrue(caller.awaitTermination(2L, TimeUnit.SECONDS));
         }
     }
 
     /**
-     * 场景：成交先于创建到达时仍先进入风险挂起，审批拒绝后不发生结算。
+     * 场景：队列满触发提交线程执行时，结果回流内关闭服务不得形成生命周期锁升级死锁。
      *
-     * @throws Exception 审批线程同步或测试夹具关闭失败时抛出
+     * @throws Exception 并发任务或审批等待失败时抛出
      */
     @Test
-    void fillBeforeCreateStillEntersRiskHoldBeforeSettlement() throws Exception {
-        try (BlockingApprovalFixture fixture = new BlockingApprovalFixture(ApprovalDecision.REJECT)) {
-            fixture.process(2L, OrderEventType.MATCH_FILLED);
-            fixture.process(2L, OrderEventType.ORDER_CREATED);
-            fixture.awaitApprovalEntry();
+    void callerRunsSinkMayCloseServiceWithoutDeadlock() throws Exception {
+        ApprovalService service = new ApprovalService(1, 1);
+        CountDownLatch workerEntered = new CountDownLatch(1);
+        CountDownLatch releaseWorker = new CountDownLatch(1);
+        ExecutorService caller = Executors.newSingleThreadExecutor();
+        try {
+            service.submit(buySubmission(), submission -> {
+                workerEntered.countDown();
+                awaitLatch(releaseWorker);
+                return ApprovalDecision.PASS;
+            }, result -> { });
+            assertTrue(workerEntered.await(2L, TimeUnit.SECONDS));
+            service.submit(buySubmission(), submission -> ApprovalDecision.PASS, result -> { });
 
-            assertEquals(OrderStatus.RISK_HOLD, fixture.engine.order(2L).status());
-            assertEquals(100L, fixture.ledger.systemSettledAmount());
-            assertEquals(100L, fixture.ledger.getRequiredAccount(1L).frozen());
+            Future<?> callerRuns = caller.submit(() -> service.submit(
+                    buySubmission(), submission -> ApprovalDecision.PASS,
+                    result -> service.close()));
+            callerRuns.get(2L, TimeUnit.SECONDS);
+            releaseWorker.countDown();
+            service.awaitQuiescence(2L, TimeUnit.SECONDS);
 
-            fixture.releaseApproval.countDown();
-            fixture.engine.awaitApprovals(2L, TimeUnit.SECONDS);
-            assertEquals(OrderStatus.CANCELED, fixture.engine.order(2L).status());
-            assertEquals(100L, fixture.ledger.systemSettledAmount());
-            assertTrue(fixture.ledger.invariantHolds());
+            assertEquals(3L, service.submittedCount());
+        } finally {
+            releaseWorker.countDown();
+            service.close();
+            caller.shutdownNow();
+            assertTrue(caller.awaitTermination(2L, TimeUnit.SECONDS));
         }
     }
 
     /**
-     * 通过闭锁阻塞审批工作线程的集成测试夹具。
-     * 核心能力：稳定复现审批未返回时的订单状态；线程安全：闭锁提供跨线程可见性；使用限制：仅供本测试类使用。
+     * 场景：提交线程执行的审批策略失败仍属于已接收且已完成任务，不得回滚接收计数。
+     *
+     * @throws Exception 并发任务或审批等待失败时抛出
      */
-    private static final class BlockingApprovalFixture implements AutoCloseable {
-        /** 测试账务账本，用于校验资金冻结与结算。 */
-        private final AccountLedger ledger = new AccountLedger(new StripedLockManager());
-        /** 审批策略已开始执行的测试同步信号。 */
+    @Test
+    void callerRunsTaskFailureStillBalancesAcceptedCount() throws Exception {
+        ApprovalService service = new ApprovalService(1, 1);
+        CountDownLatch workerEntered = new CountDownLatch(1);
+        CountDownLatch releaseWorker = new CountDownLatch(1);
+        try {
+            service.submit(buySubmission(), submission -> {
+                workerEntered.countDown();
+                awaitLatch(releaseWorker);
+                return ApprovalDecision.PASS;
+            }, result -> { });
+            assertTrue(workerEntered.await(2L, TimeUnit.SECONDS));
+            service.submit(buySubmission(), submission -> ApprovalDecision.PASS, result -> { });
+
+            assertThrows(IllegalStateException.class, () -> service.submit(
+                    buySubmission(), submission -> {
+                        throw new IllegalStateException("injected approval failure");
+                    }, result -> { }));
+            releaseWorker.countDown();
+            service.awaitQuiescence(2L, TimeUnit.SECONDS);
+
+            assertEquals(3L, service.submittedCount());
+        } finally {
+            releaseWorker.countDown();
+            service.close();
+        }
+    }
+
+    /**
+     * 场景：审批拒绝只能进入等待撤单，确认前保持冻结，确认后仅解冻一次。
+     *
+     * @throws Exception 审批结果等待失败时抛出
+     */
+    @Test
+    void rejectWaitsForConfirmationAndUnfreezesExactlyOnce() throws Exception {
+        List<CancelRequest> requests = new CopyOnWriteArrayList<>();
+        try (Fixture fixture = new Fixture(
+                ApprovalDecision.REJECT, requests, false)) {
+            OrderContext buyer = fixture.engine.submit(buySubmission());
+            fixture.engine.awaitApprovals(2L, TimeUnit.SECONDS);
+
+            assertEquals(OrderStatus.PENDING_CANCEL, buyer.status());
+            assertEquals(new BalanceSnapshot(0L, 1_000L),
+                    fixture.ledger.balance(BUYER_ID, USDT));
+            assertEquals(1, requests.size());
+
+            CancelRequest request = requests.getFirst();
+            CancelConfirmation confirmation = new CancelConfirmation(
+                    request.cancelRequestId(), BUY_ORDER_ID, 2L, 3L);
+            fixture.engine.onCancelConfirmed(confirmation);
+            fixture.engine.onCancelConfirmed(confirmation);
+
+            assertEquals(OrderStatus.CANCELED, buyer.status());
+            assertEquals(new BalanceSnapshot(1_000L, 0L),
+                    fixture.ledger.balance(BUYER_ID, USDT));
+            assertTrue(fixture.ledger.allAssetInvariantsHold());
+        }
+    }
+
+    /**
+     * 场景：审批通过后只结算一次暂挂期间重复到达的双边成交。
+     *
+     * @throws Exception 审批线程同步或结果等待失败时抛出
+     */
+    @Test
+    void approvedRiskHoldAppliesCachedTradeExactlyOnce() throws Exception {
+        try (Fixture fixture = new Fixture(
+                ApprovalDecision.PASS, new CopyOnWriteArrayList<>(), true)) {
+            OrderContext buyer = fixture.engine.submit(buySubmission());
+            fixture.engine.submit(sellSubmission());
+            fixture.awaitApprovalEntry();
+            TradeExecution execution = execution(1L, 10L, 1_000L, 2L, 2L);
+
+            assertEquals(TradeResult.PENDING, fixture.engine.onTrade(execution));
+            assertEquals(TradeResult.PENDING, fixture.engine.onTrade(execution));
+            assertEquals(OrderStatus.RISK_HOLD, buyer.status());
+
+            fixture.releaseApproval.countDown();
+            fixture.engine.awaitApprovals(2L, TimeUnit.SECONDS);
+
+            assertEquals(OrderStatus.FILLED, buyer.status());
+            assertEquals(TradeExecutionState.SETTLED,
+                    fixture.engine.trade(1L).state());
+            assertEquals(1L, fixture.engine.metrics().settledTradeCount());
+            assertTrue(fixture.ledger.allAssetInvariantsHold());
+        }
+    }
+
+    /**
+     * 场景：拒绝后的确认 N 先结算序号小于 N 的成交，再取消并释放剩余冻结额。
+     *
+     * @throws Exception 审批结果等待失败时抛出
+     */
+    @Test
+    void rejectedApprovalSettlesEarlierTradeBeforeCancelingRemainder()
+            throws Exception {
+        List<CancelRequest> requests = new CopyOnWriteArrayList<>();
+        try (Fixture fixture = new Fixture(
+                ApprovalDecision.REJECT, requests, false)) {
+            OrderContext buyer = fixture.engine.submit(buySubmission());
+            fixture.engine.submit(sellSubmission());
+            fixture.engine.awaitApprovals(2L, TimeUnit.SECONDS);
+            CancelRequest request = requests.getFirst();
+
+            fixture.engine.onCancelConfirmed(new CancelConfirmation(
+                    request.cancelRequestId(), BUY_ORDER_ID, 3L, 4L));
+            assertEquals(TradeResult.SETTLED,
+                    fixture.engine.onTrade(execution(
+                            1L, 2L, 200L, 2L, 2L)));
+
+            assertEquals(OrderStatus.CANCELED, buyer.status());
+            assertEquals(2L, buyer.cumulativeBaseFilled());
+            assertEquals(3L, buyer.lastAppliedSequence());
+            assertEquals(new BalanceSnapshot(800L, 0L),
+                    fixture.ledger.balance(BUYER_ID, USDT));
+            assertTrue(fixture.ledger.allAssetInvariantsHold());
+        }
+    }
+
+    /**
+     * 创建固定买单提交。
+     *
+     * @return 固定买单提交
+     */
+    private static OrderSubmission buySubmission() {
+        return new OrderSubmission(
+                BUY_ORDER_ID, BUYER_ID, OrderSide.BUY, BTC_USDT,
+                10L, 1_000L, 1_000L, 1L, 1L);
+    }
+
+    /**
+     * 创建固定卖单提交。
+     *
+     * @return 固定卖单提交
+     */
+    private static OrderSubmission sellSubmission() {
+        return new OrderSubmission(
+                SELL_ORDER_ID, SELLER_ID, OrderSide.SELL, BTC_USDT,
+                10L, 10L, 1_000L, 1L, 1L);
+    }
+
+    /**
+     * 构造固定双边成交。
+     *
+     * @param tradeId 成交标识
+     * @param baseQuantity 基础资产成交量
+     * @param quoteQuantity 报价资产成交量
+     * @param buySequence 买单权威序号
+     * @param sellSequence 卖单权威序号
+     * @return 强类型双边成交
+     */
+    private static TradeExecution execution(
+            long tradeId, long baseQuantity, long quoteQuantity,
+            long buySequence, long sellSequence) {
+        return new TradeExecution(
+                tradeId, BUY_ORDER_ID, SELL_ORDER_ID, BTC_USDT,
+                baseQuantity, quoteQuantity,
+                buySequence, sellSequence, 2L);
+    }
+
+    /**
+     * 在限定时间内等待测试同步信号。
+     *
+     * @param latch 待等待的同步信号
+     */
+    private static void awaitLatch(CountDownLatch latch) {
+        try {
+            if (!latch.await(2L, TimeUnit.SECONDS)) {
+                throw new AssertionError("timed out waiting for test synchronization");
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("interrupted while waiting for test synchronization", interrupted);
+        }
+    }
+
+    /**
+     * 通过闭锁控制审批返回的强类型风险夹具。
+     *
+     * <p>核心能力：装配真实审批服务、风险管线与引擎，并确定性暂停审批回流。</p>
+     * <p>线程安全：闭锁在线程间发布状态，字段初始化后只读。</p>
+     * <p>使用限制：每个测试独占夹具并在结束时关闭审批线程池。</p>
+     */
+    private static final class Fixture implements AutoCloseable {
+        /** 多资产账户账本。 */
+        private final AccountLedger ledger =
+                new AccountLedger(new StripedLockManager(16));
+        /** 审批策略开始执行的通知闭锁。 */
         private final CountDownLatch approvalEntered = new CountDownLatch(1);
-        /** 允许被阻塞审批策略返回决定的测试同步信号。 */
+        /** 允许审批策略返回的控制闭锁。 */
         private final CountDownLatch releaseApproval = new CountDownLatch(1);
-        /** 容量为 8 的测试审批服务，承载回流审批任务。 */
-        private final ApprovalService approvals = new ApprovalService(1, 8);
-        /** 接收原始与审批回流事件的订单引擎。 */
+        /** 被测强类型订单引擎。 */
         private final OrderEngine engine;
 
         /**
-         * 建立已完成首笔成交、第二笔将触发风险审批的夹具。
+         * 创建固定审批结论的测试夹具。
          *
-         * @param decision 解除阻塞后审批策略返回的结果
+         * @param decision 审批策略最终返回值
+         * @param requests 外部撤单请求收集器
+         * @param blockApproval 是否在返回审批结果前等待测试释放
          */
-        private BlockingApprovalFixture(ApprovalDecision decision) {
-            ledger.createAccount(1L, 1_000L);
+        private Fixture(
+                ApprovalDecision decision,
+                List<CancelRequest> requests,
+                boolean blockApproval) {
+            ledger.createBalance(BUYER_ID, BTC, 0L);
+            ledger.createBalance(BUYER_ID, USDT, 1_000L);
+            ledger.createBalance(SELLER_ID, BTC, 10L);
+            ledger.createBalance(SELLER_ID, USDT, 0L);
+            ApprovalService approvals = new ApprovalService(1, 8);
             engine = new OrderEngine(
                     ledger,
-                    new RiskPipeline(new SlidingWindowAmountRule(0L)),
+                    new RiskPipeline(context -> context.userId() == BUYER_ID
+                            ? RiskDecision.HOLD : RiskDecision.PASS),
                     new ManualClock(1L),
                     approvals,
-                    event -> {
+                    submission -> {
                         approvalEntered.countDown();
-                        try {
-                            releaseApproval.await();
-                        } catch (InterruptedException interrupted) {
-                            Thread.currentThread().interrupt();
-                            return ApprovalDecision.REJECT;
+                        if (blockApproval) {
+                            try {
+                                releaseApproval.await();
+                            } catch (InterruptedException interrupted) {
+                                Thread.currentThread().interrupt();
+                                return ApprovalDecision.REJECT;
+                            }
                         }
                         return decision;
-                    });
-            process(1L, OrderEventType.ORDER_CREATED);
-            process(1L, OrderEventType.MATCH_FILLED);
+                    },
+                    requests::add);
         }
 
-        /** 向订单引擎投递测试事件。
-         * @param orderId 订单标识
-         * @param type 订单事件类型
-         */
-        private void process(long orderId, OrderEventType type) {
-            engine.process(new OrderEvent(orderId, 1L, 100L, 1L, type));
-        }
-
-        /** 等待审批策略进入阻塞点。
+        /**
+         * 等待审批策略进入。
+         *
          * @throws InterruptedException 当等待线程被中断时抛出
          */
         private void awaitApprovalEntry() throws InterruptedException {
             assertTrue(approvalEntered.await(2L, TimeUnit.SECONDS));
         }
 
-        /** 释放审批并关闭订单引擎及其审批服务。 */
+        /** 释放阻塞审批并关闭引擎。 */
         @Override
         public void close() {
             releaseApproval.countDown();

@@ -13,6 +13,10 @@ import org.junit.jupiter.api.Test;
  * <p>限制：未覆盖高竞争负载下的锁吞吐表现。</p>
  */
 class StripedLockManagerTest {
+    /** 创建条带锁管理器测试实例。 */
+    StripedLockManagerTest() {
+    }
+
 
     /** 场景：无参构造器应采用约定的默认条带数量。 */
     @Test
